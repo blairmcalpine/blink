@@ -170,9 +170,11 @@ mod tests {
 
     #[test]
     fn describe_includes_the_source_chain() {
-        let err = Config::load_unvalidated(Path::new("/")).unwrap_err();
+        let dir = std::env::temp_dir();
+        let err = Config::load_unvalidated(&dir).unwrap_err();
         let message = describe(&err);
-        assert!(message.starts_with("failed to read config /"), "{message}");
+        let prefix = format!("failed to read config {}", dir.display());
+        assert!(message.starts_with(&prefix), "{message}");
         assert!(message.contains(": "), "{message}");
     }
 }
