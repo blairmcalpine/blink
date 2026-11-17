@@ -1,0 +1,26 @@
+[package]
+name = "blink-ui"
+description = "The blink settings window: a minimal egui editor for the config file."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+blink-config = { path = "../blink-config" }
+eframe.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Native folder picker and error dialog. Linux would need the GTK or XDG
+# portal backends, so it gets a text field and a logged error only.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

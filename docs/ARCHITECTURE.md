@@ -24,8 +24,8 @@ flowchart LR
   NVENC --> Ring["blink-ring encoded packet ring buffer (last N seconds, GOP-aligned)"]
   WASAPI["blink-audio WASAPI loopback"] --> AAC["AAC encode (Media Foundation MFT)"] --> Ring
   Ring -->|on hotkey| Mux["blink-mux MP4 writer"] --> File[clip.mp4]
-  Tray["Tray icon (main process)"] -->|Settings item| Settings["blink.exe --settings (Slint window)"]
-  Settings -->|"writes config.toml, signals event"| Config[("config.toml")]
+  Tray["Tray icon (main process)"] -->|Settings item| Settings["blink.exe --settings (egui window)"]
+  Settings -->|"writes config.toml, exits"| Config[("config.toml")]
   Config -->|reload off hot path| Hotkey
 ```
 
@@ -48,7 +48,7 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-ring` | Platform-agnostic encoded-packet ring buffer, GOP-aligned eviction. | `#![forbid(unsafe_code)]`, tests run under Miri |
 | `crates/blink-mux` | Platform-agnostic MP4 muxing, including the `pasp` box for stretch. | `#![forbid(unsafe_code)]` |
 | `crates/blink-config` (planned) | Shared config types and load/save, used by both processes. | `#![forbid(unsafe_code)]` |
-| `crates/blink-ui` (planned) | Slint settings window for the `--settings` process. | `#![forbid(unsafe_code)]` |
+| `crates/blink-ui` | egui/eframe settings window for the `--settings` process. | `#![forbid(unsafe_code)]` |
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-audio` | WASAPI loopback capture and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-encode` | NVENC session management, resource registration, encode calls. | `unsafe` allowed; every block needs `// SAFETY:` |
@@ -121,10 +121,24 @@ gaps with digital silence derived from the QPC timeline rather than waiting for
 real samples, so audio and video stay in sync across silence and across a
 stream that stalls.
 
+Fill covers gaps up to 60 seconds (silent AAC frames cost a few bytes each). A
+longer gap, usually a system sleep, ends the audio segment instead: the encoder
+is drained and the next packet starts a new segment at its real timestamp. A
+clip spanning that point has an audio timestamp jump, which the muxer must
+handle (with an edit list or by starting the clip's audio after the jump), but
+a clip cut from the last few minutes never spans it in practice.
+
 ### GOP structure
 
-A fixed IDR interval of 1 to 2 seconds with SPS/PPS repeated on every IDR. That
-buys two things the rest of the system depends on:
+An IDR at least once per second of PTS, with SPS/PPS repeated on every IDR.
+Capture is variable-rate (unchanged frames are skipped), so the interval is
+measured in timestamps, not frames: NVENC runs with an infinite GOP and the
+encoder forces an IDR once a second of PTS has passed since the last one, on
+the first frame after a resize, and whenever the ring asks for one
+(`PushOutcome::DroppedAwaitingKeyframe`). On a static screen nothing is
+encoded, so the capture loop asks the encoder whether an IDR is due and
+re-encodes its last captured texture when it is. That buys two things the rest
+of the system depends on:
 
 - The ring evicts whole GOPs, so no packet in the buffer references a frame that
   has already been dropped.
@@ -175,9 +189,27 @@ need work.
 The primary goal is minimal in-game FPS loss. These rules outrank feature work,
 code elegance, and convenience. Every one of them is a review criterion.
 
-1. **Zero-copy.** Register the duplicated D3D11 texture directly with NVENC
-   (`NvEncRegisterResource`) and feed it BGRA, so NVENC performs the color
-   conversion. No CPU readback, and no color-conversion shader of our own.
+1. **GPU-only, one copy.** Each admitted frame costs exactly one GPU
+   `CopyResource` from the duplicated surface into a small pool of textures
+   that blink owns (`blink-capture`, `TEXTURE_POOL_SIZE` = 3). NVENC registers
+   those pool textures (`NvEncRegisterResource`) and is fed BGRA, so NVENC
+   performs the color conversion. No CPU readback, no scaling, and no
+   color-conversion shader of our own.
+
+   The copy is deliberate. The duplicated surface is a single OS-owned texture
+   that DXGI reuses for every frame, so it cannot stay mapped as encoder input
+   across an asynchronous encode or the next `AcquireNextFrame`. Its bind flags
+   are not guaranteed, and it changes identity with every duplication session,
+   which would churn NVENC registrations on each mode change. Holding the
+   frame is not the problem: Microsoft recommends releasing it just before the
+   next acquire.
+
+   Cost: a copy reads and writes the frame once, so at 2560x1440 BGRA and
+   60 fps that is about 14.7 MB x 2 x 60 = 1.8 GB/s of video memory
+   bandwidth, a fraction of a percent of a current discrete GPU's. **Needs
+   hardware verification**: measure the copy's GPU time (timestamp queries or
+   the GPU 3D-engine delta in a capture-on versus capture-off benchmark run)
+   at 1440p and 4K, and record it with the other benchmark results.
 2. **No CUDA-core NVENC features.** Use a fast preset (P1 to P3), no lookahead,
    single pass, and no adaptive-quality modes that run on the CUDA cores. Use CBR
    or VBR at a sensible bitrate.
@@ -230,11 +262,15 @@ trimming or merging segments.
 
 ### Stretched look at zero cost
 
-An optional `stretch_to` config value (for example `1920x1080`) sets the H.264
-sample aspect ratio in the VUI and the MP4 `pasp` box, so players display 4:3
-frames stretched, exactly as they appear in game. There is no GPU scaling pass
-and no extra frame work; the pixels are untouched and only the display aspect
-metadata changes. It is off by default.
+An optional `stretch_to` config value (for example `1920x1080`) is the display
+size every frame is shown at. The encoder derives the sample aspect ratio for
+the current encode size (`stretch_w * height : stretch_h * width`, so 1280x960
+stretched to 1920x1080 is 4:3) and recomputes it on every resize, so the native
+desktop after an alt-tab goes back to square pixels. The ratio lands in the
+H.264 VUI (NVENC derives it from the display aspect ratio it is given) and the
+MP4 `pasp` box, so players display 4:3 frames stretched, exactly as they appear
+in game. There is no GPU scaling pass and no extra frame work; the pixels are
+untouched and only the display aspect metadata changes. It is off by default.
 
 **Needs hardware verification**: whether Desktop Duplication reports the game's
 mode resolution (1280x960, say) rather than a pre-scaled native image under the
@@ -242,32 +278,84 @@ different GPU scaling settings (full panel, aspect ratio, no scaling). If the
 compositor pre-scales, `stretch_to` has nothing to stretch and the design needs
 revisiting.
 
+## Saving a clip
+
+The ring keeps the clip length plus 3 seconds. A save waits 200 ms after the
+hotkey press so the encoder and audio packets of that moment land, then copies
+while capture keeps pushing; without the slack, those newer packets would evict
+the keyframe the clip starts at. Saving runs on two threads, so copying never
+waits on the disk. The cutter sizes and page-touches a reusable clip buffer
+before taking the ring lock, copies in 1 MB chunks at below-normal priority,
+and hands the lock back with a fair unlock between chunks, so a push waits at
+most one chunk. The writer writes the MP4 in Windows background mode (lowest
+CPU and I/O priority), never holding the lock, to a hidden `.partial` file
+that is renamed when complete; leftovers from a crash are deleted at startup.
+A second press while a clip is being written is cut right away into a second
+buffer, which is freed once both are back; more presses are ignored.
+
 ## Settings UI
 
 The main `blink` process contains only the capture engine and a system tray icon
-(the `tray-icon` crate, driven by an idle Win32 message loop). No UI toolkit is
-loaded in it. The tray's "Settings" item spawns `blink.exe --settings`, a
-separate short-lived process that shows a minimal Slint window using Slint's
-software renderer: CPU only, redrawing only on change, no GPU. Closing the
-window exits the process, so the settings UI costs nothing while gaming.
+(the `tray-icon` crate, driven by an idle Win32 message loop). The binary links
+eframe/egui, but the engine process never initializes it. The tray's "Settings"
+item spawns `blink.exe --settings`, a separate short-lived process that shows a
+small fixed-size egui window on eframe's OpenGL (glow) renderer. It repaints
+only on input, never continuously. Closing the window exits the process, so the
+settings UI and its GL context cost nothing while gaming.
 
-Rationale: this has the lowest possible FPS impact. An in-process GPU-backed UI
-such as egui/eframe tends to keep a GPU context resident for the life of the
-process. Raw Win32 would be marginally lighter, but needs extensive `unsafe` code
-for no measurable gain.
+Rationale: an in-process GPU-backed UI keeps a GPU context resident for the life
+of the process; a separate process that exits removes that cost entirely, so the
+toolkit choice does not affect in-game FPS. egui is MIT/Apache-2.0, and runs
+unchanged on macOS and Linux, which blink may support later. glow rather than wgpu keeps the binary and dependency tree small;
+blink already requires an NVIDIA GPU, whose drivers always provide OpenGL. Raw
+Win32 would be marginally lighter, but needs extensive `unsafe` code and is
+Windows-only.
 
 Settings exposed: output folder, clip length (seconds), hotkey, FPS,
 quality/bitrate, audio on/off, and the optional `stretch_to`.
 
-IPC: the settings process writes `%APPDATA%\blink\config.toml` atomically (write
-a temp file, then rename) and signals a named Win32 event. The engine reloads the
-config off the hot path. FPS and resolution changes restart the pipeline cleanly;
-all other changes apply live.
+IPC: there is none beyond the file and the process exit. The settings process
+writes `%APPDATA%\blink\config.toml` atomically (write a temp file, then rename)
+and exits. The engine spawned it, so it waits for that child to exit and then
+reloads the config off the hot path. Changes to FPS, video or audio bitrate,
+audio on/off, or `stretch_to` restart the pipeline cleanly (capture, encoder,
+audio, and a fresh ring). The save hotkey is suspended while the window is open and registered again
+when it closes, so a new hotkey applies live; a new clip length
+swaps in a resized ring live (the buffered clip is lost), and a new output
+folder applies to the next save. An invalid file is logged and ignored; the
+engine keeps its previous config. Hand edits to the file are picked up the next
+time the settings window closes.
 
-Two crates are planned for the implementation phase, not yet created:
-`blink-ui` (Slint) and `blink-config` (shared config types and load/save), both
-`#![forbid(unsafe_code)]` and used by both processes. The engine process must not
-depend on `blink-ui`.
+`blink-config` holds the shared config types and load/save. `blink-ui` is a
+library with one entry point, `blink_ui::run(config_path)`, which `blink-app`
+calls when started with `--settings` and which returns whether the user saved
+(a Save with no changes does not rewrite the file) or cancelled. The window
+opens the file without validating it, so out-of-range values show inline
+errors; it validates the draft every frame and disables Save while any error
+remains. A config file that does not parse is never overwritten: the settings
+window does not open and a native error dialog says why. eframe is built with
+only the glow renderer, egui's bundled fonts, and the system clipboard (no
+wgpu, accessibility, or Wayland). The crate forbids `unsafe`. The engine never calls into
+`blink-ui`, so no UI toolkit initializes in the engine process.
+
+The hotkey recorder picks the key the way the engine's registration will
+match it, so the key that records is the key that fires. `global-hotkey`
+registers a virtual-key code on Windows and a keysym on X11, both of which
+follow the keyboard layout, so the recorder prefers the key's layout meaning
+(AZERTY's A key records A) and falls back to its position for keys with no
+Latin meaning (a Cyrillic layout records the US position). macOS registers by
+position, so there the recorder prefers the position. Numpad digits record as
+digits; they fire only if the engine also registers the numpad codes.
+Ctrl+C, Ctrl+X, and Ctrl+V (Cmd on macOS) stay copy and paste for the text
+fields and cannot be recorded. egui's modifier state has no Windows-key flag
+outside macOS, so the recorder tracks the Super key presses egui reports
+instead; combinations the shell reserves (Win+L, Win+D) never reach the window.
+
+Every dependency's license and copyright notice, including the fonts egui
+embeds, is in `THIRD-PARTY-NOTICES.txt`, generated by cargo-about (`just
+notices`) and checked for staleness in CI. Release artifacts ship it next to
+`blink.exe`. The size-heavy UI crates are built at `opt-level = "s"` in the
+release profile; the engine's crates keep the default speed level.
 
 ## Open questions for the implementation phase
 

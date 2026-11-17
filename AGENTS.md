@@ -14,7 +14,7 @@ changing capture, encode, ring, or mux code.
 | `crates/blink-ring` | Encoded-packet ring buffer, tested under Miri | forbidden |
 | `crates/blink-mux` | MP4 muxing | forbidden |
 | `crates/blink-config` (planned) | Shared config types + load/save | forbidden |
-| `crates/blink-ui` (planned) | Slint settings window (`--settings` process) | forbidden |
+| `crates/blink-ui` | egui/eframe settings window (`--settings`) | forbidden |
 | `crates/blink-capture` | DXGI Desktop Duplication (Windows FFI) | allowed, documented |
 | `crates/blink-audio` | WASAPI loopback + AAC MFT (Windows FFI) | allowed, documented |
 | `crates/blink-encode` | NVENC (Windows FFI) | allowed, documented |
@@ -43,8 +43,9 @@ table, or `clippy.toml` to make code pass.
   `[target.'cfg(windows)'.dependencies]`, so the workspace builds on macOS and
   Linux.
 - Every public item has a doc comment.
-- No UI toolkit code in the engine process; UI lives in the separate settings
- process (`blink.exe --settings`).
+- The engine process links eframe/egui (one binary) but must never initialize
+  or run it. UI runs only in the short-lived `blink.exe --settings` child
+  process, through `blink_ui::run`.
 - Performance (details in `docs/ARCHITECTURE.md`): the GPU path is zero-copy
   with no CPU readback; no NVENC features that run on CUDA cores; no per-frame
   allocation; capture and encode threads never block on I/O or wait on muxing.

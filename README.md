@@ -62,6 +62,15 @@ and the toolchain bump procedure.
   unsafe policy, and the performance rules every change must respect.
 - [docs/BENCHMARKING.md](docs/BENCHMARKING.md): how to measure in-game impact.
 
+## Third-party
+
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) lists the licenses and
+copyright notices of every dependency compiled into `blink.exe`, and release
+artifacts ship it next to the binary. It includes the fonts the settings
+window's toolkit, [egui](https://github.com/emilk/egui), embeds: Ubuntu-Light
+(Ubuntu Font Licence 1.0), Hack (MIT and the Bitstream Vera licence), and
+egui-icons (MIT).
+
 ## License
 
 Licensed under either of

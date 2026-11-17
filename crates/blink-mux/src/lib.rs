@@ -1,13 +1,18 @@
 //! MP4 muxing for blink clips.
 //!
-//! Turns the encoded packets cut from the ring into an MP4 file without
-//! re-encoding. Only the box header encoding exists so far. This crate is
-//! platform-agnostic and contains no `unsafe`.
+//! [`write_mp4`] turns a [`ClipBuf`](blink_ring::ClipBuf) cut from the ring into a
+//! faststart MP4 (ISO BMFF) file without re-encoding: an `avc1` video track
+//! and, when present, an `mp4a` audio track. The writer is hand-written,
+//! platform-agnostic, and contains no `unsafe`.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::indexing_slicing)]
 
-use thiserror::Error;
+mod error;
+mod writer;
+
+pub use error::MuxError;
+pub use writer::write_mp4;
 
 /// Size in bytes of a compact (32-bit size) MP4 box header.
 pub const BOX_HEADER_LEN: usize = 8;
@@ -15,18 +20,6 @@ pub const BOX_HEADER_LEN: usize = 8;
 /// A four-character code identifying an MP4 box type, such as `moov`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FourCc(pub [u8; 4]);
-
-/// Errors produced while muxing.
-#[derive(Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MuxError {
-    /// The box is too large for a compact 32-bit size field.
-    #[error("box payload of {payload_len} bytes does not fit a 32-bit box size")]
-    BoxTooLarge {
-        /// Payload length that was requested, in bytes.
-        payload_len: usize,
-    },
-}
 
 /// Encodes a compact MP4 box header for a payload of `payload_len` bytes.
 ///
@@ -41,8 +34,8 @@ pub enum MuxError {
 /// use blink_mux::{FourCc, box_header};
 ///
 /// assert_eq!(
-///     box_header(FourCc(*b"free"), 0),
-///     Ok([0, 0, 0, 8, b'f', b'r', b'e', b'e']),
+///     box_header(FourCc(*b"free"), 0).ok(),
+///     Some([0, 0, 0, 8, b'f', b'r', b'e', b'e']),
 /// );
 /// ```
 pub fn box_header(kind: FourCc, payload_len: usize) -> Result<[u8; BOX_HEADER_LEN], MuxError> {
@@ -76,9 +69,9 @@ mod tests {
     #[test]
     fn rejects_oversized_box() {
         let payload_len = usize::try_from(u32::MAX).expect("usize is at least 32 bits");
-        assert_eq!(
+        assert!(matches!(
             box_header(FourCc(*b"mdat"), payload_len),
-            Err(MuxError::BoxTooLarge { payload_len }),
-        );
+            Err(MuxError::BoxTooLarge { payload_len: len }) if len == payload_len,
+        ));
     }
 }

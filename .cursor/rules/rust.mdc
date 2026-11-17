@@ -14,8 +14,9 @@ Enforced by `[workspace.lints]` and `just lint`. Never weaken the lints,
 - `unsafe` only in `blink-capture`, `blink-audio`, `blink-encode`. Each block
   gets a `// SAFETY:` comment and holds one unsafe operation; split otherwise.
 - `#[expect(lint, reason = "...")]`, never `#[allow]`.
-- No UI toolkit code in the engine process; UI lives in the separate settings
-  process. Planned crates `blink-ui` and `blink-config` forbid `unsafe`.
+- The engine process links eframe/egui but never initializes or runs it; UI
+  runs only in the short-lived `--settings` child process. `blink-config` and
+  `blink-ui` forbid `unsafe`.
 - Log with `tracing` only; no `println!`/`eprintln!`/`dbg!`.
 - No `as` casts (use `From`/`TryFrom`); no panicking indexing in `blink-ring`
   and `blink-mux`.

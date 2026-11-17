@@ -20,7 +20,19 @@ allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "MIT-0", "U
 confidence-threshold = 0.8
 # The allowlist is policy, not a record of current dependencies.
 unused-allowed-license = "allow"
-exceptions = []
+exceptions = [
+    # egui's bundled fonts (blink-ui only): Ubuntu-Light under the Ubuntu Font
+    # Licence, Hack under MIT plus the Bitstream Vera licence, and egui-icons
+    # under MIT. The crate's SPDX expression also names OFL-1.1, which covers
+    # a font blink does not embed. All permit embedding in any software; their
+    # texts are in THIRD-PARTY-NOTICES.txt. Scoped here, not allowed globally.
+    { crate = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+    # The Windows clipboard behind egui's copy and paste (blink-ui only).
+    # BSL-1.0 is permissive and asks only that its notice ship with source,
+    # not with binaries. Scoped to these crates, not allowed globally.
+    { crate = "clipboard-win", allow = ["BSL-1.0"] },
+    { crate = "error-code", allow = ["BSL-1.0"] },
+]
 
 [licenses.private]
 # Workspace crates set `publish = false`; their license is the workspace one.

@@ -12,8 +12,21 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1"
+known-folders = "1"
+rfd = { version = "0.18", default-features = false }
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+toml = "1"
 tracing = "0.1"
+windows = "0.62"
+
+# The OpenGL (glow) renderer only, with egui's bundled fonts and the system
+# clipboard: no wgpu, no accessibility, no Wayland. `x11` gives Linux a window
+# backend and adds nothing on Windows or macOS.
+[workspace.dependencies.eframe]
+version = "=0.37.0"
+default-features = false
+features = ["clipboard", "default_fonts", "glow", "x11"]
 
 [workspace.dependencies.tracing-subscriber]
 version = "0.3"
@@ -49,3 +62,74 @@ unwrap_used = "deny"
 codegen-units = 1
 lto = "fat"
 panic = "abort"
+strip = "symbols"
+
+# The settings window's crates, which never run in the engine process, are
+# optimized for size. Keep capture, encode, ring, and mux crates at the
+# default speed level.
+
+[profile.release.package.arboard]
+opt-level = "s"
+
+[profile.release.package.ecolor]
+opt-level = "s"
+
+[profile.release.package.eframe]
+opt-level = "s"
+
+[profile.release.package.egui]
+opt-level = "s"
+
+[profile.release.package.egui-winit]
+opt-level = "s"
+
+[profile.release.package.egui_glow]
+opt-level = "s"
+
+[profile.release.package.emath]
+opt-level = "s"
+
+[profile.release.package.epaint]
+opt-level = "s"
+
+[profile.release.package.glow]
+opt-level = "s"
+
+[profile.release.package.glutin]
+opt-level = "s"
+
+[profile.release.package.glutin-winit]
+opt-level = "s"
+
+[profile.release.package.harfrust]
+opt-level = "s"
+
+[profile.release.package.image]
+opt-level = "s"
+
+[profile.release.package.kurbo]
+opt-level = "s"
+
+[profile.release.package.peniko]
+opt-level = "s"
+
+[profile.release.package.png]
+opt-level = "s"
+
+[profile.release.package.read-fonts]
+opt-level = "s"
+
+[profile.release.package.rfd]
+opt-level = "s"
+
+[profile.release.package.skrifa]
+opt-level = "s"
+
+[profile.release.package.vello_common]
+opt-level = "s"
+
+[profile.release.package.vello_cpu]
+opt-level = "s"
+
+[profile.release.package.winit]
+opt-level = "s"
