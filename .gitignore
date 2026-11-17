@@ -1,0 +1,17 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Clips saved to the repository root by a local run
+/*.mp4
+
+# Environment and local secrets
+.env*
+!.env.example
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest a change or addition to blink
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        blink is deliberately narrow: capture the screen and system audio,
+        encode on NVENC, keep the last N seconds, save a clip. Proposals that
+        add work to the capture or encode path are weighed against the project's
+        primary goal, minimal in-game FPS loss.
+
+        Please read docs/ARCHITECTURE.md before proposing a design change.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that blink does not let you do today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like blink to do? Include alternatives you considered.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hot-path
+    attributes:
+      label: Does this touch the hot path?
+      description: Capture, color conversion, encode, the packet ring, muxing, or thread priority.
+      options:
+        - "No"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: cost
+    attributes:
+      label: Expected cost
+      description: If this touches the hot path, what per-frame or per-clip cost do you expect, and could it be avoided?
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Config examples, screenshots, links to similar behavior in other tools.
+    validations:
+      required: false

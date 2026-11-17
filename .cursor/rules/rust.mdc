@@ -1,0 +1,26 @@
+---
+description: Rust rules for the blink workspace
+globs: **/*.rs,**/Cargo.toml
+alwaysApply: false
+---
+
+# blink Rust rules
+
+Enforced by `[workspace.lints]` and `just lint`. Never weaken the lints,
+`clippy.toml`, or `rust-toolchain.toml` to make code pass.
+
+- No `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!` outside tests.
+  `thiserror` in libraries, `anyhow` only in `blink-app`.
+- `unsafe` only in `blink-capture`, `blink-audio`, `blink-encode`. Each block
+  gets a `// SAFETY:` comment and holds one unsafe operation; split otherwise.
+- `#[expect(lint, reason = "...")]`, never `#[allow]`.
+- Log with `tracing` only; no `println!`/`eprintln!`/`dbg!`.
+- No `as` casts (use `From`/`TryFrom`); no panicking indexing in `blink-ring`
+  and `blink-mux`.
+- Windows code behind `#[cfg(windows)]`, deps under
+  `[target.'cfg(windows)'.dependencies]`.
+- Document every public item.
+- Hot path (see `docs/ARCHITECTURE.md`): zero-copy GPU path, no CPU readback,
+  no CUDA-core NVENC features, no per-frame allocation, capture/encode threads
+  never block on I/O.
+- Run `just check` before finishing.

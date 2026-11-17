@@ -1,0 +1,47 @@
+# cargo-deny configuration. Started from `cargo deny init` (cargo-deny 0.21) and
+# trimmed to the settings blink changes. Reference:
+# https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[graph]
+# Windows is the shipping target; macOS and Linux are development and CI hosts.
+targets = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+# RustSec advisories are always errors; ignore entries need a reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MIT", "MIT-0", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.8
+# The allowlist is policy, not a record of current dependencies.
+unused-allowed-license = "allow"
+exceptions = []
+
+[licenses.private]
+# Workspace crates set `publish = false`; their license is the workspace one.
+ignore = true
+
+[bans]
+# The `windows-*` crates routinely appear at several versions at once.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies carry no version requirement.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

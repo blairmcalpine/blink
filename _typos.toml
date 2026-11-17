@@ -1,0 +1,9 @@
+[files]
+extend-exclude = ["Cargo.lock", "LICENSE-*", "target/"]
+
+[default]
+extend-ignore-re = [
+    # Hex literals and commit SHAs.
+    "\\b0x[0-9a-fA-F_]+\\b",
+    "\\b[0-9a-f]{40}\\b",
+]

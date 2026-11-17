@@ -1,0 +1,84 @@
+name: Bug report
+description: Report a problem with blink
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. blink is pre-alpha, so please check the known
+        limitations in the README first: black captures in some DX9-era
+        exclusive-fullscreen games, brief gaps on display mode changes, DRM
+        content, dual-GPU laptops, and NVENC session limits are all expected.
+
+        For security issues, do not file here. See SECURITY.md.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, what actually happened, and how often it reproduces.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Launch blink
+        2. Start CS2 in fullscreen at 1280x960
+        3. Press the clip hotkey
+        4. ...
+    validations:
+      required: true
+
+  - type: input
+    id: windows-version
+    attributes:
+      label: Windows version
+      description: For example "Windows 11 24H2, build 26100.2314" (from `winver`).
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model
+      placeholder: NVIDIA GeForce RTX 4070
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: NVIDIA driver version
+      description: From the NVIDIA control panel or `nvidia-smi`.
+    validations:
+      required: true
+
+  - type: input
+    id: blink-version
+    attributes:
+      label: blink version or commit
+      description: A release tag, or the commit SHA if you built from source.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Paste relevant log output with any secrets or personal paths removed.
+        Run blink with the log level raised if the default output is not enough.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Config file contents, display mode, whether the game was fullscreen or borderless, and so on.
+    validations:
+      required: false

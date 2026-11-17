@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUSTDOCFLAGS: "-D warnings"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - name: Install taplo
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: taplo
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: taplo fmt
+        run: taplo fmt --check
+
+      - name: typos
+        uses: crate-ci/typos@276087d9a4f06398b3e04825487805e2d7375888 # v1.52.2
+
+  clippy:
+    name: clippy
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: clippy
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked
+
+  test:
+    name: test
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-nextest
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: test
+
+      - name: cargo nextest
+        run: cargo nextest run --workspace --all-features --locked --no-tests=pass
+
+      - name: cargo test --doc
+        run: cargo test --doc --workspace --locked
+
+  doc:
+    name: doc
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: doc
+
+      - name: cargo doc
+        run: cargo doc --workspace --no-deps --all-features --locked
+
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install nightly with miri
+        run: rustup toolchain install nightly --component miri,rust-src
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: miri
+
+      - name: cargo miri test
+        run: cargo +nightly miri test -p blink-ring
+
+  msrv:
+    name: msrv
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          msrv="$(grep -m1 -oE '^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"[^"]+"' Cargo.toml \
+            | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' || true)"
+          if [ -z "${msrv}" ]; then
+            echo "::error file=Cargo.toml::could not read rust-version from [workspace.package]"
+            exit 1
+          fi
+          echo "MSRV ${msrv}"
+          echo "msrv=${msrv}" >> "$GITHUB_OUTPUT"
+
+      - name: Install MSRV toolchain
+        shell: bash
+        run: rustup toolchain install "${{ steps.msrv.outputs.msrv }}" --profile minimal --target x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: msrv-${{ steps.msrv.outputs.msrv }}
+
+      - name: cargo check on MSRV
+        shell: bash
+        run: cargo +${{ steps.msrv.outputs.msrv }} check --workspace --all-targets --locked
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
+        with:
+          command: check
+          arguments: --all-features
+
+  machete:
+    name: machete
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-machete
+
+      - name: cargo machete
+        run: cargo machete
+
+  ci-success:
+    name: ci-success
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - format
+      - clippy
+      - test
+      - doc
+      - miri
+      - msrv
+      - deny
+      - machete
+    steps:
+      - name: Fail if any required job did not succeed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: |
+          echo "One or more required jobs did not succeed."
+          echo '${{ toJSON(needs) }}'
+          exit 1
+
+      - name: All required jobs succeeded
+        run: echo "All required jobs succeeded."
