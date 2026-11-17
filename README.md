@@ -7,7 +7,8 @@ blink exists for one reason: clipping should not cost frames. Capture runs
 through DXGI Desktop Duplication, H.264 encoding runs on the GPU through NVIDIA
 NVENC without a copy back to system memory, and only encoded packets are kept in
 memory. Saving a clip cuts the ring buffer at a keyframe and remuxes it, so the
-clip is never re-encoded.
+clip is never re-encoded. blink lives in the system tray, and a minimal settings
+window opens only on demand in a separate process.
 
 ## Status
 

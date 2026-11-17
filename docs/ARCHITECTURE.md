@@ -24,6 +24,9 @@ flowchart LR
   NVENC --> Ring["blink-ring encoded packet ring buffer (last N seconds, GOP-aligned)"]
   WASAPI["blink-audio WASAPI loopback"] --> AAC["AAC encode (Media Foundation MFT)"] --> Ring
   Ring -->|on hotkey| Mux["blink-mux MP4 writer"] --> File[clip.mp4]
+  Tray["Tray icon (main process)"] -->|Settings item| Settings["blink.exe --settings (Slint window)"]
+  Settings -->|"writes config.toml, signals event"| Config[("config.toml")]
+  Config -->|reload off hot path| Hotkey
 ```
 
 Two properties define the design:
@@ -44,6 +47,8 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-app` | Binary. Hotkey registration, configuration, wiring, `tracing` setup. | `#![forbid(unsafe_code)]` |
 | `crates/blink-ring` | Platform-agnostic encoded-packet ring buffer, GOP-aligned eviction. | `#![forbid(unsafe_code)]`, tests run under Miri |
 | `crates/blink-mux` | Platform-agnostic MP4 muxing, including the `pasp` box for stretch. | `#![forbid(unsafe_code)]` |
+| `crates/blink-config` (planned) | Shared config types and load/save, used by both processes. | `#![forbid(unsafe_code)]` |
+| `crates/blink-ui` (planned) | Slint settings window for the `--settings` process. | `#![forbid(unsafe_code)]` |
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-audio` | WASAPI loopback capture and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-encode` | NVENC session management, resource registration, encode calls. | `unsafe` allowed; every block needs `// SAFETY:` |
@@ -236,6 +241,33 @@ mode resolution (1280x960, say) rather than a pre-scaled native image under the
 different GPU scaling settings (full panel, aspect ratio, no scaling). If the
 compositor pre-scales, `stretch_to` has nothing to stretch and the design needs
 revisiting.
+
+## Settings UI
+
+The main `blink` process contains only the capture engine and a system tray icon
+(the `tray-icon` crate, driven by an idle Win32 message loop). No UI toolkit is
+loaded in it. The tray's "Settings" item spawns `blink.exe --settings`, a
+separate short-lived process that shows a minimal Slint window using Slint's
+software renderer: CPU only, redrawing only on change, no GPU. Closing the
+window exits the process, so the settings UI costs nothing while gaming.
+
+Rationale: this has the lowest possible FPS impact. An in-process GPU-backed UI
+such as egui/eframe tends to keep a GPU context resident for the life of the
+process. Raw Win32 would be marginally lighter, but needs extensive `unsafe` code
+for no measurable gain.
+
+Settings exposed: output folder, clip length (seconds), hotkey, FPS,
+quality/bitrate, audio on/off, and the optional `stretch_to`.
+
+IPC: the settings process writes `%APPDATA%\blink\config.toml` atomically (write
+a temp file, then rename) and signals a named Win32 event. The engine reloads the
+config off the hot path. FPS and resolution changes restart the pipeline cleanly;
+all other changes apply live.
+
+Two crates are planned for the implementation phase, not yet created:
+`blink-ui` (Slint) and `blink-config` (shared config types and load/save), both
+`#![forbid(unsafe_code)]` and used by both processes. The engine process must not
+depend on `blink-ui`.
 
 ## Open questions for the implementation phase
 
