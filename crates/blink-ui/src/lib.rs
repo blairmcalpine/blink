@@ -170,10 +170,13 @@ mod tests {
 
     #[test]
     fn describe_includes_the_source_chain() {
-        let dir = std::env::temp_dir();
-        let err = Config::load_unvalidated(&dir).unwrap_err();
+        let path =
+            std::env::temp_dir().join(format!("blink-ui-describe-{}.toml", std::process::id()));
+        std::fs::write(&path, "clip_seconds = \"long\"\n").unwrap();
+        let err = Config::load_unvalidated(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
         let message = describe(&err);
-        let prefix = format!("failed to read config {}", dir.display());
+        let prefix = format!("failed to parse config {}", path.display());
         assert!(message.starts_with(&prefix), "{message}");
         assert!(message.contains(": "), "{message}");
     }
