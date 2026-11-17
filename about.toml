@@ -1,0 +1,32 @@
+# cargo-about configuration for THIRD-PARTY-NOTICES.txt. Regenerate with
+# `just notices`; `just notices-check` (part of `just check`) fails when the
+# file is stale. Both run cargo-about with `--offline`, so it reads only the
+# license files inside each crate and the output is the same on every machine.
+
+# The notices cover what ships: the Windows binary.
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# Workspace crates are blink itself, under the repository's own licenses.
+private = { ignore = true }
+
+# Keep in step with the allow-list and exceptions in deny.toml.
+accepted = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[epaint_default_fonts]
+accepted = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[clipboard-win]
+accepted = ["BSL-1.0"]
+
+[error-code]
+accepted = ["BSL-1.0"]

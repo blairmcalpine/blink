@@ -28,6 +28,7 @@ rustup toolchain install nightly
 | `cargo-nextest` | Test runner used by `just test` |
 | `cargo-deny` | License, advisory, ban, and source checks |
 | `cargo-machete` | Unused dependency detection |
+| `cargo-about` | Generates `THIRD-PARTY-NOTICES.txt` (install with `--features cli`) |
 | `cargo-xwin` | Lints Windows code from macOS or Linux |
 | `taplo-cli` | TOML formatting and checking |
 | `typos-cli` | Spell checking |
@@ -36,6 +37,7 @@ rustup toolchain install nightly
 ```sh
 cargo install --locked just cargo-nextest cargo-deny cargo-machete cargo-xwin \
   taplo-cli typos-cli lefthook
+cargo install --locked --features cli cargo-about
 ```
 
 `cargo-xwin` needs LLVM, because it typechecks against Windows headers and may
@@ -88,7 +90,9 @@ It must pass. CI runs the same set of checks.
 | `just deny` | Licenses, advisories, dependency bans, and sources |
 | `just doc` | Build docs with `RUSTDOCFLAGS=-D warnings` |
 | `just machete` | Detect unused dependencies |
-| `just check` | All of the above |
+| `just notices-check` | Fail if `THIRD-PARTY-NOTICES.txt` is out of date |
+| `just notices` | Regenerate `THIRD-PARTY-NOTICES.txt`; run it after any dependency change |
+| `just check` | All of the above except `just fmt` and `just notices` |
 
 ## Code rules
 

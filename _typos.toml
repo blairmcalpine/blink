@@ -1,5 +1,5 @@
 [files]
-extend-exclude = ["Cargo.lock", "LICENSE-*", "target/"]
+extend-exclude = ["Cargo.lock", "LICENSE-*", "THIRD-PARTY-NOTICES.txt", "target/"]
 
 [default]
 extend-ignore-re = [
@@ -7,3 +7,11 @@ extend-ignore-re = [
     "\\b0x[0-9a-fA-F_]+\\b",
     "\\b[0-9a-f]{40}\\b",
 ]
+
+[default.extend-words]
+# ISO BMFF track box.
+trak = "trak"
+# nvEncodeAPI.h identifiers: `enablePTD` (picture type decision) and the
+# header's own spelling of `NV_ENC_ERR_EVENT_NOT_REGISTERD`.
+ptd = "ptd"
+registerd = "registerd"

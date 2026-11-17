@@ -67,5 +67,43 @@ doc:
 machete:
     cargo machete
 
+# Regenerate THIRD-PARTY-NOTICES.txt, which ships next to blink.exe.
+notices:
+    just _notices THIRD-PARTY-NOTICES.txt
+
+# Fail if THIRD-PARTY-NOTICES.txt is out of date.
+notices-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fresh="$(mktemp)"
+    trap 'rm -f "$fresh"' EXIT
+    just _notices "$fresh"
+    if ! diff -u THIRD-PARTY-NOTICES.txt "$fresh"; then
+        echo "THIRD-PARTY-NOTICES.txt is out of date; run 'just notices'." >&2
+        exit 1
+    fi
+
+# cargo-about's crate licenses, then the licenses of the fonts egui embeds,
+# which are in epaint_default_fonts but not its package metadata.
+_notices out:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo fetch --locked --quiet
+    cargo about generate --locked --offline about.hbs -o "{{ out }}"
+    manifest="$(cargo metadata --format-version 1 --locked --offline \
+        | grep -oE '"manifest_path":"[^"]*epaint_default_fonts-[0-9.]+[/\\]+Cargo.toml"' \
+        | head -n 1 | cut -d '"' -f 4)"
+    crate="$(dirname "$manifest")"
+    rule="================================================================================"
+    {
+        printf '\n%s\nFonts embedded by egui (%s)\n' "$rule" "$(basename "$crate")"
+        printf '\nUbuntu-Light:\n\n'
+        cat "$crate/fonts/UFL.txt"
+        printf '\nHack-Regular:\n\n'
+        cat "$crate/fonts/Hack-Regular.txt"
+        printf '\negui-icons (emoji-icon-font):\n\n'
+        cat "$crate/fonts/emoji-icon-font-mit-license.txt"
+    } >> "{{ out }}"
+
 # Everything CI checks. Must pass before a pull request.
-check: fmt-check taplo-check typos lint test miri deny doc machete
+check: fmt-check taplo-check typos lint test miri deny doc machete notices-check

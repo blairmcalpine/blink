@@ -210,6 +210,27 @@ jobs:
       - name: cargo machete
         run: cargo machete
 
+  notices:
+    name: notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - name: Install cargo-about and just
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-about@0.9.3,just
+
+      - name: THIRD-PARTY-NOTICES.txt is current
+        run: just notices-check
+
   ci-success:
     name: ci-success
     if: always()
@@ -223,6 +244,7 @@ jobs:
       - msrv
       - deny
       - machete
+      - notices
     steps:
       - name: Fail if any required job did not succeed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
