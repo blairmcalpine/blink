@@ -275,7 +275,8 @@ fn settle(now: Timestamp) {
 fn write(temp: &Path, clip: &ClipBuf) -> anyhow::Result<()> {
     let file =
         File::create(temp).with_context(|| format!("failed to create {}", temp.display()))?;
-    blink_mux::write_mp4(&file, clip).context("failed to write the MP4")?;
+    blink_mux::write_mp4(&file, clip)
+        .with_context(|| format!("failed to mux {}", temp.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to flush {}", temp.display()))
 }

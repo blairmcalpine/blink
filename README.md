@@ -31,9 +31,9 @@ loaded from the installed driver at runtime.
 ## Building
 
 The workspace builds and lints on macOS and Linux as well as Windows. Windows
-capture, audio, encode, and system code is gated behind `cfg(windows)` and
-compiles to a stub elsewhere, so `cargo check`, `cargo test`, and `cargo clippy` work on any
-host.
+capture, audio, encode, and system code is gated behind `cfg(windows)`, and
+those crates export only their portable parts elsewhere, so `cargo check`,
+`cargo test`, and `cargo clippy` work on any host.
 
 ```sh
 just check

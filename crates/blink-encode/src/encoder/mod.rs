@@ -23,8 +23,8 @@ use crate::idr::IdrScheduler;
 use crate::params::{TUNING, apply_config, fill_initialize, preset_guid};
 use crate::{EncodeError, EncoderConfig};
 
-/// Registered textures kept at once: the three-texture capture pool plus one
-/// spare.
+/// Registered textures kept at once: the capture pool
+/// (`blink_capture::TEXTURE_POOL_SIZE`) plus one spare.
 ///
 /// Each registration holds a texture alive (about 33 MB at 4K), so the cap
 /// bounds what a replaced pool can pin if `release_textures` is missed.

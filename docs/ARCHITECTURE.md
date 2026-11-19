@@ -51,7 +51,7 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-audio` | WASAPI loopback capture and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-encode` | NVENC session management, resource registration, encode calls. | `unsafe` allowed; every block needs `// SAFETY:` |
-| `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex, and the tray thread's message pump. | `unsafe` allowed; every block needs `// SAFETY:` |
+| `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex, and the tray thread's message pump. Also the portable helpers they share: `Backoff`, `ErrorChain`, and the replacing and no-replace file renames. | `unsafe` allowed; every block needs `// SAFETY:` |
 
 The four FFI crates are the only place `unsafe` is permitted. They are also
 where bugs are most expensive, so they carry the strictest review bar.
@@ -76,7 +76,10 @@ workspace compiles.
 
 - The FFI crates declare Windows dependencies under
   `[target.'cfg(windows)'.dependencies]` and gate their modules with
-  `#[cfg(windows)]`. On other hosts they compile to a stub.
+  `#[cfg(windows)]`. On other hosts they export only their portable items
+  (config, errors, pure logic). The entry points of `blink-capture` and
+  `blink-audio` also have stubs that return an `Unsupported` error;
+  `blink-encode` and `blink-sys` have none.
 - `cargo check`, `cargo test`, and `cargo clippy` therefore work for the whole
   workspace on macOS and Linux.
 - Windows code is typechecked from other hosts with
@@ -84,7 +87,7 @@ workspace compiles.
   and can fail on C build scripts that need libclang, so it is best effort
   locally. `windows-latest` CI is authoritative.
 
-The stub is a compile-time convenience, not a fallback. A stubbed build must
+The stubs are a compile-time convenience, not a fallback. A stubbed build must
 report that capture is unavailable rather than silently doing nothing.
 
 ## Architecture decisions
