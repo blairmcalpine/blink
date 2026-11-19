@@ -4,7 +4,7 @@ use blink_ring::media::PacketMeta;
 
 /// Receives encoded AAC frames on the audio thread.
 ///
-/// `blink-app` implements this by locking its `Arc<Mutex<ClipRing>>` and
+/// `blink-app` implements this by locking its shared ring (`SharedRing`) and
 /// pushing the packet, which copies the payload into the ring's preallocated
 /// arena. Keep the call short and never block on I/O: the audio thread drains
 /// the WASAPI buffer between calls, and that buffer holds about half a second.

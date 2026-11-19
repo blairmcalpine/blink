@@ -1,4 +1,5 @@
-//! Media types shared by the capture, encode, audio, ring, and mux crates.
+//! Media types shared across the pipeline: the capture, encode, audio, ring,
+//! and mux crates, and `blink-sys`'s clock.
 
 use std::time::Duration;
 

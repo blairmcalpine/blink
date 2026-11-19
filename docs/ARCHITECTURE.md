@@ -1,13 +1,12 @@
 # Architecture
 
 This document records the design of blink: the pipeline, the crate layout, the
-rules that govern each crate's `unsafe` usage, and the decisions already made
-before any capture, encode, or mux code was written. It exists so that
-implementers, human or agent, follow one design instead of re-litigating it per
-pull request.
+rules that govern each crate's `unsafe` usage, and the decisions behind them. It
+exists so that implementers, human or agent, follow one design instead of
+re-litigating it per pull request.
 
-blink is pre-alpha. Everything here describes intent; most of it is not
-implemented yet.
+blink is pre-alpha. The pipeline described here is implemented; what is still
+open is marked below.
 
 Items that cannot be settled without a GPU and a Windows host are marked **needs
 hardware verification**; a few others are marked **to confirm before
@@ -47,7 +46,7 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-app` | Binary. Hotkey registration, configuration, wiring, `tracing` setup. | `#![forbid(unsafe_code)]` |
 | `crates/blink-ring` | Platform-agnostic encoded-packet ring buffer, GOP-aligned eviction. | `#![forbid(unsafe_code)]`, tests run under Miri |
 | `crates/blink-mux` | Platform-agnostic MP4 muxing, including the `pasp` box for stretch. | `#![forbid(unsafe_code)]` |
-| `crates/blink-config` (planned) | Shared config types and load/save, used by both processes. | `#![forbid(unsafe_code)]` |
+| `crates/blink-config` | Shared config types and load/save, used by both processes. | `#![forbid(unsafe_code)]` |
 | `crates/blink-ui` | egui/eframe settings window for the `--settings` process. | `#![forbid(unsafe_code)]` |
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-audio` | WASAPI loopback capture and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
@@ -102,20 +101,17 @@ different source, and no component re-derives timestamps from arrival order.
 ### Variable frame rate
 
 DXGI Desktop Duplication only returns a frame when the screen content changes,
-so the duplicated frame rate is inherently variable. There are two ways to
-produce a conformant MP4, and the implementation spike picks one:
+so the duplicated frame rate is inherently variable. blink writes a
+variable-frame-rate MP4 rather than repeating frames to hold a constant rate:
+each encoded frame keeps its capture timestamp, the ring stores it, and the
+muxer writes per-sample durations from consecutive timestamps. Nothing is
+encoded while the screen is static except the periodic IDR refresh that keeps
+a clip start available. Repeating frames would cost encoder work per held
+frame, which the no-extra-work goal rules out.
 
-- Repeat the last frame on the CPU or GPU to hold a constant frame rate, which
-  costs work per held frame; or
-- Write a variable-frame-rate MP4 with correct per-frame timestamps, which costs
-  nothing at capture time but needs muxer support and correct handling in
-  players.
-
-Preference is the variable-frame-rate track, because it aligns with the
-no-extra-work goal. **Needs verification**: confirm, with hardware and the
-players people actually use (editors and share targets included), that the
-timestamps are handled correctly. This is the one decision the implementation
-spike must settle before the ring's packet format is fixed.
+**Needs verification**: confirm, with hardware and the players people actually
+use (editors and share targets included), that the timestamps are handled
+correctly.
 
 ### Audio gaps
 
@@ -360,10 +356,10 @@ notices`) and checked for staleness in CI. Release artifacts ship it next to
 `blink.exe`. The size-heavy UI crates are built at `opt-level = "s"` in the
 release profile; the engine's crates keep the default speed level.
 
-## Open questions for the implementation phase
+## Decisions settled during implementation
 
-- NVENC bindings: an existing crate, or our own `bindgen`-generated
-  `blink-nvenc-sys` with pre-generated bindings checked in so builds do not need
-  libclang.
-- MP4 muxer: an existing crate, or a minimal hand-written writer. The `pasp` box
-  and variable-frame-rate support above constrain the choice.
+- NVENC bindings are hand-written declarations in `crates/blink-encode/src/ffi`,
+  covering only the API blink calls. Nothing is generated at build time, so no
+  libclang is needed; `ffi/README.md` records the header version they follow.
+- The MP4 muxer is a minimal hand-written writer in `blink-mux`, which keeps
+  the `pasp` box and variable-frame-rate sample durations under our control.

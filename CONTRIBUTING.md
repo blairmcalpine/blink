@@ -82,6 +82,9 @@ It must pass. CI runs the same set of checks.
 | Recipe | What it does |
 | --- | --- |
 | `just fmt` | Format Rust and TOML |
+| `just fmt-check` | Fail if Rust code is not formatted |
+| `just taplo-check` | Fail if TOML files are not formatted |
+| `just typos` | Spell-check the repository |
 | `just lint` | Host clippy plus Windows clippy through `cargo xwin`, both `-D warnings` |
 | `just lint-host` | Clippy for the host target only |
 | `just lint-windows` | Clippy for `x86_64-pc-windows-msvc` only |
@@ -115,8 +118,9 @@ that fights the compiler.
   errors as `error = %ErrorChain(&error)` (`blink_sys::ErrorChain`) so the
   source chain, including any HRESULT, reaches the log.
 - Windows code stays behind `#[cfg(windows)]`. FFI crates declare their
-  dependencies under `[target.'cfg(windows)'.dependencies]` and compile to a
-  stub elsewhere, so the whole workspace keeps building on macOS and Linux.
+  dependencies under `[target.'cfg(windows)'.dependencies]` and export only
+  their portable items elsewhere, so the whole workspace keeps building on
+  macOS and Linux.
 - No gratuitous `as` casts; prefer `From`/`TryFrom`. Indexing that could panic is
   denied in `blink-ring` and `blink-mux`.
 - Read the performance rules in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)

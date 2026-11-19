@@ -9,9 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Repository foundation: Cargo workspace with `blink-app`, `blink-ring`,
-  `blink-mux`, `blink-capture`, `blink-audio`, and `blink-encode` crate
-  skeletons, with Windows-only code gated behind `cfg(windows)`.
+- `blink-capture`: DXGI Desktop Duplication into a pool of GPU textures, with
+  device-loss and mode-change recovery.
+- `blink-encode`: NVENC H.264 encoding straight from the captured D3D11
+  textures through hand-written bindings, with periodic and on-demand IDRs.
+- `blink-audio`: WASAPI loopback capture of system audio, a QPC-anchored
+  timeline that fills silence and corrects drift, and AAC-LC encoding through
+  the Media Foundation encoder.
+- `blink-ring`: the preallocated encoded-packet ring with whole-GOP eviction
+  and GOP-aligned clip cuts, tested under Miri.
+- `blink-mux`: a hand-written faststart MP4 writer for variable-frame-rate
+  H.264 and AAC, including the `pasp` box for stretched output.
+- `blink-config`: the shared TOML config with validation and atomic saves.
+- `blink-ui`: the egui settings window, run in a separate `--settings`
+  process.
+- `blink-sys`: shared Win32 plumbing (QPC clock, thread priority, single
+  instance, message pump) plus retry backoff, error-chain rendering, and
+  rename helpers.
+- `blink-app`: the tray app that wires the pipeline together, with the save
+  hotkey, live settings reload, clip saving off the hot path, and file logging
+  with crash reports.
 - Strict workspace lints, `just` recipes, `lefthook` hooks, and CI covering
   formatting, clippy on the host and Windows target, tests, Miri, dependencies,
   and documentation.
@@ -19,5 +36,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`docs/BENCHMARKING.md`).
 - Open-source scaffolding: dual MIT/Apache-2.0 license, README, contributing
   guide, security policy, and issue and pull request templates.
-
-No functional capture, encode, or muxing code exists yet.
