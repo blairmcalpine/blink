@@ -32,9 +32,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use blink_capture::{SingleInstance, ThreadPriority};
 use blink_config::Config;
 use blink_ring::media::Timestamp;
+use blink_sys::{SingleInstance, ThreadPriority};
 
 use self::audio::AudioSupervisor;
 use self::save::{SaveRequest, Saver, local_time};
@@ -106,7 +106,7 @@ fn report_in_background(level: rfd::MessageLevel, message: String) {
 /// Runs the recorder until Quit. Startup failures are returned; the caller
 /// logs and shows them.
 pub(crate) fn run() -> anyhow::Result<ExitCode> {
-    if let Err(error) = blink_capture::set_current_thread_priority(ThreadPriority::BelowNormal) {
+    if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
         tracing::warn!(%error, "could not lower the tray thread priority");
     }
     let Some(_instance) = SingleInstance::acquire(INSTANCE_MUTEX)
@@ -212,7 +212,7 @@ impl Engine {
     /// The tray thread's loop. Returns the process exit code.
     fn run(&mut self) -> ExitCode {
         loop {
-            if !blink_capture::pump_messages(TICK) {
+            if !blink_sys::pump_messages(TICK) {
                 tracing::info!("window messages ended; quitting");
                 return ExitCode::SUCCESS;
             }
@@ -315,8 +315,8 @@ impl Engine {
     }
 
     fn request_save(&self) {
-        let now = match blink_capture::qpc_now() {
-            Ok(now) => Timestamp(now),
+        let now = match blink_sys::qpc_now() {
+            Ok(now) => now,
             Err(error) => {
                 tracing::error!(%error, "cannot read the clock; clip not saved");
                 return;

@@ -27,19 +27,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use blink_ring::media::AudioFormat;
+use blink_sys::ThreadPriority;
 use tracing::{debug, info, warn};
 use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-};
 
 use self::com::MediaRuntime;
 use self::encoder::AacEncoder;
 use self::wasapi::{LoopbackStream, PacketInfo};
 use crate::backoff::Backoff;
-use crate::qpc::QpcClock;
 use crate::timeline::{Correction, Event, Packet, Timeline};
 use crate::{AudioConfig, AudioError, AudioSink};
 
@@ -192,7 +188,9 @@ where
     S: AudioSink,
     F: FnOnce(&AudioFormat) -> S,
 {
-    lower_priority();
+    if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
+        warn!(?error, "could not lower the audio thread priority");
+    }
     let runtime = MediaRuntime::init()?;
     let result = capture(config, make_sink, stop, ready);
     drop(runtime);
@@ -212,7 +210,6 @@ where
     S: AudioSink,
     F: FnOnce(&AudioFormat) -> S,
 {
-    let clock = qpc_clock()?;
     let mut encoder = AacEncoder::new(config)?;
     // SAFETY: COM is initialized on this thread; creates an in-process object
     // with no aggregation.
@@ -227,7 +224,7 @@ where
     drop(ready);
     info!(bitrate_kbps = config.bitrate.kbps(), "audio encoder ready");
 
-    let mut timeline = Timeline::new(now(clock)?);
+    let mut timeline = Timeline::new(blink_sys::qpc_now()?.ticks());
     let mut on_event = |event: Event<'_>| match event {
         Event::Chunk(chunk) => encoder.encode(chunk, &mut sink),
         Event::SegmentEnd => encoder.drain(&mut sink),
@@ -238,7 +235,7 @@ where
     while !stop.load(Ordering::Acquire) {
         endpoint.ensure_open();
         endpoint.wait();
-        let now = now(clock)?;
+        let now = blink_sys::qpc_now()?.ticks();
         endpoint.drain(&mut |packet, info: PacketInfo| {
             if info.discontinuity {
                 debug!("loopback data discontinuity");
@@ -430,27 +427,4 @@ impl Endpoint {
         }
         Ok(())
     }
-}
-
-fn lower_priority() {
-    // SAFETY: returns a pseudo-handle for the calling thread; no arguments.
-    let thread = unsafe { GetCurrentThread() };
-    // SAFETY: the pseudo-handle is always valid for the calling thread.
-    if let Err(error) = unsafe { SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL) } {
-        warn!(?error, "could not lower the audio thread priority");
-    }
-}
-
-fn qpc_clock() -> Result<QpcClock, AudioError> {
-    let mut frequency = 0_i64;
-    // SAFETY: the out-pointer refers to a live local.
-    unsafe { QueryPerformanceFrequency(&raw mut frequency) }.context("read the QPC frequency")?;
-    QpcClock::new(frequency).ok_or(AudioError::InvalidQpcFrequency(frequency))
-}
-
-fn now(clock: QpcClock) -> Result<i64, AudioError> {
-    let mut counter = 0_i64;
-    // SAFETY: the out-pointer refers to a live local.
-    unsafe { QueryPerformanceCounter(&raw mut counter) }.context("read the QPC counter")?;
-    Ok(clock.to_ticks(counter))
 }

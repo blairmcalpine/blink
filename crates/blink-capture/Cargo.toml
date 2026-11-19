@@ -12,6 +12,7 @@ publish.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+blink-sys = { path = "../blink-sys" }
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]
@@ -23,10 +24,6 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
-    "Win32_Security",
-    "Win32_System_Performance",
-    "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
 ]
 
 [lints]

@@ -16,9 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
-use blink_capture::{BackgroundMode, ThreadPriority};
 use blink_ring::ClipBuf;
 use blink_ring::media::Timestamp;
+use blink_sys::{BackgroundMode, ThreadPriority};
 use time::OffsetDateTime;
 
 use super::EngineEvent;
@@ -102,7 +102,7 @@ impl Saver {
             settle,
             || {
                 if let Err(error) =
-                    blink_capture::set_current_thread_priority(ThreadPriority::BelowNormal)
+                    blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal)
                 {
                     tracing::warn!(%error, "could not lower the save thread priority");
                 }
@@ -270,11 +270,11 @@ fn saved(request: &Written, path: &Path, clip: &ClipBuf) {
 /// Waits until [`SETTLE`] after `now` on the QPC clock.
 fn settle(now: Timestamp) {
     let target = now.saturating_add(SETTLE);
-    let Ok(current) = blink_capture::qpc_now() else {
+    let Ok(current) = blink_sys::qpc_now() else {
         thread::sleep(Duration::from_millis(200));
         return;
     };
-    let remaining = target.saturating_sub(Timestamp(current)).ticks();
+    let remaining = target.saturating_sub(current).ticks();
     if let Ok(ticks) = u64::try_from(remaining) {
         // 100 ns ticks.
         thread::sleep(Duration::from_nanos(ticks.saturating_mul(100)));

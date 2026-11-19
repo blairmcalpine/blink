@@ -55,10 +55,10 @@ pub enum CaptureError {
     #[cfg(windows)]
     #[error("no adapter owns the primary desktop output")]
     NoPrimaryOutput,
-    /// `QueryPerformanceFrequency` returned a non-positive frequency.
+    /// The QPC clock could not be read.
     #[cfg(windows)]
-    #[error("invalid QPC frequency {0}")]
-    InvalidQpcFrequency(i64),
+    #[error(transparent)]
+    Clock(#[from] blink_sys::SysError),
     /// The duplicated desktop image is not `DXGI_FORMAT_B8G8R8A8_UNORM`.
     #[cfg(windows)]
     #[error("unsupported desktop image format {0:?}")]

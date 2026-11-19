@@ -1,5 +1,10 @@
 //! Media types shared by the capture, encode, audio, ring, and mux crates.
 
+use std::time::Duration;
+
+/// Nanoseconds in one [`Timestamp`] tick.
+const NANOS_PER_TICK: u64 = 100;
+
 /// A point or span on blink's single media clock, in 100 ns ticks.
 ///
 /// Both video and audio timestamps come from the Windows Query Performance
@@ -15,6 +20,25 @@ impl Timestamp {
 
     /// The zero timestamp.
     pub const ZERO: Self = Self(0);
+
+    /// Creates a timestamp from a raw tick count.
+    #[must_use]
+    pub const fn from_ticks(ticks: i64) -> Self {
+        Self(ticks)
+    }
+
+    /// Converts a span to a `Duration`. Negative spans are zero.
+    #[must_use]
+    pub const fn to_duration(self) -> Duration {
+        if self.0 <= 0 {
+            return Duration::ZERO;
+        }
+        let ticks = self.0.unsigned_abs();
+        let per_second = Self::TICKS_PER_SECOND.unsigned_abs();
+        // The remainder is below 10^7 ticks, so its nanoseconds fit easily.
+        Duration::from_secs(ticks / per_second)
+            .saturating_add(Duration::from_nanos((ticks % per_second) * NANOS_PER_TICK))
+    }
 
     /// Creates a timestamp from a whole number of seconds, saturating on overflow.
     #[must_use]

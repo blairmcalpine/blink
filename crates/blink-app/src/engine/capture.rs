@@ -11,13 +11,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use blink_capture::{
-    CaptureDevice, CaptureError, CaptureEvent, CapturedFrame, DesktopDuplicator, ThreadPriority,
-};
+use blink_capture::{CaptureDevice, CaptureError, CaptureEvent, CapturedFrame, DesktopDuplicator};
 use blink_config::Config;
 use blink_encode::{EncodeError, Encoder};
 use blink_ring::PushOutcome;
 use blink_ring::media::{Timestamp, VideoFormat};
+use blink_sys::{SysError, ThreadPriority};
 
 use super::EngineEvent;
 use super::signal::StopSignal;
@@ -65,6 +64,12 @@ impl From<CaptureError> for Failure {
     }
 }
 
+impl From<SysError> for Failure {
+    fn from(error: SysError) -> Self {
+        Self::Retry(error.into())
+    }
+}
+
 impl From<EncodeError> for Failure {
     fn from(error: EncodeError) -> Self {
         match error {
@@ -99,7 +104,7 @@ impl Run<'_> {
 }
 
 fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<EngineEvent>) {
-    if let Err(error) = blink_capture::set_current_thread_priority(ThreadPriority::BelowNormal) {
+    if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
         tracing::warn!(%error, "could not lower the capture thread priority");
     }
     let Some(fps) = NonZeroU32::new(config.fps) else {
@@ -188,7 +193,7 @@ fn session(
                 }
             }
             CaptureEvent::Unchanged { timestamp } => state.refresh_idr(Timestamp(timestamp))?,
-            CaptureEvent::Timeout => state.refresh_idr(Timestamp(blink_capture::qpc_now()?))?,
+            CaptureEvent::Timeout => state.refresh_idr(blink_sys::qpc_now()?)?,
         }
     }
     Ok(())
@@ -240,7 +245,7 @@ impl State<'_> {
                 run.encoded_any = false;
                 let since = match run.paused_since {
                     Some(since) => since,
-                    None => Timestamp(blink_capture::qpc_now()?),
+                    None => blink_sys::qpc_now()?,
                 };
                 run.paused_since = Some(since);
                 run.report(CaptureState::Unsupported {

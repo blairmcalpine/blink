@@ -17,9 +17,10 @@ pub enum AudioError {
         #[source]
         source: windows::core::Error,
     },
-    /// `QueryPerformanceFrequency` returned a non-positive frequency.
-    #[error("invalid QPC frequency {0}")]
-    InvalidQpcFrequency(i64),
+    /// The QPC clock could not be read.
+    #[cfg(windows)]
+    #[error(transparent)]
+    Clock(#[from] blink_sys::SysError),
     /// The endpoint accepted none of the capture formats blink can consume
     /// (48 kHz stereo float or 16-bit PCM, converted by the audio engine or
     /// native), and resampling is out of scope.

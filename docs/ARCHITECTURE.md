@@ -52,8 +52,9 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-audio` | WASAPI loopback capture and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-encode` | NVENC session management, resource registration, encode calls. | `unsafe` allowed; every block needs `// SAFETY:` |
+| `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex, and the tray thread's message pump. | `unsafe` allowed; every block needs `// SAFETY:` |
 
-The three FFI crates are the only place `unsafe` is permitted. They are also
+The four FFI crates are the only place `unsafe` is permitted. They are also
 where bugs are most expensive, so they carry the strictest review bar.
 
 Rules that apply everywhere:
@@ -93,7 +94,9 @@ report that capture is unavailable rather than silently doing nothing.
 
 One timeline, based on the Windows Query Performance Counter. Video frames and
 WASAPI packets both carry presentation timestamps in that clock, and the ring
-stores the PTS with every packet. Nothing downstream computes time from a
+stores the PTS with every packet. `blink-sys` owns the conversion from QPC
+counts to 100 ns `Timestamp` ticks (`QpcClock`) and the `qpc_now` reading that
+capture, audio, and save requests share. Nothing downstream computes time from a
 different source, and no component re-derives timestamps from arrival order.
 
 ### Variable frame rate

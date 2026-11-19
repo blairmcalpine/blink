@@ -151,6 +151,7 @@ dependencies = [
  "blink-encode",
  "blink-mux",
  "blink-ring",
+ "blink-sys",
  "blink-ui",
  "global-hotkey",
  "keyboard-types",
@@ -168,6 +169,7 @@ name = "blink-audio"
 version = "0.0.0"
 dependencies = [
  "blink-ring",
+ "blink-sys",
  "thiserror 2.0.21",
  "tracing",
  "windows",
@@ -177,6 +179,7 @@ dependencies = [
 name = "blink-capture"
 version = "0.0.0"
 dependencies = [
+ "blink-sys",
  "thiserror 2.0.21",
  "tracing",
  "windows",
@@ -217,6 +220,16 @@ version = "0.0.0"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "blink-sys"
+version = "0.0.0"
+dependencies = [
+ "blink-ring",
+ "thiserror 2.0.21",
+ "tracing",
+ "windows",
 ]
 
 [[package]]

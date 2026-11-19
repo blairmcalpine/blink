@@ -4,6 +4,7 @@ use std::num::NonZeroU32;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use blink_sys::{QpcClock, qpc_counter};
 use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
@@ -17,11 +18,9 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice,
     IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::Interface;
 
 use crate::backoff::{Backoff, MAX_RETRY_DELAY};
-use crate::clock::QpcClock;
 use crate::decision::{
     Acquired, FrameAction, Staleness, TimeoutAction, acquire_timeout_ms, decide, monotonic,
     on_timeout,
@@ -225,11 +224,7 @@ impl DesktopDuplicator {
         // reference to its immediate context.
         let context =
             unsafe { device.GetImmediateContext() }.context("get the immediate context")?;
-        let mut frequency = 0;
-        // SAFETY: `frequency` is a valid, writable i64 for the call.
-        unsafe { QueryPerformanceFrequency(&raw mut frequency) }
-            .context("read the QPC frequency")?;
-        let clock = QpcClock::new(frequency).ok_or(CaptureError::InvalidQpcFrequency(frequency))?;
+        let clock = QpcClock::system()?;
         let mut duplicator = Self {
             device: device.clone(),
             context,
@@ -341,7 +336,7 @@ impl DesktopDuplicator {
         match acquired {
             Ok(()) => {}
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                let slot_due = self.scheduler.is_due(query_qpc()?);
+                let slot_due = self.scheduler.is_due(qpc_counter()?);
                 return Ok(match on_timeout(self.staleness, slot_due) {
                     TimeoutAction::Resync => Step::Resync,
                     TimeoutAction::Report => Step::Event(CaptureEvent::Timeout),
@@ -369,7 +364,7 @@ impl DesktopDuplicator {
         } else if info.LastMouseUpdateTime != 0 {
             info.LastMouseUpdateTime
         } else {
-            query_qpc()?
+            qpc_counter()?
         };
         let facts = Acquired {
             content_changed,
@@ -384,7 +379,7 @@ impl DesktopDuplicator {
                 Ok(Step::Dropped)
             }
             FrameAction::Unchanged => Ok(Step::Event(CaptureEvent::Unchanged {
-                timestamp: self.clock.to_ticks(qpc),
+                timestamp: self.clock.to_ticks(qpc).ticks(),
             })),
             FrameAction::Copy => resource.map_or(Ok(Step::Dropped), |resource| {
                 self.copy_frame(&resource, qpc).map(Step::Event)
@@ -397,7 +392,7 @@ impl DesktopDuplicator {
         let Some(slot) = self.scheduler.next_admit_qpc() else {
             return Ok(None);
         };
-        let now = query_qpc()?;
+        let now = qpc_counter()?;
         Ok(Some(self.clock.to_duration(slot.saturating_sub(now))))
     }
 
@@ -429,7 +424,7 @@ impl DesktopDuplicator {
         // a no-op, not undefined behavior. The source stays alive until the
         // frame is released, after this call is queued.
         unsafe { self.context.CopyResource(&texture, &source) };
-        let timestamp = monotonic(self.last_timestamp, self.clock.to_ticks(qpc));
+        let timestamp = monotonic(self.last_timestamp, self.clock.to_ticks(qpc).ticks());
         self.last_timestamp = Some(timestamp);
         let sequence = self.next_sequence;
         self.next_sequence = sequence.saturating_add(1);
@@ -656,11 +651,4 @@ fn create_texture(
         context: "create a capture texture",
         source: windows::core::Error::from(E_POINTER),
     })
-}
-
-fn query_qpc() -> Result<i64, CaptureError> {
-    let mut counter = 0;
-    // SAFETY: `counter` is a valid, writable i64 for the call.
-    unsafe { QueryPerformanceCounter(&raw mut counter) }.context("read the QPC counter")?;
-    Ok(counter)
 }

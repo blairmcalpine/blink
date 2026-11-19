@@ -12,8 +12,8 @@
 //!
 //! Windows only. The Windows API is gated behind `#[cfg(windows)]`; on other
 //! hosts [`AudioCapture::start`] returns [`AudioError::Unsupported`], and the
-//! portable clock, PCM, and `AudioSpecificConfig` helpers are compiled only for
-//! their tests. Every `unsafe` block needs a `// SAFETY:` comment and may
+//! portable timeline, PCM, and `AudioSpecificConfig` helpers are compiled only
+//! for their tests. The QPC clock and thread priority come from `blink-sys`. Every `unsafe` block needs a `// SAFETY:` comment and may
 //! contain only one unsafe operation.
 
 use blink_ring::media::Timestamp;
@@ -44,12 +44,6 @@ mod pcm;
     reason = "`pub` here would trip the denied `unreachable_pub`"
 )]
 mod pts_queue;
-#[cfg(any(windows, test))]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
-)]
-mod qpc;
 mod sink;
 #[cfg(any(windows, test))]
 #[expect(

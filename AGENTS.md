@@ -18,6 +18,7 @@ changing capture, encode, ring, or mux code.
 | `crates/blink-capture` | DXGI Desktop Duplication (Windows FFI) | allowed, documented |
 | `crates/blink-audio` | WASAPI loopback + AAC MFT (Windows FFI) | allowed, documented |
 | `crates/blink-encode` | NVENC (Windows FFI) | allowed, documented |
+| `crates/blink-sys` | QPC clock, thread priority, single instance, message pump (Windows FFI) | allowed, documented |
 
 ## Commands
 
@@ -36,7 +37,8 @@ table, or `clippy.toml` to make code pass.
   Libraries return `thiserror` errors; `anyhow` is only for `blink-app`.
 - Every `unsafe` block has a `// SAFETY:` comment explaining why it is sound,
   and contains exactly one unsafe operation. `unsafe fn` bodies still need
-  explicit `unsafe` blocks. `unsafe` is only allowed in the three FFI crates.
+  explicit `unsafe` blocks. `unsafe` is only allowed in the four FFI crates
+  (`blink-capture`, `blink-audio`, `blink-encode`, `blink-sys`).
 - Suppress a lint only with `#[expect(lint, reason = "...")]`, never `#[allow]`.
 - All output goes through `tracing`. No `println!`, `eprintln!`, or `dbg!`.
 - No `as` casts; use `From`/`TryFrom`. No panicking indexing in `blink-ring` or
