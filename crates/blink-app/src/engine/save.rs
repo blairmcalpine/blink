@@ -19,7 +19,7 @@ use anyhow::{Context as _, bail};
 use blink_capture::{BackgroundMode, ThreadPriority};
 use blink_ring::ClipBuf;
 use blink_ring::media::Timestamp;
-use chrono::{Datelike as _, Timelike as _};
+use time::OffsetDateTime;
 
 use super::EngineEvent;
 use crate::clip::{LocalTime, Seconds, file_name, is_temp_name, temp_name};
@@ -51,16 +51,19 @@ pub(super) struct SaveRequest {
     pub(super) output_dir: PathBuf,
 }
 
-/// The local time now, to the second.
+/// The local time now, to the second, or UTC if the local offset is unknown.
 pub(super) fn local_time() -> LocalTime {
-    let now = chrono::Local::now();
+    let now = OffsetDateTime::now_local().unwrap_or_else(|error| {
+        tracing::warn!(%error, "local time offset unavailable; naming clips in UTC");
+        OffsetDateTime::now_utc()
+    });
     LocalTime {
         year: now.year(),
-        month: now.month(),
-        day: now.day(),
-        hour: now.hour(),
-        minute: now.minute(),
-        second: now.second(),
+        month: u32::from(u8::from(now.month())),
+        day: u32::from(now.day()),
+        hour: u32::from(now.hour()),
+        minute: u32::from(now.minute()),
+        second: u32::from(now.second()),
     }
 }
 

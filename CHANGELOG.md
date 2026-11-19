@@ -18,6 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Design documentation (`docs/ARCHITECTURE.md`) and the benchmarking procedure
   (`docs/BENCHMARKING.md`).
 - Open-source scaffolding: dual MIT/Apache-2.0 license, README, contributing
-  guide, code of conduct, security policy, and issue and pull request templates.
+  guide, security policy, and issue and pull request templates.
 
 No functional capture, encode, or muxing code exists yet.
