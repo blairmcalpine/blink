@@ -11,10 +11,11 @@
 //! [`AudioCapture::audio_format`] as soon as [`AudioCapture::start`] returns.
 //!
 //! Windows only. The Windows API is gated behind `#[cfg(windows)]`; on other
-//! hosts [`AudioCapture::start`] returns [`AudioError::Unsupported`], and the
+//! hosts [`AudioCapture::start`] returns `AudioError::Unsupported`, and the
 //! portable timeline, PCM, and `AudioSpecificConfig` helpers are compiled only
-//! for their tests. The QPC clock and thread priority come from `blink-sys`. Every `unsafe` block needs a `// SAFETY:` comment and may
-//! contain only one unsafe operation.
+//! for their tests. The QPC clock and thread priority come from `blink-sys`.
+//! Every `unsafe` block needs a `// SAFETY:` comment and may contain only one
+//! unsafe operation.
 
 use blink_ring::media::Timestamp;
 
