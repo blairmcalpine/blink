@@ -46,7 +46,7 @@ mod tests {
 
         fn shift_video_from(&mut self, index: usize, ticks: i64) {
             for (meta, _) in &mut self.video[index..] {
-                meta.pts = Timestamp(meta.pts.0 + ticks);
+                meta.pts = Timestamp::from_ticks(meta.pts.ticks() + ticks);
             }
         }
     }
@@ -84,7 +84,8 @@ mod tests {
     #[test]
     fn writes_from_a_ring_snapshot() {
         let fixture = baseline_with_audio();
-        let mut ring = blink_ring::ClipRing::with_capacity(Timestamp(10 * SECOND), 1 << 20);
+        let mut ring =
+            blink_ring::ClipRing::with_capacity(Timestamp::from_ticks(10 * SECOND), 1 << 20);
         ring.set_video_format(fixture.video_format.clone());
         ring.set_audio_format(fixture.audio_format.clone().expect("audio"));
         let mut packets: Vec<&(PacketMeta, Vec<u8>)> =
@@ -94,8 +95,12 @@ mod tests {
             ring.push(*meta, data).expect("push");
         }
         let mut clip = ClipBuf::new();
-        ring.snapshot(Timestamp(2 * SECOND), Timestamp(2 * SECOND), &mut clip)
-            .expect("snapshot");
+        ring.snapshot(
+            Timestamp::from_ticks(2 * SECOND),
+            Timestamp::from_ticks(2 * SECOND),
+            &mut clip,
+        )
+        .expect("snapshot");
         assert_eq!(clip.video_len(), 60);
         let mut out = Cursor::new(Vec::new());
         write_mp4(&mut out, &clip).expect("mux succeeds");
@@ -279,7 +284,7 @@ mod tests {
     #[test]
     fn edit_list_delays_video_after_the_clip_start() {
         let mut fixture = load_clip("video_baseline.h264", None);
-        fixture.start = Timestamp(-10_000);
+        fixture.start = Timestamp::from_ticks(-10_000);
         let file = mux(&fixture);
         let root = parse(&file, 0);
         let video_elst = &tracks(&root)[0].get("edts/elst").body;
@@ -308,7 +313,7 @@ mod tests {
     fn stalled_clip() -> Fixture {
         let mut fixture = load_clip("video_baseline.h264", None);
         fixture.shift_video_from(30, SECOND);
-        fixture.end = Timestamp(4 * SECOND);
+        fixture.end = Timestamp::from_ticks(4 * SECOND);
         fixture
     }
 
@@ -387,7 +392,7 @@ mod tests {
             } else {
                 assert!(audio.contains("codec_name=aac"), "{name}: {audio}");
                 assert!(audio.contains("nb_frames=95"), "{name}: {audio}");
-                let offset = fixture.audio[0].0.pts.0.max(0);
+                let offset = fixture.audio[0].0.pts.ticks().max(0);
                 let start = format!("start_time={:.6}", secs(offset));
                 assert!(audio.contains(&start), "{name}: {audio}");
             }
@@ -555,15 +560,15 @@ mod tests {
             sample_aspect: None,
         };
         let frame_ticks = |i: i64| i * 10_000_000 / 30;
-        let end = Timestamp(frame_ticks(i64::try_from(units.len()).expect("small")));
+        let end = Timestamp::from_ticks(frame_ticks(i64::try_from(units.len()).expect("small")));
         let video = units
             .iter()
             .zip(0_i64..)
             .map(|(unit, i)| {
                 let meta = PacketMeta {
                     kind: StreamKind::Video,
-                    pts: Timestamp(frame_ticks(i)),
-                    duration: Timestamp(frame_ticks(i + 1) - frame_ticks(i)),
+                    pts: Timestamp::from_ticks(frame_ticks(i)),
+                    duration: Timestamp::from_ticks(frame_ticks(i + 1) - frame_ticks(i)),
                     keyframe: nals(unit).iter().any(|n| n[0] & 0x1f == 5),
                 };
                 (meta, unit.to_vec())
@@ -581,8 +586,8 @@ mod tests {
                     .map(|(frame, i)| {
                         let meta = PacketMeta {
                             kind: StreamKind::Audio,
-                            pts: Timestamp(offset + i * 1024 * 10_000_000 / rate),
-                            duration: Timestamp(1024 * 10_000_000 / rate),
+                            pts: Timestamp::from_ticks(offset + i * 1024 * 10_000_000 / rate),
+                            duration: Timestamp::from_ticks(1024 * 10_000_000 / rate),
                             keyframe: false,
                         };
                         (meta, frame.to_vec())

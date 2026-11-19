@@ -179,6 +179,7 @@ dependencies = [
 name = "blink-capture"
 version = "0.0.0"
 dependencies = [
+ "blink-ring",
  "blink-sys",
  "thiserror 2.0.21",
  "tracing",

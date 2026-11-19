@@ -222,7 +222,7 @@ pub(crate) mod tests {
         let result = cut_with(
             ring,
             &mut clip,
-            Timestamp(NOW_MS * MS),
+            Timestamp::from_ticks(NOW_MS * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || {
@@ -243,7 +243,7 @@ pub(crate) mod tests {
             "clip is {:?} long",
             clip.duration()
         );
-        assert_eq!(clip.end(), Timestamp(NOW_MS * MS));
+        assert_eq!(clip.end(), Timestamp::from_ticks(NOW_MS * MS));
         assert!(clip.video().all(|(meta, _)| meta.pts < clip.end()));
         assert!(clip.audio_len() > 0);
     }
@@ -277,7 +277,7 @@ pub(crate) mod tests {
         let result = cut_with(
             &ring,
             &mut clip,
-            Timestamp(10_000 * MS),
+            Timestamp::from_ticks(10_000 * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || ring.replace(replacement),
@@ -294,7 +294,7 @@ pub(crate) mod tests {
         let result = cut_with(
             &ring,
             &mut clip,
-            Timestamp(10_000 * MS),
+            Timestamp::from_ticks(10_000 * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || source.video.set_format(&ring, video_format(1920)),
@@ -312,7 +312,7 @@ pub(crate) mod tests {
         let result = cut_with(
             &ring,
             &mut clip,
-            Timestamp(20_000 * MS),
+            Timestamp::from_ticks(20_000 * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || {
@@ -326,7 +326,7 @@ pub(crate) mod tests {
         assert_eq!(result, Ok(()));
         assert!(calls > 2, "the copy started over");
         assert!(clip.duration() > Timestamp::ZERO);
-        assert_eq!(clip.end(), Timestamp(20_000 * MS));
+        assert_eq!(clip.end(), Timestamp::from_ticks(20_000 * MS));
     }
 
     #[test]
@@ -334,7 +334,12 @@ pub(crate) mod tests {
         let ring = SharedRing::new(RingSize::for_config(&config()));
         let mut clip = ClipBuf::new();
         assert_eq!(
-            cut(&ring, &mut clip, Timestamp(MS), Timestamp::from_secs(5)),
+            cut(
+                &ring,
+                &mut clip,
+                Timestamp::from_ticks(MS),
+                Timestamp::from_secs(5)
+            ),
             Err(CutError::NothingYet)
         );
     }

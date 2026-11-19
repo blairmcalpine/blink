@@ -62,7 +62,9 @@ pub(crate) fn should_refresh(
 /// last encoded one so timestamps strictly increase even if the clock
 /// sources disagree by a tick.
 pub(crate) fn next_pts(last_pts: Option<Timestamp>, pts: Timestamp) -> Timestamp {
-    last_pts.map_or(pts, |last| pts.max(last.saturating_add(Timestamp(1))))
+    last_pts.map_or(pts, |last| {
+        pts.max(last.saturating_add(Timestamp::from_ticks(1)))
+    })
 }
 
 #[cfg(test)]
@@ -122,20 +124,47 @@ mod tests {
 
     #[test]
     fn refresh_only_when_due_with_a_frame_and_time_moved_on() {
-        let last = Some(Timestamp(100));
-        assert!(should_refresh(true, last, Timestamp(101), true));
-        assert!(should_refresh(true, None, Timestamp(0), true));
-        assert!(!should_refresh(false, last, Timestamp(101), true));
-        assert!(!should_refresh(true, last, Timestamp(101), false));
-        assert!(!should_refresh(true, last, Timestamp(100), true));
-        assert!(!should_refresh(true, last, Timestamp(99), true));
+        let last = Some(Timestamp::from_ticks(100));
+        assert!(should_refresh(true, last, Timestamp::from_ticks(101), true));
+        assert!(should_refresh(true, None, Timestamp::from_ticks(0), true));
+        assert!(!should_refresh(
+            false,
+            last,
+            Timestamp::from_ticks(101),
+            true
+        ));
+        assert!(!should_refresh(
+            true,
+            last,
+            Timestamp::from_ticks(101),
+            false
+        ));
+        assert!(!should_refresh(
+            true,
+            last,
+            Timestamp::from_ticks(100),
+            true
+        ));
+        assert!(!should_refresh(true, last, Timestamp::from_ticks(99), true));
     }
 
     #[test]
     fn pts_strictly_increase() {
-        assert_eq!(next_pts(None, Timestamp(50)), Timestamp(50));
-        assert_eq!(next_pts(Some(Timestamp(40)), Timestamp(50)), Timestamp(50));
-        assert_eq!(next_pts(Some(Timestamp(50)), Timestamp(50)), Timestamp(51));
-        assert_eq!(next_pts(Some(Timestamp(60)), Timestamp(50)), Timestamp(61));
+        assert_eq!(
+            next_pts(None, Timestamp::from_ticks(50)),
+            Timestamp::from_ticks(50)
+        );
+        assert_eq!(
+            next_pts(Some(Timestamp::from_ticks(40)), Timestamp::from_ticks(50)),
+            Timestamp::from_ticks(50)
+        );
+        assert_eq!(
+            next_pts(Some(Timestamp::from_ticks(50)), Timestamp::from_ticks(50)),
+            Timestamp::from_ticks(51)
+        );
+        assert_eq!(
+            next_pts(Some(Timestamp::from_ticks(60)), Timestamp::from_ticks(50)),
+            Timestamp::from_ticks(61)
+        );
     }
 }

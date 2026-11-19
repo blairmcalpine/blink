@@ -164,8 +164,8 @@ pub(crate) mod tests {
     pub(crate) fn video(pts_ms: i64, keyframe: bool) -> PacketMeta {
         PacketMeta {
             kind: StreamKind::Video,
-            pts: Timestamp(pts_ms * MS),
-            duration: Timestamp(33 * MS),
+            pts: Timestamp::from_ticks(pts_ms * MS),
+            duration: Timestamp::from_ticks(33 * MS),
             keyframe,
         }
     }
@@ -173,8 +173,8 @@ pub(crate) mod tests {
     pub(crate) fn audio(pts_ms: i64) -> PacketMeta {
         PacketMeta {
             kind: StreamKind::Audio,
-            pts: Timestamp(pts_ms * MS),
-            duration: Timestamp(21 * MS),
+            pts: Timestamp::from_ticks(pts_ms * MS),
+            duration: Timestamp::from_ticks(21 * MS),
             keyframe: false,
         }
     }

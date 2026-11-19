@@ -16,7 +16,7 @@ use blink_config::Config;
 use blink_encode::{EncodeError, Encoder};
 use blink_ring::PushOutcome;
 use blink_ring::media::{Timestamp, VideoFormat};
-use blink_sys::{SysError, ThreadPriority};
+use blink_sys::{Backoff, SysError, ThreadPriority};
 
 use super::EngineEvent;
 use super::signal::StopSignal;
@@ -120,7 +120,7 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
         encoded_any: false,
         paused_since: None,
     };
-    let mut delay = FIRST_RETRY;
+    let mut backoff = Backoff::new(FIRST_RETRY, MAX_RETRY);
     let mut failures = 0_u32;
     while !stop.is_stopped() {
         run.encoded_any = false;
@@ -133,9 +133,10 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
             }
             Err(Failure::Retry(error)) => {
                 if run.encoded_any {
-                    delay = FIRST_RETRY;
+                    backoff.reset();
                     failures = 0;
                 }
+                let delay = backoff.next_delay();
                 failures = failures.saturating_add(1);
                 let error = format!("{error:#}");
                 tracing::warn!(
@@ -148,7 +149,6 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
                 if stop.wait(delay) {
                     return;
                 }
-                delay = delay.saturating_mul(2).min(MAX_RETRY);
             }
         }
     }
@@ -192,7 +192,7 @@ fn session(
                     run.report(CaptureState::Recording);
                 }
             }
-            CaptureEvent::Unchanged { timestamp } => state.refresh_idr(Timestamp(timestamp))?,
+            CaptureEvent::Unchanged { timestamp } => state.refresh_idr(timestamp)?,
             CaptureEvent::Timeout => state.refresh_idr(blink_sys::qpc_now()?)?,
         }
     }
@@ -287,7 +287,7 @@ impl State<'_> {
         if self.paused {
             return Ok(false);
         }
-        let pts = next_pts(self.last_pts, Timestamp(frame.timestamp()));
+        let pts = next_pts(self.last_pts, frame.timestamp());
         let encoded = self.encode(&frame, pts)?;
         self.last_frame = Some(frame);
         Ok(encoded)

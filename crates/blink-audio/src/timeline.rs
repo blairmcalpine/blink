@@ -55,10 +55,10 @@ const SAMPLE_RATE: i128 = 48_000;
 
 /// Drift in continuous audio that starts a slewed correction: 20 ms, about two
 /// WASAPI periods, so timestamp jitter never triggers one.
-pub(crate) const DRIFT_TOLERANCE: i64 = 200_000;
+pub(crate) const DRIFT_TOLERANCE: i64 = Timestamp::from_millis(20).ticks();
 
 /// Drift a slewed correction stops at: 5 ms.
-pub(crate) const SLEW_TARGET: i64 = 50_000;
+pub(crate) const SLEW_TARGET: i64 = Timestamp::from_millis(5).ticks();
 
 /// A slewed correction changes at most one frame in this many per packet.
 const SLEW_DIVISOR: u64 = 100;
@@ -66,19 +66,19 @@ const SLEW_DIVISOR: u64 = 100;
 /// Drift in continuous audio that is corrected at once instead of slewed:
 /// 50 ms. Device-clock drift never gets here because slewing starts at
 /// [`DRIFT_TOLERANCE`]; only lost or duplicated data does.
-pub(crate) const HARD_LIMIT: i64 = 500_000;
+pub(crate) const HARD_LIMIT: i64 = Timestamp::from_millis(50).ticks();
 
 /// How exactly an onset is placed: 1 ms.
-pub(crate) const RESYNC_TOLERANCE: i64 = 10_000;
+pub(crate) const RESYNC_TOLERANCE: i64 = Timestamp::from_millis(1).ticks();
 
 /// How far behind the wall clock silence fill stops: 60 ms. A packet's
 /// timestamp is the capture time of its first frame, which precedes its
 /// delivery by up to a period (10 ms) plus scheduling delay.
-pub(crate) const FILL_LAG: i64 = 600_000;
+pub(crate) const FILL_LAG: i64 = Timestamp::from_millis(60).ticks();
 
 /// Longest gap filled with silence: 60 s (about 2,800 cheap silent AAC
 /// frames). Longer gaps start a new segment with a timestamp jump.
-pub(crate) const MAX_GAP: i64 = 600_000_000;
+pub(crate) const MAX_GAP: i64 = Timestamp::from_secs(60).ticks();
 
 /// Converts a frame count to 100 ns ticks, rounding down and saturating.
 pub(crate) fn frames_to_ticks(frames: u64) -> i64 {
@@ -441,7 +441,7 @@ impl Timeline {
             return Ok(());
         }
         let offset = frames_to_ticks(self.chunks.saturating_mul(CHUNK_FRAMES));
-        let pts = Timestamp(self.anchor.saturating_add(offset));
+        let pts = Timestamp::from_ticks(self.anchor.saturating_add(offset));
         self.filled = 0;
         self.chunks += 1;
         sink(Event::Chunk(Chunk {

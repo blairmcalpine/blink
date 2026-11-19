@@ -95,16 +95,16 @@ impl PtsQueue {
 mod tests {
     use super::*;
 
-    const D: Timestamp = Timestamp(10);
+    const D: Timestamp = Timestamp::from_ticks(10);
 
     #[test]
     fn pops_in_order() {
         let mut queue = PtsQueue::new();
-        assert!(queue.push(Timestamp(100)));
-        assert!(queue.push(Timestamp(110)));
+        assert!(queue.push(Timestamp::from_ticks(100)));
+        assert!(queue.push(Timestamp::from_ticks(110)));
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.next(D), Timestamp(100));
-        assert_eq!(queue.next(D), Timestamp(110));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(100));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(110));
         assert_eq!(queue.len(), 0);
     }
 
@@ -112,28 +112,28 @@ mod tests {
     fn extrapolates_when_empty() {
         let mut queue = PtsQueue::new();
         assert_eq!(queue.next(D), Timestamp::ZERO);
-        queue.push(Timestamp(500));
-        assert_eq!(queue.next(D), Timestamp(500));
-        assert_eq!(queue.next(D), Timestamp(510));
-        assert_eq!(queue.next(D), Timestamp(520));
+        queue.push(Timestamp::from_ticks(500));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(500));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(510));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(520));
     }
 
     #[test]
     fn overflow_drops_oldest() {
         let mut queue = PtsQueue::new();
         for i in 0..CAPACITY {
-            assert!(queue.push(Timestamp(i64::try_from(i).unwrap())));
+            assert!(queue.push(Timestamp::from_ticks(i64::try_from(i).unwrap())));
         }
-        assert!(!queue.push(Timestamp(99)));
+        assert!(!queue.push(Timestamp::from_ticks(99)));
         assert_eq!(queue.len(), CAPACITY);
-        assert_eq!(queue.next(D), Timestamp(1));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(1));
     }
 
     #[test]
     fn wraps_around() {
         let mut queue = PtsQueue::new();
         for round in 0..3 * CAPACITY {
-            let pts = Timestamp(i64::try_from(round).unwrap());
+            let pts = Timestamp::from_ticks(i64::try_from(round).unwrap());
             queue.push(pts);
             assert_eq!(queue.next(D), pts);
         }
@@ -141,20 +141,20 @@ mod tests {
 
     #[test]
     fn delay_shifts_queued_and_extrapolated_output() {
-        let mut queue = PtsQueue::with_delay(Timestamp(3));
-        queue.push(Timestamp(100));
-        assert_eq!(queue.next(D), Timestamp(97));
-        assert_eq!(queue.next(D), Timestamp(107));
+        let mut queue = PtsQueue::with_delay(Timestamp::from_ticks(3));
+        queue.push(Timestamp::from_ticks(100));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(97));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(107));
         queue.clear();
-        queue.push(Timestamp(200));
-        assert_eq!(queue.next(D), Timestamp(197));
+        queue.push(Timestamp::from_ticks(200));
+        assert_eq!(queue.next(D), Timestamp::from_ticks(197));
     }
 
     #[test]
     fn clear_resets_extrapolation() {
         let mut queue = PtsQueue::new();
-        queue.push(Timestamp(7));
-        queue.push(Timestamp(8));
+        queue.push(Timestamp::from_ticks(7));
+        queue.push(Timestamp::from_ticks(8));
         queue.next(D);
         queue.clear();
         assert_eq!(queue.len(), 0);

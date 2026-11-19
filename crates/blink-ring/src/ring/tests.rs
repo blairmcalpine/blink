@@ -1,7 +1,7 @@
 use super::*;
 
 const MS: i64 = 10_000;
-const FOREVER: Timestamp = Timestamp(i64::MAX);
+const FOREVER: Timestamp = Timestamp::from_ticks(i64::MAX);
 
 fn video_format(width: u32) -> VideoFormat {
     VideoFormat {
@@ -25,8 +25,8 @@ fn audio_format(sample_rate: u32) -> AudioFormat {
 fn video(pts_ms: i64, keyframe: bool) -> PacketMeta {
     PacketMeta {
         kind: StreamKind::Video,
-        pts: Timestamp(pts_ms * MS),
-        duration: Timestamp(33 * MS),
+        pts: Timestamp::from_ticks(pts_ms * MS),
+        duration: Timestamp::from_ticks(33 * MS),
         keyframe,
     }
 }
@@ -34,14 +34,14 @@ fn video(pts_ms: i64, keyframe: bool) -> PacketMeta {
 fn audio(pts_ms: i64) -> PacketMeta {
     PacketMeta {
         kind: StreamKind::Audio,
-        pts: Timestamp(pts_ms * MS),
-        duration: Timestamp(21 * MS),
+        pts: Timestamp::from_ticks(pts_ms * MS),
+        duration: Timestamp::from_ticks(21 * MS),
         keyframe: false,
     }
 }
 
 fn ring(window_ms: i64, bytes: usize) -> ClipRing {
-    let mut ring = ClipRing::with_capacity(Timestamp(window_ms * MS), bytes);
+    let mut ring = ClipRing::with_capacity(Timestamp::from_ticks(window_ms * MS), bytes);
     ring.set_video_format(video_format(64));
     ring.set_audio_format(audio_format(48_000));
     ring
@@ -62,18 +62,22 @@ fn push_gops(ring: &mut ClipRing, start_ms: i64, gops: i64, frames: i64, size: u
 }
 
 fn video_pts_ms(clip: &ClipBuf) -> Vec<i64> {
-    clip.video().map(|(meta, _)| meta.pts.0 / MS).collect()
+    clip.video()
+        .map(|(meta, _)| meta.pts.ticks() / MS)
+        .collect()
 }
 
 fn audio_pts_ms(clip: &ClipBuf) -> Vec<i64> {
-    clip.audio().map(|(meta, _)| meta.pts.0 / MS).collect()
+    clip.audio()
+        .map(|(meta, _)| meta.pts.ticks() / MS)
+        .collect()
 }
 
 fn snapshot(ring: &ClipRing, now_ms: i64, duration_ms: i64) -> ClipBuf {
     let mut clip = ClipBuf::new();
     ring.snapshot(
-        Timestamp(now_ms * MS),
-        Timestamp(duration_ms * MS),
+        Timestamp::from_ticks(now_ms * MS),
+        Timestamp::from_ticks(duration_ms * MS),
         &mut clip,
     )
     .expect("clip available");
@@ -93,15 +97,47 @@ fn bytes_in_entries(ring: &ClipRing) -> usize {
 }
 
 #[test]
-fn timestamp_helpers() {
-    assert_eq!(Timestamp::from_secs(2), Timestamp(20_000_000));
-    assert_eq!(Timestamp::from_millis(3), Timestamp(30_000));
-    assert_eq!(Timestamp::from_secs(i64::MAX), Timestamp(i64::MAX));
+fn timestamp_duration_conversions() {
+    use std::time::Duration;
+
+    let span = Timestamp::from_ticks(12_345_678);
+    assert_eq!(span.to_duration(), Duration::from_nanos(1_234_567_800));
+    assert_eq!(Timestamp::from_duration(span.to_duration()), span);
+    // Sub-tick nanoseconds are truncated.
     assert_eq!(
-        Timestamp(i64::MIN).saturating_sub(Timestamp(1)),
-        Timestamp(i64::MIN)
+        Timestamp::from_duration(Duration::from_nanos(199)),
+        Timestamp::from_ticks(1)
     );
-    assert_eq!(Timestamp(5).saturating_add(Timestamp(2)).ticks(), 7);
+    assert_eq!(Timestamp::from_ticks(-5).to_duration(), Duration::ZERO);
+    assert_eq!(
+        Timestamp::from_duration(Duration::MAX),
+        Timestamp::from_ticks(i64::MAX)
+    );
+    let max = Timestamp::from_ticks(i64::MAX).to_duration();
+    assert_eq!(
+        Timestamp::from_duration(max),
+        Timestamp::from_ticks(i64::MAX)
+    );
+}
+
+#[test]
+fn timestamp_helpers() {
+    assert_eq!(Timestamp::from_secs(2), Timestamp::from_ticks(20_000_000));
+    assert_eq!(Timestamp::from_millis(3), Timestamp::from_ticks(30_000));
+    assert_eq!(
+        Timestamp::from_secs(i64::MAX),
+        Timestamp::from_ticks(i64::MAX)
+    );
+    assert_eq!(
+        Timestamp::from_ticks(i64::MIN).saturating_sub(Timestamp::from_ticks(1)),
+        Timestamp::from_ticks(i64::MIN)
+    );
+    assert_eq!(
+        Timestamp::from_ticks(5)
+            .saturating_add(Timestamp::from_ticks(2))
+            .ticks(),
+        7
+    );
 }
 
 #[test]
@@ -165,7 +201,10 @@ fn recommends_byte_capacity_from_bitrate() {
         ClipRing::recommended_byte_capacity(Timestamp::from_secs(30), 20_000_000),
         106_250_000
     );
-    assert_eq!(ClipRing::recommended_byte_capacity(Timestamp(-1), 8), 5);
+    assert_eq!(
+        ClipRing::recommended_byte_capacity(Timestamp::from_ticks(-1), 8),
+        5
+    );
 }
 
 #[test]
@@ -280,7 +319,7 @@ fn gop_eviction_keeps_audio_that_video_lagged_behind() {
     // Keyframes at 0, 500, ...; the window evicted GOPs, and audio up to 40 ms
     // after each kept keyframe was pushed before it.
     let clip = snapshot(&ring, 1980, 500);
-    let start = clip.start().0 / MS;
+    let start = clip.start().ticks() / MS;
     assert_eq!(start, 1000);
     let audio = audio_pts_ms(&clip);
     // Preroll frame (within two frames before the keyframe), then every frame from it.
@@ -306,9 +345,9 @@ fn snapshot_cuts_at_the_save_time() {
         Some(&1900),
         "PTS at or after `now` is excluded"
     );
-    assert_eq!(clip.start(), Timestamp(500 * MS));
-    assert_eq!(clip.end(), Timestamp(1950 * MS));
-    assert_eq!(clip.duration(), Timestamp(1450 * MS));
+    assert_eq!(clip.start(), Timestamp::from_ticks(500 * MS));
+    assert_eq!(clip.end(), Timestamp::from_ticks(1950 * MS));
+    assert_eq!(clip.duration(), Timestamp::from_ticks(1450 * MS));
     assert!(clip.audio_format().is_some());
     // A cut exactly on a keyframe starts there.
     assert_eq!(
@@ -337,7 +376,7 @@ fn static_screen_clip_ends_at_the_save_time() {
     // No video for almost 5 s; the clip still ends at `now`, not at the last frame.
     let clip = snapshot(&ring, 5000, 3000);
     assert_eq!(video_pts_ms(&clip), [0, 100, 200]);
-    assert_eq!(clip.end(), Timestamp(5000 * MS));
+    assert_eq!(clip.end(), Timestamp::from_ticks(5000 * MS));
     assert_eq!(audio_pts_ms(&clip).last(), Some(&4980));
 }
 
@@ -347,7 +386,11 @@ fn save_time_before_any_keyframe_has_no_clip() {
     push(&mut ring, video(500, true), &[1]);
     let mut clip = ClipBuf::new();
     assert_eq!(
-        ring.snapshot(Timestamp(500 * MS), Timestamp(MS), &mut clip),
+        ring.snapshot(
+            Timestamp::from_ticks(500 * MS),
+            Timestamp::from_ticks(MS),
+            &mut clip
+        ),
         Err(ClipError::NoKeyframe)
     );
 }
@@ -359,7 +402,7 @@ fn chunked_copy_matches_one_shot_and_sees_late_packets() {
     for pts in (0..1000).step_by(25) {
         push(&mut ring, audio(pts), &[5; 3]);
     }
-    let now = Timestamp(1000 * MS);
+    let now = Timestamp::from_ticks(1000 * MS);
     let mut clip = ClipBuf::new();
     let mut cursor = ring.begin_clip(now, FOREVER, &mut clip).expect("clip");
     let mut calls = 0;
@@ -423,7 +466,7 @@ fn audio_preroll_frame_is_included() {
     let clip = snapshot_all(&ring);
     // 84 is the last frame before the keyframe at 100.
     assert_eq!(audio_pts_ms(&clip).get(..3), Some(&[84, 105, 126][..]));
-    assert_eq!(clip.start(), Timestamp(100 * MS));
+    assert_eq!(clip.start(), Timestamp::from_ticks(100 * MS));
 }
 
 #[test]
@@ -497,7 +540,7 @@ fn payloads_survive_wraparound() {
     let clip = snapshot_all(&ring);
     let stored: Vec<_> = clip
         .video()
-        .map(|(meta, data)| (meta.pts.0 / MS, data.to_vec()))
+        .map(|(meta, data)| (meta.pts.ticks() / MS, data.to_vec()))
         .collect();
     assert!(stored.ends_with(&expected));
     assert!(ring.bytes_used() <= 50);
@@ -530,7 +573,7 @@ fn owned(clip_packets: impl Iterator<Item = (PacketMeta, Vec<u8>)>) -> Vec<(Pack
 /// the window invariant must hold; under pressure clip audio may lose a prefix.
 fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy: bool) {
     let iterations = if cfg!(miri) { 250 } else { 12_000 };
-    let window = Timestamp(400 * MS);
+    let window = Timestamp::from_ticks(400 * MS);
     let mut ring = ClipRing::with_limits(window, byte_capacity, packet_capacity);
     ring.set_video_format(video_format(64));
     ring.set_audio_format(audio_format(48_000));
@@ -572,7 +615,7 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
             let cutoff = newest.saturating_sub(window);
             assert!(ring.keyframes.get(1).is_none_or(|next| next.pts > cutoff));
         }
-        let end = newest.saturating_add(Timestamp(1));
+        let end = newest.saturating_add(Timestamp::from_ticks(1));
         if ring.snapshot(end, window, &mut clip).is_err() {
             continue;
         }
@@ -588,7 +631,7 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
         let mut audio = owned(clip.audio().map(|(meta, data)| (meta, data.to_vec())));
         if audio.first().is_some_and(|(meta, _)| meta.pts < start) {
             let preroll = audio.remove(0);
-            let before = model_range(&model.audio, Timestamp(i64::MIN), start);
+            let before = model_range(&model.audio, Timestamp::from_ticks(i64::MIN), start);
             assert_eq!(before.last(), Some(&preroll));
         }
         let expected = model_range(&model.audio, start, end);
@@ -668,7 +711,12 @@ fn reused_clip_buffer_does_not_grow() {
 fn hand_built_clip() {
     let mut clip = ClipBuf::new();
     assert!(clip.video_format().is_none());
-    clip.begin(&video_format(64), None, Timestamp(5), Timestamp(10));
+    clip.begin(
+        &video_format(64),
+        None,
+        Timestamp::from_ticks(5),
+        Timestamp::from_ticks(10),
+    );
     clip.push_video(video(0, true), &[1, 2]);
     clip.push_audio(audio(0), &[3]);
     assert_eq!(
@@ -683,7 +731,7 @@ fn hand_built_clip() {
             .collect::<Vec<_>>(),
         [vec![3]]
     );
-    assert_eq!(clip.duration(), Timestamp(5));
+    assert_eq!(clip.duration(), Timestamp::from_ticks(5));
 }
 
 #[test]
@@ -692,10 +740,19 @@ fn default_packet_capacity_is_bounded() {
         default_packet_capacity(Timestamp::from_secs(30), 1 << 30),
         34 * 512
     );
-    assert_eq!(default_packet_capacity(Timestamp(1), 1 << 30), 5 * 512);
-    assert_eq!(default_packet_capacity(Timestamp(-5), 1 << 30), 4 * 512);
+    assert_eq!(
+        default_packet_capacity(Timestamp::from_ticks(1), 1 << 30),
+        5 * 512
+    );
+    assert_eq!(
+        default_packet_capacity(Timestamp::from_ticks(-5), 1 << 30),
+        4 * 512
+    );
     assert_eq!(default_packet_capacity(Timestamp::from_secs(30), 100), 100);
-    assert_eq!(default_packet_capacity(Timestamp(i64::MAX), 1000), 1000);
+    assert_eq!(
+        default_packet_capacity(Timestamp::from_ticks(i64::MAX), 1000),
+        1000
+    );
 }
 
 #[test]
@@ -721,7 +778,11 @@ fn prepare_sizes_the_buffer_for_the_whole_ring() {
     assert!(capacity >= ring.bytes_used());
 
     let mut cursor = ring
-        .begin_clip(Timestamp(3_000 * MS), Timestamp(3_000 * MS), &mut clip)
+        .begin_clip(
+            Timestamp::from_ticks(3_000 * MS),
+            Timestamp::from_ticks(3_000 * MS),
+            &mut clip,
+        )
         .expect("clip available");
     let progress = ring
         .copy_clip(&mut cursor, &mut clip, usize::MAX)

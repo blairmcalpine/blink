@@ -125,7 +125,10 @@ mod tests {
     #[test]
     fn seconds_display() {
         assert_eq!(Seconds(Timestamp::from_secs(30)).to_string(), "30.000 s");
-        assert_eq!(Seconds(Timestamp(12_345_678)).to_string(), "1.234 s");
+        assert_eq!(
+            Seconds(Timestamp::from_ticks(12_345_678)).to_string(),
+            "1.234 s"
+        );
         assert_eq!(
             Seconds(Timestamp::from_millis(-1500)).to_string(),
             "-1.500 s"

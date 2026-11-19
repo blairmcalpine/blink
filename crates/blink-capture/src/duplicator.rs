@@ -4,7 +4,8 @@ use std::num::NonZeroU32;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blink_sys::{QpcClock, qpc_counter};
+use blink_ring::media::Timestamp;
+use blink_sys::{Backoff, QpcClock, qpc_counter};
 use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
@@ -20,7 +21,6 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
-use crate::backoff::{Backoff, MAX_RETRY_DELAY};
 use crate::decision::{
     Acquired, FrameAction, Staleness, TimeoutAction, acquire_timeout_ms, decide, monotonic,
     on_timeout,
@@ -42,6 +42,14 @@ use crate::schedule::FrameScheduler;
 /// contents.
 pub const TEXTURE_POOL_SIZE: usize = 3;
 
+/// Delay before the first retry after a failed recreation.
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Longest delay between retries. Recovery never gives up, because the
+/// secure desktop (UAC, lock screen) can block duplication for minutes, so the
+/// cap keeps polling cheap rather than ending it.
+const MAX_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// How long a lost session may stay unrecoverable before it is logged as a
 /// warning rather than at debug level.
 const LONG_OUTAGE: Duration = Duration::from_secs(3);
@@ -56,7 +64,7 @@ pub struct CapturedFrame {
     texture: ID3D11Texture2D,
     width: u32,
     height: u32,
-    timestamp: i64,
+    timestamp: Timestamp,
     sequence: u64,
 }
 
@@ -84,11 +92,10 @@ impl CapturedFrame {
         self.height
     }
 
-    /// Presentation time in 100 ns ticks on the QPC timeline (the
-    /// `blink_ring` `Timestamp` unit). Strictly increasing across the frames
-    /// of one duplicator.
+    /// Presentation time on the shared QPC timeline. Strictly increasing
+    /// across the frames of one duplicator.
     #[must_use]
-    pub const fn timestamp(&self) -> i64 {
+    pub const fn timestamp(&self) -> Timestamp {
         self.timestamp
     }
 
@@ -112,9 +119,10 @@ pub enum CaptureEvent {
     /// mouse pointer moved). Nothing was copied; the previous frame still
     /// stands.
     Unchanged {
-        /// When the update happened, in 100 ns QPC ticks: the pointer update
-        /// time if DXGI reported one, otherwise the time it was observed.
-        timestamp: i64,
+        /// When the update happened on the shared QPC timeline: the pointer
+        /// update time if DXGI reported one, otherwise the time it was
+        /// observed.
+        timestamp: Timestamp,
     },
     /// Nothing to report before the timeout elapsed. Also returned while the
     /// duplication session is being recreated after a mode change or desktop
@@ -195,7 +203,7 @@ pub struct DesktopDuplicator {
     warned_outage: bool,
     /// `ProtectedContentMaskedOut` has been logged.
     logged_protected: bool,
-    last_timestamp: Option<i64>,
+    last_timestamp: Option<Timestamp>,
     next_sequence: u64,
 }
 
@@ -233,7 +241,7 @@ impl DesktopDuplicator {
             pool: None,
             clock,
             scheduler: FrameScheduler::new(target_fps, clock.frequency()),
-            backoff: Backoff::default(),
+            backoff: Backoff::new(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY),
             retry_at: None,
             staleness: Staleness::NewSession,
             pending: None,
@@ -379,7 +387,7 @@ impl DesktopDuplicator {
                 Ok(Step::Dropped)
             }
             FrameAction::Unchanged => Ok(Step::Event(CaptureEvent::Unchanged {
-                timestamp: self.clock.to_ticks(qpc).ticks(),
+                timestamp: self.clock.to_ticks(qpc),
             })),
             FrameAction::Copy => resource.map_or(Ok(Step::Dropped), |resource| {
                 self.copy_frame(&resource, qpc).map(Step::Event)
@@ -424,7 +432,7 @@ impl DesktopDuplicator {
         // a no-op, not undefined behavior. The source stays alive until the
         // frame is released, after this call is queued.
         unsafe { self.context.CopyResource(&texture, &source) };
-        let timestamp = monotonic(self.last_timestamp, self.clock.to_ticks(qpc).ticks());
+        let timestamp = monotonic(self.last_timestamp, self.clock.to_ticks(qpc));
         self.last_timestamp = Some(timestamp);
         let sequence = self.next_sequence;
         self.next_sequence = sequence.saturating_add(1);

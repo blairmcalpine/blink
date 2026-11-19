@@ -141,7 +141,7 @@ impl AacEncoder {
             transform,
             inputs,
             output,
-            pts: PtsQueue::with_delay(Timestamp(frames_to_ticks(ENCODER_DELAY_FRAMES))),
+            pts: PtsQueue::with_delay(Timestamp::from_ticks(frames_to_ticks(ENCODER_DELAY_FRAMES))),
             format,
             first_output_logged: false,
             overflow_warned: false,
@@ -555,7 +555,7 @@ mod tests {
             }
             let chunk = Chunk {
                 pcm: &pcm,
-                pts: Timestamp(frames_to_ticks(chunk_index * 1024)),
+                pts: Timestamp::from_ticks(frames_to_ticks(chunk_index * 1024)),
             };
             encoder.encode(chunk, &mut sink).unwrap();
         }

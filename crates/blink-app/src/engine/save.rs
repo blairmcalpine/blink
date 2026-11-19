@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context as _, bail};
 use blink_ring::ClipBuf;
@@ -270,15 +270,8 @@ fn saved(request: &Written, path: &Path, clip: &ClipBuf) {
 /// Waits until [`SETTLE`] after `now` on the QPC clock.
 fn settle(now: Timestamp) {
     let target = now.saturating_add(SETTLE);
-    let Ok(current) = blink_sys::qpc_now() else {
-        thread::sleep(Duration::from_millis(200));
-        return;
-    };
-    let remaining = target.saturating_sub(current).ticks();
-    if let Ok(ticks) = u64::try_from(remaining) {
-        // 100 ns ticks.
-        thread::sleep(Duration::from_nanos(ticks.saturating_mul(100)));
-    }
+    let remaining = blink_sys::qpc_now().map_or(SETTLE, |current| target.saturating_sub(current));
+    thread::sleep(remaining.to_duration());
 }
 
 fn write(temp: &Path, clip: &ClipBuf) -> anyhow::Result<()> {

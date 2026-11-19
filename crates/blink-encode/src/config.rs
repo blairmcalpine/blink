@@ -135,7 +135,7 @@ impl EncoderConfig {
     /// Length of one frame at the nominal frame rate, in 100 ns ticks,
     /// truncated (166 666 ticks at 60 fps).
     pub(crate) fn frame_duration(&self) -> Timestamp {
-        Timestamp(Timestamp::TICKS_PER_SECOND / i64::from(self.fps.max(1)))
+        Timestamp::from_ticks(Timestamp::TICKS_PER_SECOND / i64::from(self.fps.max(1)))
     }
 
     /// The display aspect ratio for `NV_ENC_INITIALIZE_PARAMS::darWidth` and
@@ -326,9 +326,9 @@ mod tests {
 
     #[test]
     fn frame_duration_is_one_frame_in_ticks() {
-        assert_eq!(valid().frame_duration(), Timestamp(166_666));
+        assert_eq!(valid().frame_duration(), Timestamp::from_ticks(166_666));
         let thirty = EncoderConfig { fps: 30, ..valid() };
-        assert_eq!(thirty.frame_duration(), Timestamp(333_333));
+        assert_eq!(thirty.frame_duration(), Timestamp::from_ticks(333_333));
     }
 
     #[test]

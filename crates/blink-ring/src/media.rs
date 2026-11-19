@@ -12,7 +12,7 @@ const NANOS_PER_TICK: u64 = 100;
 /// [`Timestamp::TICKS_PER_SECOND`] ticks make a second. The same type is used
 /// for durations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Timestamp(pub i64);
+pub struct Timestamp(i64);
 
 impl Timestamp {
     /// Ticks in one second.
@@ -25,6 +25,14 @@ impl Timestamp {
     #[must_use]
     pub const fn from_ticks(ticks: i64) -> Self {
         Self(ticks)
+    }
+
+    /// Creates a span from a `Duration`, truncated to whole ticks and
+    /// saturating at [`i64::MAX`] ticks.
+    #[must_use]
+    pub fn from_duration(duration: Duration) -> Self {
+        let ticks = duration.as_nanos() / u128::from(NANOS_PER_TICK);
+        Self(i64::try_from(ticks).unwrap_or(i64::MAX))
     }
 
     /// Converts a span to a `Duration`. Negative spans are zero.

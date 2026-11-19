@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use blink_audio::{AudioCapture, AudioConfig};
 use blink_ring::media::{AudioFormat, PacketMeta};
+use blink_sys::Backoff;
 
 use crate::shared::{Producer, SharedRing};
 
@@ -18,7 +19,6 @@ const FIRST_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(60);
 
 /// The audio capture, if enabled, and its restart schedule.
-#[derive(Default)]
 pub(super) struct AudioSupervisor {
     /// The settings to run with; `None` while audio is disabled.
     config: Option<AudioConfig>,
@@ -26,7 +26,19 @@ pub(super) struct AudioSupervisor {
     /// When the running capture started.
     started_at: Option<Instant>,
     retry_at: Option<Instant>,
-    delay: Option<Duration>,
+    backoff: Backoff,
+}
+
+impl Default for AudioSupervisor {
+    fn default() -> Self {
+        Self {
+            config: None,
+            capture: None,
+            started_at: None,
+            retry_at: None,
+            backoff: Backoff::new(FIRST_RETRY, MAX_RETRY),
+        }
+    }
 }
 
 impl AudioSupervisor {
@@ -34,7 +46,7 @@ impl AudioSupervisor {
     pub(super) fn start(&mut self, config: AudioConfig, ring: &Arc<SharedRing>) {
         self.stop();
         self.config = Some(config);
-        self.delay = None;
+        self.backoff.reset();
         self.try_start(ring);
     }
 
@@ -68,7 +80,7 @@ impl AudioSupervisor {
                 .take()
                 .is_some_and(|started| started.elapsed() >= MAX_RETRY)
             {
-                self.delay = None;
+                self.backoff.reset();
             }
             self.schedule_retry();
         }
@@ -101,11 +113,7 @@ impl AudioSupervisor {
     }
 
     fn schedule_retry(&mut self) {
-        let delay = self
-            .delay
-            .map_or(FIRST_RETRY, |delay| delay.saturating_mul(2).min(MAX_RETRY));
-        self.delay = Some(delay);
-        self.retry_at = Instant::now().checked_add(delay);
+        self.retry_at = Instant::now().checked_add(self.backoff.next_delay());
     }
 }
 

@@ -27,7 +27,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use blink_ring::media::AudioFormat;
-use blink_sys::ThreadPriority;
+use blink_sys::{Backoff, ThreadPriority};
 use tracing::{debug, info, warn};
 use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
@@ -35,7 +35,6 @@ use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 use self::com::MediaRuntime;
 use self::encoder::AacEncoder;
 use self::wasapi::{LoopbackStream, PacketInfo};
-use crate::backoff::Backoff;
 use crate::timeline::{Correction, Event, Packet, Timeline};
 use crate::{AudioConfig, AudioError, AudioSink};
 
@@ -44,6 +43,15 @@ const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sleep per iteration while no endpoint is open (silence is still emitted).
 const IDLE_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Delay before the second attempt to open an endpoint; the first reopen
+/// after a loss is immediate because a default-device switch usually
+/// succeeds at once.
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Longest delay between attempts. Reopening never gives up (a headset can be
+/// unplugged for hours), so the cap keeps polling cheap rather than ending it.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// How often the timeline correction counters are logged.
 const STATS_INTERVAL: Duration = Duration::from_secs(60);
@@ -341,7 +349,7 @@ impl Endpoint {
         Self {
             enumerator,
             stream: None,
-            backoff: Backoff::default(),
+            backoff: Backoff::new(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY),
             next_open: now,
             next_device_check: now,
             open_failures: 0,

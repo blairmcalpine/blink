@@ -208,8 +208,8 @@ impl Encoder {
             output: &self.bitstream,
             width: self.settings.width,
             height: self.settings.height,
-            timestamp: timestamp.0.cast_unsigned(),
-            duration: self.frame_duration.0.cast_unsigned(),
+            timestamp: timestamp.ticks().cast_unsigned(),
+            duration: self.frame_duration.ticks().cast_unsigned(),
             flags: if force_idr {
                 NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
             } else {

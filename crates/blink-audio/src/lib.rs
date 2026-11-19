@@ -24,12 +24,6 @@ use blink_ring::media::Timestamp;
     reason = "`pub` here would trip the denied `unreachable_pub`"
 )]
 mod asc;
-#[cfg(any(windows, test))]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
-)]
-mod backoff;
 mod config;
 mod error;
 #[cfg(any(windows, test))]
@@ -78,4 +72,4 @@ pub const FRAMES_PER_PACKET: u32 = 1024;
 ///
 /// 1024 frames at 48 kHz, truncated. Packet timestamps are computed from the
 /// exact sample count, so the truncation never accumulates.
-pub const PACKET_DURATION: Timestamp = Timestamp(213_333);
+pub const PACKET_DURATION: Timestamp = Timestamp::from_ticks(213_333);
