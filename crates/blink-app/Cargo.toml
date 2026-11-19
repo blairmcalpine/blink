@@ -27,6 +27,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 anyhow.workspace = true
 blink-capture = { path = "../blink-capture" }

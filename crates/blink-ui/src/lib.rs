@@ -160,11 +160,10 @@ mod tests {
 
     #[test]
     fn load_errors_render_with_their_source_chain() {
-        let path =
-            std::env::temp_dir().join(format!("blink-ui-describe-{}.toml", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         std::fs::write(&path, "clip_seconds = \"long\"\n").unwrap();
         let err = Config::load_unvalidated(&path).unwrap_err();
-        std::fs::remove_file(&path).unwrap();
         let message = ErrorChain(&err).to_string();
         let prefix = format!("failed to parse config {}", path.display());
         assert!(message.starts_with(&prefix), "{message}");

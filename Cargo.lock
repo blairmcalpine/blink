@@ -157,6 +157,7 @@ dependencies = [
  "keyboard-types",
  "parking_lot",
  "rfd",
+ "tempfile",
  "thiserror 2.0.21",
  "time",
  "tracing",
@@ -194,6 +195,7 @@ dependencies = [
  "blink-sys",
  "known-folders",
  "serde",
+ "tempfile",
  "thiserror 2.0.21",
  "toml",
 ]
@@ -245,6 +247,7 @@ dependencies = [
  "blink-sys",
  "eframe",
  "rfd",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",

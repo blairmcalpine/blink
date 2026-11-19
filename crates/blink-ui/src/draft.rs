@@ -197,14 +197,15 @@ pub(crate) fn decide(draft: &Draft, loaded: &Config) -> SaveDecision {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn clips_dir() -> PathBuf {
         PathBuf::from(if cfg!(windows) { r"C:\clips" } else { "/clips" })
     }
 
-    fn sample() -> Config {
+    /// A valid config with every field away from its default.
+    pub(crate) fn sample() -> Config {
         Config {
             output_dir: clips_dir(),
             clip_seconds: 45,

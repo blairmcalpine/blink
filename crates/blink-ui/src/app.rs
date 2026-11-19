@@ -314,40 +314,11 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::draft::tests::sample;
 
-    /// A unique scratch directory, removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("blink-ui-test-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            Self(dir)
-        }
-
-        fn config(&self) -> PathBuf {
-            self.0.join("config.toml")
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn sample() -> Config {
-        Config {
-            output_dir: PathBuf::from(if cfg!(windows) { r"C:\clips" } else { "/clips" }),
-            clip_seconds: 45,
-            hotkey: "Ctrl+Shift+F9".parse().unwrap(),
-            fps: 144,
-            video_bitrate_kbps: 50_000,
-            audio_enabled: false,
-            audio_bitrate_kbps: 192,
-            stretch_to: Some("1280x960".parse().unwrap()),
-        }
+    /// The settings file in the scratch directory `dir`.
+    fn config(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("config.toml")
     }
 
     /// Runs one headless egui frame with `events`, without a window or GPU.
@@ -396,9 +367,9 @@ mod tests {
 
     #[test]
     fn recording_through_egui_input_sets_the_hotkey() {
-        let dir = TempDir::new("record");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         let ctx = egui::Context::default();
         frame(&ctx, &mut app, Vec::new());
 
@@ -426,9 +397,9 @@ mod tests {
 
     #[test]
     fn escape_while_recording_keeps_the_old_hotkey() {
-        let dir = TempDir::new("escape");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         let ctx = egui::Context::default();
         app.recorder.start();
         frame(
@@ -442,9 +413,9 @@ mod tests {
 
     #[test]
     fn save_writes_edits_and_reports_saved() {
-        let dir = TempDir::new("save");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         app.draft.fps = 60;
         app.draft.stretch_enabled = false;
         let output = save(&mut app);
@@ -452,7 +423,7 @@ mod tests {
 
         assert_eq!(outcome.get(), Outcome::Saved);
         assert_eq!(
-            Config::load(&dir.config()).unwrap(),
+            Config::load(&config(&dir)).unwrap(),
             Config {
                 fps: 60,
                 stretch_to: None,
@@ -463,51 +434,51 @@ mod tests {
 
     #[test]
     fn unchanged_save_closes_without_writing() {
-        let dir = TempDir::new("unchanged");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         let output = save(&mut app);
         assert!(closed(&output));
         assert_eq!(outcome.get(), Outcome::Cancelled);
-        assert!(!dir.config().exists());
+        assert!(!config(&dir).exists());
     }
 
     #[test]
     fn invalid_settings_are_not_saved() {
-        let dir = TempDir::new("invalid");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
         let loaded = Config {
             clip_seconds: 1,
             ..sample()
         };
-        let mut app = SettingsApp::new(dir.config(), loaded, &outcome);
+        let mut app = SettingsApp::new(config(&dir), loaded, &outcome);
         assert_eq!(app.draft.clip_seconds, 1);
         let output = save(&mut app);
         assert!(!closed(&output));
         assert_eq!(outcome.get(), Outcome::Cancelled);
-        assert!(!dir.config().exists());
+        assert!(!config(&dir).exists());
     }
 
     #[test]
     fn menus_offer_only_valid_values() {
-        let dir = TempDir::new("menus");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
         let loaded = Config {
             fps: 1_000,
             ..sample()
         };
-        let app = SettingsApp::new(dir.config(), loaded, &outcome);
+        let app = SettingsApp::new(config(&dir), loaded, &outcome);
         assert_eq!(app.fps_options, [30, 60, 120, 144, 240]);
         assert_eq!(app.draft.fps, 1_000);
     }
 
     #[test]
     fn picked_folder_replaces_the_output_dir() {
-        let dir = TempDir::new("pick");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
-        app.pick(dir.0.clone());
-        assert_eq!(app.draft.output_dir, dir.0.display().to_string());
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
+        app.pick(dir.path().to_owned());
+        assert_eq!(app.draft.output_dir, dir.path().display().to_string());
         assert!(app.status.is_none());
     }
 
@@ -516,9 +487,9 @@ mod tests {
     fn non_unicode_folder_is_refused_not_mangled() {
         use std::os::unix::ffi::OsStringExt;
 
-        let dir = TempDir::new("pick-bad");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         let before = app.draft.output_dir.clone();
         app.pick(PathBuf::from(std::ffi::OsString::from_vec(vec![
             b'/', 0xff,
@@ -531,10 +502,10 @@ mod tests {
 
     #[test]
     fn save_failure_keeps_the_window_open_until_the_draft_changes() {
-        let dir = TempDir::new("write-fails");
-        fs::create_dir_all(dir.config()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(config(&dir)).unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         app.draft.fps = 30;
         let output = save(&mut app);
         assert!(!closed(&output));
@@ -580,9 +551,9 @@ mod tests {
 
     #[test]
     fn frames_settle_without_requesting_repaints() {
-        let dir = TempDir::new("render");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         let ctx = egui::Context::default();
         let (_, output) = settle(&ctx, &mut app);
         assert!(output.shapes.len() > 10, "{}", output.shapes.len());
@@ -594,9 +565,9 @@ mod tests {
 
     #[test]
     fn window_height_follows_the_form() {
-        let dir = TempDir::new("fit");
+        let dir = tempfile::tempdir().unwrap();
         let outcome = Cell::new(Outcome::Cancelled);
-        let mut app = SettingsApp::new(dir.config(), sample(), &outcome);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         let ctx = egui::Context::default();
         let (valid, _) = settle(&ctx, &mut app);
         assert!((valid.x - WINDOW_WIDTH).abs() < f32::EPSILON);

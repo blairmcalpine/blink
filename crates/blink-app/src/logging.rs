@@ -176,12 +176,10 @@ mod tests {
 
     #[test]
     fn crash_entries_append() {
-        let dir = std::env::temp_dir().join(format!("blink-crash-test-{}", std::process::id()));
-        let path = dir.join(CRASH_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join(CRASH_FILE);
         assert!(append(&path, "one\n"));
         assert!(append(&path, "two\n"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
