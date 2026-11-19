@@ -29,6 +29,11 @@ use crate::status::CaptureState;
 /// static-screen IDR refresh is noticed.
 const POLL: Duration = Duration::from_millis(100);
 
+const _: () = assert!(
+    blink_capture::TEXTURE_POOL_SIZE <= blink_encode::MAX_REGISTERED_TEXTURES,
+    "every pooled capture texture must stay registered with NVENC"
+);
+
 /// First and longest delay before rebuilding the device after a failure.
 const FIRST_RETRY: Duration = Duration::from_millis(250);
 const MAX_RETRY: Duration = Duration::from_secs(10);

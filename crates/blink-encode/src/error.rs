@@ -50,6 +50,10 @@ pub enum EncodeError {
         /// The output that was null.
         what: &'static str,
     },
+    /// The frame's timestamp was before the QPC epoch; NVENC takes unsigned
+    /// timestamps.
+    #[error("frame timestamp {0} is negative")]
+    NegativeTimestamp(i64),
     /// The encoder's own state broke an invariant it relies on. A bug in
     /// blink, not a driver failure.
     #[error("internal encoder error: {0}")]

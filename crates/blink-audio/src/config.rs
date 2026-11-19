@@ -50,7 +50,7 @@ impl TryFrom<u32> for AacBitrate {
 
 /// A bitrate, in kbit/s, that is not one of [`AacBitrate::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("unsupported AAC bitrate {0} kbit/s; expected 96, 128, 160, or 192")]
+#[error("unsupported AAC bitrate {0} kbit/s; expected one of {supported:?}", supported = AacBitrate::ALL.map(AacBitrate::kbps))]
 pub struct UnsupportedBitrate(pub u32);
 
 /// Settings for [`AudioCapture::start`](crate::AudioCapture::start).
@@ -80,6 +80,10 @@ mod tests {
         for kbps in [0, 64, 127, 256, u32::MAX] {
             assert_eq!(AacBitrate::try_from(kbps), Err(UnsupportedBitrate(kbps)));
         }
+        assert_eq!(
+            UnsupportedBitrate(64).to_string(),
+            "unsupported AAC bitrate 64 kbit/s; expected one of [96, 128, 160, 192]"
+        );
     }
 
     #[test]

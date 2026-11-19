@@ -588,7 +588,7 @@ mod tests {
                             kind: StreamKind::Audio,
                             pts: Timestamp::from_ticks(offset + i * 1024 * 10_000_000 / rate),
                             duration: Timestamp::from_ticks(1024 * 10_000_000 / rate),
-                            keyframe: false,
+                            keyframe: true,
                         };
                         (meta, frame.to_vec())
                     })

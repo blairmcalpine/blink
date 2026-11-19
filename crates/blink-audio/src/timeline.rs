@@ -44,6 +44,10 @@ use crate::pcm::{self, SampleFormat};
 /// frames of [`CHANNELS`](crate::CHANNELS) samples.
 pub(crate) const CHUNK_SAMPLES: usize = 2048;
 
+/// Bytes in one chunk as 16-bit PCM: the AAC encoder's input buffer size.
+#[cfg(any(windows, test))]
+pub(crate) const CHUNK_BYTES: u32 = 4096;
+
 /// Frames in one chunk.
 const CHUNK_FRAMES: u64 = 1024;
 
@@ -519,6 +523,10 @@ mod tests {
             usize::try_from(FRAMES_PER_PACKET).unwrap() * usize::from(PUB_CHANNELS)
         );
         assert_eq!(CHUNK_FRAMES, u64::from(FRAMES_PER_PACKET));
+        assert_eq!(
+            usize::try_from(CHUNK_BYTES).unwrap(),
+            CHUNK_SAMPLES * size_of::<i16>()
+        );
         assert_eq!(SAMPLE_RATE, i128::from(PUB_RATE));
         assert_eq!(frames_to_ticks(CHUNK_FRAMES), PACKET_DURATION.ticks());
     }

@@ -1,10 +1,9 @@
 //! `AVCDecoderConfigurationRecord` (the `avcC` box payload, ISO/IEC 14496-15).
 
-use super::annexb::nal_type;
+use blink_ring::h264::{NAL_PPS, NAL_SPS, nal_type};
+
 use crate::MuxError;
 
-const SPS_NAL_TYPE: u8 = 7;
-const PPS_NAL_TYPE: u8 = 8;
 const TRUNCATED: MuxError = MuxError::InvalidSps {
     reason: "truncated",
 };
@@ -26,12 +25,12 @@ pub(super) fn decoder_config(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>, MuxError
             reason: "shorter than 4 bytes",
         });
     };
-    if nal_type(sps) != Some(SPS_NAL_TYPE) {
+    if nal_type(sps) != Some(NAL_SPS) {
         return Err(MuxError::InvalidSps {
             reason: "not an SPS NAL unit",
         });
     }
-    if nal_type(pps) != Some(PPS_NAL_TYPE) {
+    if nal_type(pps) != Some(NAL_PPS) {
         return Err(MuxError::InvalidPps);
     }
     let sps_len =

@@ -18,9 +18,10 @@ use crate::media::{AudioFormat, PacketMeta, StreamKind, Timestamp, VideoFormat};
 /// 240 fps video plus 48 kHz AAC (about 47 frames per second), with headroom.
 const MAX_PACKETS_PER_SECOND: usize = 512;
 
-/// Seconds of packets kept beyond the window: eviction is whole-GOP, so up to
-/// one GOP (1 to 2 s) more than the window is held.
-const GOP_SLACK_SECONDS: usize = 4;
+/// Media kept beyond the window, which both the arena and the metadata deque
+/// are sized for: eviction is whole-GOP, so up to one GOP (1 to 2 s) more
+/// than the window is held.
+const GOP_SLACK: Timestamp = Timestamp::from_secs(4);
 
 /// Errors returned by [`ClipRing::push`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -242,15 +243,14 @@ impl ClipRing {
     }
 
     /// Arena size for `window` at a combined audio and video bitrate of
-    /// `bits_per_second`: the window plus 4 s of GOP slack, with 25% headroom
-    /// for bitrate overshoot.
+    /// `bits_per_second`: the window plus the ring's GOP slack (4 s), with 25%
+    /// headroom for bitrate overshoot.
     #[must_use]
     pub fn recommended_byte_capacity(window: Timestamp, bits_per_second: u64) -> usize {
-        let ticks = u128::from(u64::try_from(window.ticks()).unwrap_or(0));
-        let slack = u128::from(Timestamp::from_secs(4).ticks().unsigned_abs());
+        let ticks = u128::from(u64::try_from(kept(window).ticks()).unwrap_or(0));
         let ticks_per_second = u128::from(Timestamp::TICKS_PER_SECOND.unsigned_abs());
         // bytes = bits / 8 * seconds * 1.25 = bits * seconds * 5 / 32
-        let bytes = u128::from(bits_per_second) * (ticks + slack) * 5 / 32 / ticks_per_second;
+        let bytes = u128::from(bits_per_second) * ticks * 5 / 32 / ticks_per_second;
         usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 
@@ -694,12 +694,21 @@ fn max_allocation(element_size: usize) -> usize {
     usize::try_from(isize::MAX).unwrap_or(usize::MAX) / element_size.max(1)
 }
 
+/// The most media the ring holds for `window`: the window plus [`GOP_SLACK`].
+const fn kept(window: Timestamp) -> Timestamp {
+    let window = if window.ticks() < 0 {
+        Timestamp::ZERO
+    } else {
+        window
+    };
+    window.saturating_add(GOP_SLACK)
+}
+
 fn default_packet_capacity(window: Timestamp, byte_capacity: usize) -> usize {
-    let ticks = u64::try_from(window.ticks()).unwrap_or(0);
+    let ticks = u64::try_from(kept(window).ticks()).unwrap_or(0);
     let secs = ticks.div_ceil(Timestamp::TICKS_PER_SECOND.unsigned_abs());
     usize::try_from(secs)
         .unwrap_or(usize::MAX)
-        .saturating_add(GOP_SLACK_SECONDS)
         .saturating_mul(MAX_PACKETS_PER_SECOND)
         .min(byte_capacity)
 }

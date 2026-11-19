@@ -9,17 +9,17 @@
 //! (which forbids `unsafe`) can use them and the FFI crates do not duplicate
 //! them.
 //!
-//! Windows only, like the other FFI crates. On other hosts only the portable
-//! items exist ([`QpcClock`]'s arithmetic, [`Backoff`], [`ErrorChain`], and
-//! [`SysError`]), so
-//! the workspace
-//! still builds and their logic is unit tested everywhere.
+//! A few portable helpers live here for the same reason, because every crate
+//! that needs them already depends on this one: [`Backoff`], the retry delay
+//! every reconnect loop uses; [`ErrorChain`], which renders an error with its
+//! sources for logs and dialogs; and [`rename_replacing`] and
+//! [`rename_no_replace`], which retry the sharing violations antivirus causes
+//! on Windows.
 //!
-//! Two portable helpers live here for the same reason: [`Backoff`], the retry
-//! delay every reconnect loop uses, and [`ErrorChain`], which renders an
-//! error with its sources for logs and dialogs. Every `unsafe`
-//! block needs a `// SAFETY:` comment and may contain only one unsafe
-//! operation.
+//! On other hosts only the portable items exist ([`QpcClock`]'s arithmetic,
+//! [`SysError`], and the helpers above), so the workspace still builds and
+//! their logic is unit tested everywhere. Every `unsafe` block needs a
+//! `// SAFETY:` comment and may contain only one unsafe operation.
 
 mod backoff;
 mod clock;
@@ -32,6 +32,7 @@ mod clock;
 )]
 mod error;
 mod error_chain;
+mod fs;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]
@@ -45,6 +46,7 @@ pub use clock::QpcClock;
 pub use clock::{qpc_counter, qpc_now};
 pub use error::SysError;
 pub use error_chain::ErrorChain;
+pub use fs::{rename_no_replace, rename_replacing};
 #[cfg(windows)]
 pub use instance::SingleInstance;
 #[cfg(windows)]

@@ -20,5 +20,5 @@ pub use config::{
     STRETCH_TO_DIMENSION_RANGE, VIDEO_BITRATE_KBPS_RANGE, ValidationError,
 };
 pub use hotkey::{Hotkey, HotkeyParseError, Key, Modifiers};
-pub use paths::{default_config_path, default_output_dir};
+pub use paths::{default_config_path, default_log_dir, default_output_dir};
 pub use resolution::{Resolution, ResolutionParseError};

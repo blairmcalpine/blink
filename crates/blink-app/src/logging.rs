@@ -73,12 +73,11 @@ pub(crate) fn init(prefix: &str) -> LogGuard {
 /// The crash report file in the log folder.
 const CRASH_FILE: &str = "crash.log";
 
-/// `%LOCALAPPDATA%\blink\logs` on Windows; `None` elsewhere, where logs go
-/// to stderr only.
+/// [`blink_config::default_log_dir`] on Windows; `None` elsewhere, where
+/// logs go to stderr only.
 pub(crate) fn log_dir() -> Option<PathBuf> {
     if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|local| PathBuf::from(local).join("blink").join("logs"))
+        blink_config::default_log_dir()
     } else {
         None
     }
@@ -145,7 +144,7 @@ mod file {
     const KEPT_FILES: usize = 7;
 
     pub(super) fn writer(prefix: &str) -> anyhow::Result<(NonBlocking, WorkerGuard)> {
-        let dir = super::log_dir().context("LOCALAPPDATA is not set")?;
+        let dir = super::log_dir().context("cannot locate the per-user local data folder")?;
         let appender = RollingFileAppender::builder()
             .rotation(Rotation::DAILY)
             .filename_prefix(prefix)

@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn config_and_encoder_agree_on_audio_bitrates() {
+    fn config_and_audio_crate_agree_on_aac_bitrates() {
         assert_eq!(AUDIO_BITRATES_KBPS, AacBitrate::ALL.map(AacBitrate::kbps));
     }
 

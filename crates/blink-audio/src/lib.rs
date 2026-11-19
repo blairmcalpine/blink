@@ -21,7 +21,7 @@ use blink_ring::media::Timestamp;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod asc;
 mod config;
@@ -29,20 +29,20 @@ mod error;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod pcm;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod pts_queue;
 mod sink;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod timeline;
 
@@ -66,7 +66,7 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
 
 /// PCM frames (one sample per channel) in one AAC-LC access unit.
-pub const FRAMES_PER_PACKET: u32 = 1024;
+pub const FRAMES_PER_PACKET: u32 = blink_ring::media::AAC_FRAME_SAMPLES;
 
 /// Nominal duration of one AAC packet, in whole 100 ns ticks (21.3333 ms).
 ///

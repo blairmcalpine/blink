@@ -105,6 +105,11 @@ pub struct VideoFormat {
     pub sample_aspect: Option<(u32, u32)>,
 }
 
+/// PCM frames (one sample per channel) in one AAC-LC access unit. The audio
+/// encoder packetizes on it and the muxer falls back to it as a sample
+/// duration.
+pub const AAC_FRAME_SAMPLES: u32 = 1024;
+
 /// Format of the AAC audio stream in the current segment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AudioFormat {
@@ -129,6 +134,8 @@ pub struct PacketMeta {
     pub pts: Timestamp,
     /// Nominal duration of the packet.
     pub duration: Timestamp,
-    /// Whether the packet is an IDR access unit. Ignored for audio.
+    /// Whether the packet is an IDR access unit. Every AAC frame decodes on
+    /// its own, so audio packets set it to `true`; the ring and muxer only
+    /// read it for video.
     pub keyframe: bool,
 }

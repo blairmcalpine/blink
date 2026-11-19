@@ -91,7 +91,7 @@ mod error;
 pub use annexb::ParameterSetError;
 pub use config::{EncoderConfig, EncoderConfigError, Preset};
 #[cfg(windows)]
-pub use encoder::{EncodedFrame, Encoder};
+pub use encoder::{EncodedFrame, Encoder, MAX_REGISTERED_TEXTURES};
 #[cfg(windows)]
 pub use error::EncodeError;
 pub use status::NvencStatus;

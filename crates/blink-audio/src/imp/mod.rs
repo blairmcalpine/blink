@@ -285,7 +285,7 @@ struct Stats {
 impl Stats {
     fn new() -> Self {
         Self {
-            next_log: Some(Instant::now() + STATS_INTERVAL),
+            next_log: Instant::now().checked_add(STATS_INTERVAL),
             ..Self::default()
         }
     }
@@ -327,7 +327,7 @@ impl Stats {
             "audio timeline stats (last 60 s)"
         );
         *self = Self {
-            next_log: Some(now + STATS_INTERVAL),
+            next_log: now.checked_add(STATS_INTERVAL),
             ..Self::default()
         };
     }
@@ -371,7 +371,7 @@ impl Endpoint {
                 );
                 self.backoff.reset();
                 self.open_failures = 0;
-                self.next_device_check = Instant::now() + DEVICE_CHECK_INTERVAL;
+                self.next_device_check = after(DEVICE_CHECK_INTERVAL);
                 self.stream = Some(stream);
             }
             Err(error) => {
@@ -385,7 +385,7 @@ impl Endpoint {
                     );
                 }
                 self.open_failures = self.open_failures.saturating_add(1);
-                self.next_open = Instant::now() + self.backoff.next_delay();
+                self.next_open = after(self.backoff.next_delay());
             }
         }
     }
@@ -415,7 +415,7 @@ impl Endpoint {
                 true
             }
             Ok(()) if Instant::now() >= self.next_device_check => {
-                self.next_device_check = Instant::now() + DEVICE_CHECK_INTERVAL;
+                self.next_device_check = after(DEVICE_CHECK_INTERVAL);
                 match stream.is_default(&self.enumerator) {
                     Ok(true) => false,
                     Ok(false) => {
@@ -436,4 +436,10 @@ impl Endpoint {
         }
         Ok(())
     }
+}
+
+/// `delay` from now, or now if that is past the end of `Instant`'s range.
+fn after(delay: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(delay).unwrap_or(now)
 }

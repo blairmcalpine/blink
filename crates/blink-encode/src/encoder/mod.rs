@@ -24,10 +24,13 @@ use crate::params::{TUNING, apply_config, fill_initialize, preset_guid};
 use crate::{EncodeError, EncoderConfig};
 
 /// Registered textures kept at once: the three-texture capture pool plus one
-/// spare. Each registration holds a texture alive (about 33 MB at 4K), so the
-/// cap bounds what a replaced pool can pin if `release_textures` is missed.
-/// Beyond it the least recently registered texture is unregistered.
-const MAX_REGISTERED_TEXTURES: usize = 4;
+/// spare.
+///
+/// Each registration holds a texture alive (about 33 MB at 4K), so the cap
+/// bounds what a replaced pool can pin if `release_textures` is missed.
+/// Beyond it the least recently registered texture is unregistered, so a
+/// capture pool larger than this would re-register on every frame.
+pub const MAX_REGISTERED_TEXTURES: usize = 4;
 
 /// Initial capacity of the reused output buffer: one second at the target
 /// bitrate, but at least 256 KiB, which covers a typical IDR frame. A larger
@@ -205,6 +208,8 @@ impl Encoder {
                 "the cached texture registration is missing",
             ))?;
 
+        let pts = u64::try_from(timestamp.ticks())
+            .map_err(|_| EncodeError::NegativeTimestamp(timestamp.ticks()))?;
         let force_idr = self.idr.due(timestamp);
         let mapped = self.session.map(registered)?;
         let picture = PictureInput {
@@ -212,8 +217,8 @@ impl Encoder {
             output: &self.bitstream,
             width: self.settings.width,
             height: self.settings.height,
-            timestamp: timestamp.ticks().cast_unsigned(),
-            duration: self.frame_duration.ticks().cast_unsigned(),
+            timestamp: pts,
+            duration: self.frame_duration.ticks().unsigned_abs(),
             flags: if force_idr {
                 NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS
             } else {

@@ -36,7 +36,7 @@ fn audio(pts_ms: i64) -> PacketMeta {
         kind: StreamKind::Audio,
         pts: Timestamp::from_ticks(pts_ms * MS),
         duration: Timestamp::from_ticks(21 * MS),
-        keyframe: false,
+        keyframe: true,
     }
 }
 

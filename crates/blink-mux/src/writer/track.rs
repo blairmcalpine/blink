@@ -1,7 +1,7 @@
 //! Converts a clip into tracks of timed samples grouped into interleaved chunks.
 
 use blink_ring::ClipBuf;
-use blink_ring::media::{AudioFormat, PacketMeta, Timestamp, VideoFormat};
+use blink_ring::media::{AAC_FRAME_SAMPLES, AudioFormat, PacketMeta, Timestamp, VideoFormat};
 use tracing::warn;
 
 use super::annexb;
@@ -14,9 +14,6 @@ pub(super) const MOVIE_TIMESCALE: u32 = 90_000;
 /// Video media timescale. 90 kHz is exact for 24, 25, 30, 50, 60, 120, 144,
 /// and 240 fps, and the conventional H.264 clock.
 pub(super) const VIDEO_TIMESCALE: u32 = 90_000;
-
-/// Samples per AAC-LC frame, the fallback audio frame duration.
-const AAC_FRAME_SAMPLES: u64 = 1024;
 
 /// Target span of one chunk; chunks of both tracks interleave in the `mdat`.
 const CHUNK_TICKS: i64 = Timestamp::TICKS_PER_SECOND / 2;
@@ -316,19 +313,19 @@ fn audio_durations(packets: &[Packet<'_>], timescale: u32) -> Result<Vec<u32>, M
         .first()
         .map(|(meta, _)| ticks_to_units(meta.duration, timescale))
         .filter(|&nominal| nominal > 0)
-        .unwrap_or(AAC_FRAME_SAMPLES);
+        .unwrap_or_else(|| u64::from(AAC_FRAME_SAMPLES));
     let mut durations = Vec::with_capacity(packets.len());
     let mut timeline = 0_u64;
     let mut adjusted = 0_usize;
     for (_, (next, _)) in packets.iter().zip(packets.iter().skip(1)) {
         let actual = ticks_to_units(next.pts.saturating_sub(first), timescale);
-        let duration = if actual.abs_diff(timeline + nominal) > nominal / 2 {
+        let duration = if actual.abs_diff(timeline.saturating_add(nominal)) > nominal / 2 {
             adjusted += 1;
             actual.saturating_sub(timeline).max(1)
         } else {
             nominal
         };
-        timeline += duration;
+        timeline = timeline.saturating_add(duration);
         durations.push(duration);
     }
     if !packets.is_empty() {

@@ -254,8 +254,8 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(dir).map_err(write_error)?;
         let (temp, file) = create_temp(dir, file_name).map_err(write_error)?;
-        let result =
-            write_synced(file, text.as_bytes()).and_then(|()| rename_replacing(&temp, path));
+        let result = write_synced(file, text.as_bytes())
+            .and_then(|()| blink_sys::rename_replacing(&temp, path));
         result.map_err(|source| {
             // Best effort: the original error matters more than a stray temp file.
             let _ = fs::remove_file(&temp);
@@ -287,37 +287,6 @@ fn create_temp(dir: &Path, file_name: &std::ffi::OsStr) -> io::Result<(PathBuf, 
 fn write_synced(mut file: File, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()
-}
-
-#[cfg(not(windows))]
-fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
-}
-
-/// Renames with a short retry, because antivirus and the search indexer
-/// briefly open the destination without `FILE_SHARE_DELETE`.
-#[cfg(windows)]
-fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
-    use std::time::Duration;
-
-    const RETRIES: u32 = 5;
-    const BACKOFF: Duration = Duration::from_millis(20);
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-
-    let mut attempt = 0;
-    loop {
-        match fs::rename(from, to) {
-            Err(err)
-                if attempt < RETRIES
-                    && (err.kind() == io::ErrorKind::PermissionDenied
-                        || err.raw_os_error() == Some(ERROR_SHARING_VIOLATION)) =>
-            {
-                attempt += 1;
-                std::thread::sleep(BACKOFF * attempt);
-            }
-            result => return result,
-        }
-    }
 }
 
 #[cfg(test)]

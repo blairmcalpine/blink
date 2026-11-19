@@ -15,6 +15,7 @@ anyhow = "1"
 known-folders = "1"
 rfd = { version = "0.18", default-features = false }
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 thiserror = "2"
 toml = "1"
 tracing = "0.1"

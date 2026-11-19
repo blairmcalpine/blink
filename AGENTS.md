@@ -45,7 +45,11 @@ table, or `clippy.toml` to make code pass.
   `blink-mux`; use `get` and iterators.
 - Windows code stays behind `#[cfg(windows)]`, with dependencies under
   `[target.'cfg(windows)'.dependencies]`, so the workspace builds on macOS and
-  Linux.
+  Linux. Off Windows an FFI crate exports only its portable items (config,
+  errors, pure logic). The entry points of `blink-capture` (`create_device`)
+  and `blink-audio` (`AudioCapture`) also have stubs that return an
+  `Unsupported` error; `blink-encode` and `blink-sys` have none. Do not add
+  new stubs without a portable caller.
 - Every public item has a doc comment.
 - The engine process links eframe/egui (one binary) but must never initialize
   or run it. UI runs only in the short-lived `blink.exe --settings` child

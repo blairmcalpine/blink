@@ -4,7 +4,7 @@
 //! [`ClipRing`] holds those packets in one preallocated circular byte arena,
 //! evicts whole GOPs as time passes, and copies a GOP-aligned clip into a
 //! reusable [`ClipBuf`] when the user saves. [`media`] holds the media types shared by every crate in the
-//! pipeline.
+//! pipeline, and [`h264`] the Annex B splitting the encoder and muxer share.
 //!
 //! The crate is platform-agnostic, contains no `unsafe`, and its tests run
 //! under Miri.
@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::indexing_slicing)]
 
+pub mod h264;
 pub mod media;
 mod ring;
 

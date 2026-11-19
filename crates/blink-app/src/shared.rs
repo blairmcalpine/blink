@@ -175,7 +175,7 @@ pub(crate) mod tests {
             kind: StreamKind::Audio,
             pts: Timestamp::from_ticks(pts_ms * MS),
             duration: Timestamp::from_ticks(21 * MS),
-            keyframe: false,
+            keyframe: true,
         }
     }
 

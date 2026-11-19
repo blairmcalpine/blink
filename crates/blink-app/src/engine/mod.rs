@@ -457,7 +457,7 @@ impl Engine {
 
 fn open_log_folder() {
     let Some(dir) = crate::logging::log_dir() else {
-        tracing::warn!("no log folder: LOCALAPPDATA is not set");
+        tracing::warn!("no log folder: the per-user local data folder is unknown");
         return;
     };
     if let Err(error) = Command::new("explorer.exe").arg(&dir).spawn() {

@@ -36,15 +36,12 @@ use super::{Context, has_flag};
 use crate::asc::{self, AscInfo};
 use crate::pcm;
 use crate::pts_queue::PtsQueue;
-use crate::timeline::{CHUNK_SAMPLES, Chunk, frames_to_ticks};
+use crate::timeline::{CHUNK_BYTES, Chunk, frames_to_ticks};
 use crate::{AudioConfig, AudioError, AudioSink, CHANNELS, PACKET_DURATION, SAMPLE_RATE};
 
 /// Input and output stream ID. The AAC encoder has fixed streams numbered
 /// from zero (`GetStreamIDs` returns `E_NOTIMPL`).
 const STREAM: u32 = 0;
-
-/// Bytes in one input chunk: 1024 frames of two 16-bit samples.
-const INPUT_BYTES: u32 = 4096;
 
 /// Input samples used round robin. The MFT may keep a reference to an input
 /// sample after `ProcessInput` returns (unless it reports
@@ -120,7 +117,7 @@ impl AacEncoder {
             "AAC encoder stream info"
         );
 
-        let input = || media_slot(INPUT_BYTES, input_info.cbAlignment);
+        let input = || media_slot(CHUNK_BYTES, input_info.cbAlignment);
         let inputs = [
             input()?,
             input()?,
@@ -291,11 +288,10 @@ fn fill_input(slot: &MediaSlot, chunk: Chunk<'_>) -> Result<(), AudioError> {
         let mut locked = Locked::new(&slot.buffer)?;
         pcm::write_le(chunk.pcm, locked.whole())
     };
-    let expected = CHUNK_SAMPLES * 2;
-    if written != expected {
-        return Err(AudioError::InvalidEncoderBuffer(written));
-    }
-    let length = u32::try_from(written).map_err(|_| AudioError::InvalidEncoderBuffer(written))?;
+    let length = u32::try_from(written)
+        .ok()
+        .filter(|&length| length == CHUNK_BYTES)
+        .ok_or(AudioError::InvalidEncoderBuffer(written))?;
     // SAFETY: plain COM call; `length` is within the buffer's maximum length
     // (it was just written).
     unsafe { slot.buffer.SetCurrentLength(length) }.context("size the PCM input buffer")?;
@@ -544,7 +540,7 @@ mod tests {
         let mut sink = move |meta: PacketMeta, payload: &[u8]| {
             tx.send((meta, payload.len())).unwrap();
         };
-        let mut pcm = [0_i16; CHUNK_SAMPLES];
+        let mut pcm = [0_i16; crate::timeline::CHUNK_SAMPLES];
         let mut frame = 0_u32;
         for chunk_index in 0..50_u64 {
             for pair in pcm.as_chunks_mut::<2>().0 {
