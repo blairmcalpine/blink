@@ -1,18 +1,18 @@
-//! Bounded exponential backoff for recreating a lost duplication session.
+//! Bounded exponential backoff for retrying a lost device, stream, or file.
 
 use std::time::Duration;
 
-/// Delay before the first retry after a failed recreation.
-pub(crate) const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
-
-/// Longest delay between retries. Recovery never gives up, because the
-/// secure desktop (UAC, lock screen) can block duplication for minutes, so the
-/// cap keeps polling cheap rather than ending it.
-pub(crate) const MAX_RETRY_DELAY: Duration = Duration::from_millis(500);
-
 /// Doubling retry delay, capped at a maximum.
+///
+/// Every retry loop in blink (a lost duplication session, a lost audio
+/// endpoint, a failed capture or audio thread) waits [`next_delay`] between
+/// attempts and calls [`reset`] once an attempt succeeds. None of them give
+/// up: the cap keeps polling cheap rather than ending it.
+///
+/// [`next_delay`]: Self::next_delay
+/// [`reset`]: Self::reset
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Backoff {
+pub struct Backoff {
     initial: Duration,
     max: Duration,
     next: Duration,
@@ -20,8 +20,13 @@ pub(crate) struct Backoff {
 
 impl Backoff {
     /// Starts at `initial` and never exceeds `max`.
-    pub(crate) fn new(initial: Duration, max: Duration) -> Self {
-        let initial = initial.min(max);
+    #[must_use]
+    pub const fn new(initial: Duration, max: Duration) -> Self {
+        let initial = if initial.as_nanos() > max.as_nanos() {
+            max
+        } else {
+            initial
+        };
         Self {
             initial,
             max,
@@ -30,21 +35,15 @@ impl Backoff {
     }
 
     /// Returns the delay to wait before the next attempt and doubles it.
-    pub(crate) fn next_delay(&mut self) -> Duration {
+    pub fn next_delay(&mut self) -> Duration {
         let delay = self.next;
         self.next = delay.saturating_mul(2).min(self.max);
         delay
     }
 
     /// Restarts from the initial delay after a successful attempt.
-    pub(crate) const fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.next = self.initial;
-    }
-}
-
-impl Default for Backoff {
-    fn default() -> Self {
-        Self::new(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY)
     }
 }
 
@@ -65,11 +64,11 @@ mod tests {
 
     #[test]
     fn reset_restarts_from_initial() {
-        let mut backoff = Backoff::default();
+        let mut backoff = Backoff::new(ms(10), ms(500));
         backoff.next_delay();
         backoff.next_delay();
         backoff.reset();
-        assert_eq!(backoff.next_delay(), INITIAL_RETRY_DELAY);
+        assert_eq!(backoff.next_delay(), ms(10));
     }
 
     #[test]

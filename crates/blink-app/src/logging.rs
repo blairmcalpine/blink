@@ -54,7 +54,7 @@ pub(crate) fn init(prefix: &str) -> LogGuard {
         if installed.is_ok()
             && let Some(error) = file_error
         {
-            tracing::warn!(error = format!("{error:#}"), "logging to stderr only");
+            tracing::warn!(error = %blink_sys::ErrorChain(error.as_ref()), "logging to stderr only");
         }
         LogGuard { _worker: worker }
     }
@@ -73,12 +73,11 @@ pub(crate) fn init(prefix: &str) -> LogGuard {
 /// The crash report file in the log folder.
 const CRASH_FILE: &str = "crash.log";
 
-/// `%LOCALAPPDATA%\blink\logs` on Windows; `None` elsewhere, where logs go
-/// to stderr only.
+/// [`blink_config::default_log_dir`] on Windows; `None` elsewhere, where
+/// logs go to stderr only.
 pub(crate) fn log_dir() -> Option<PathBuf> {
     if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA")
-            .map(|local| PathBuf::from(local).join("blink").join("logs"))
+        blink_config::default_log_dir()
     } else {
         None
     }
@@ -145,7 +144,7 @@ mod file {
     const KEPT_FILES: usize = 7;
 
     pub(super) fn writer(prefix: &str) -> anyhow::Result<(NonBlocking, WorkerGuard)> {
-        let dir = super::log_dir().context("LOCALAPPDATA is not set")?;
+        let dir = super::log_dir().context("cannot locate the per-user local data folder")?;
         let appender = RollingFileAppender::builder()
             .rotation(Rotation::DAILY)
             .filename_prefix(prefix)
@@ -177,12 +176,10 @@ mod tests {
 
     #[test]
     fn crash_entries_append() {
-        let dir = std::env::temp_dir().join(format!("blink-crash-test-{}", std::process::id()));
-        let path = dir.join(CRASH_FILE);
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join(CRASH_FILE);
         assert!(append(&path, "one\n"));
         assert!(append(&path, "two\n"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

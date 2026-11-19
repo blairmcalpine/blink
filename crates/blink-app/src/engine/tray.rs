@@ -5,6 +5,7 @@
 
 use anyhow::Context as _;
 use blink_config::Hotkey;
+use blink_sys::ErrorChain;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyManager, HotKeyState};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
@@ -83,7 +84,7 @@ impl Tray {
 
     pub(super) fn set_tooltip(&self, tooltip: &str) {
         if let Err(error) = self.icon.set_tooltip(Some(tooltip)) {
-            tracing::warn!(%error, "failed to update the tray tooltip");
+            tracing::warn!(error = %ErrorChain(&error), "failed to update the tray tooltip");
         }
     }
 }
@@ -119,7 +120,7 @@ impl SaveHotkey {
         if let Some((_, old)) = self.registered.replace((hotkey, new))
             && let Err(error) = self.manager.unregister(old)
         {
-            tracing::warn!(%error, "failed to unregister the previous hotkey");
+            tracing::warn!(error = %ErrorChain(&error), "failed to unregister the previous hotkey");
         }
         Ok(())
     }
@@ -130,7 +131,9 @@ impl SaveHotkey {
         if let Some((hotkey, old)) = self.registered.take() {
             match self.manager.unregister(old) {
                 Ok(()) => tracing::debug!(%hotkey, "save hotkey suspended"),
-                Err(error) => tracing::warn!(%error, "failed to unregister the hotkey"),
+                Err(error) => {
+                    tracing::warn!(error = %ErrorChain(&error), "failed to unregister the hotkey");
+                }
             }
         }
     }

@@ -92,6 +92,8 @@ mod status;
 use std::ffi::OsStr;
 use std::process::ExitCode;
 
+use blink_sys::ErrorChain;
+
 /// The argument that runs the settings window instead of the recorder.
 const SETTINGS_FLAG: &str = "--settings";
 
@@ -134,24 +136,10 @@ fn run_settings() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            tracing::error!(error = error_chain(&error), "settings window failed");
+            tracing::error!(error = %ErrorChain(&error), "settings window failed");
             ExitCode::FAILURE
         }
     }
-}
-
-/// `error` and its sources, outermost first, joined with `: `. `UiError` is
-/// not `Send` (it can hold a window-system error), so it cannot go through
-/// `anyhow`.
-fn error_chain(error: &dyn std::error::Error) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        text.push_str(": ");
-        text.push_str(&cause.to_string());
-        source = cause.source();
-    }
-    text
 }
 
 /// Tells the user the process crashed; release builds have no console.
@@ -170,7 +158,7 @@ fn run_recorder() -> ExitCode {
     match engine::run() {
         Ok(code) => code,
         Err(error) => {
-            let message = format!("{error:#}");
+            let message = ErrorChain(error.as_ref()).to_string();
             tracing::error!(error = message, "blink stopped");
             engine::show_error(&message);
             ExitCode::FAILURE
@@ -185,42 +173,4 @@ fn run_recorder() -> ExitCode {
          `blink {SETTINGS_FLAG}` opens the settings window on this host"
     );
     ExitCode::FAILURE
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fmt;
-
-    use super::*;
-
-    #[derive(Debug)]
-    struct Layer(&'static str, Option<Box<Self>>);
-
-    impl fmt::Display for Layer {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.0)
-        }
-    }
-
-    impl std::error::Error for Layer {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.1.as_deref().map(|inner| {
-                let source: &(dyn std::error::Error + 'static) = inner;
-                source
-            })
-        }
-    }
-
-    #[test]
-    fn error_chain_lists_every_source() {
-        let error = Layer(
-            "failed to show the window",
-            Some(Box::new(Layer("no OpenGL context", None))),
-        );
-        assert_eq!(
-            error_chain(&error),
-            "failed to show the window: no OpenGL context"
-        );
-        assert_eq!(error_chain(&Layer("alone", None)), "alone");
-    }
 }

@@ -27,19 +27,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use blink_ring::media::AudioFormat;
+use blink_sys::ErrorChain;
+use blink_sys::{Backoff, ThreadPriority};
 use tracing::{debug, info, warn};
 use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::Threading::{
-    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
-};
 
 use self::com::MediaRuntime;
 use self::encoder::AacEncoder;
 use self::wasapi::{LoopbackStream, PacketInfo};
-use crate::backoff::Backoff;
-use crate::qpc::QpcClock;
 use crate::timeline::{Correction, Event, Packet, Timeline};
 use crate::{AudioConfig, AudioError, AudioSink};
 
@@ -48,6 +44,15 @@ const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sleep per iteration while no endpoint is open (silence is still emitted).
 const IDLE_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Delay before the second attempt to open an endpoint; the first reopen
+/// after a loss is immediate because a default-device switch usually
+/// succeeds at once.
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Longest delay between attempts. Reopening never gives up (a headset can be
+/// unplugged for hours), so the cap keeps polling cheap rather than ending it.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 /// How often the timeline correction counters are logged.
 const STATS_INTERVAL: Duration = Duration::from_secs(60);
@@ -174,7 +179,7 @@ impl Drop for AudioCapture {
         self.stop.store(true, Ordering::Release);
         match self.thread.take().map(JoinHandle::join) {
             None | Some(Ok(Ok(()))) => {}
-            Some(Ok(Err(error))) => warn!(?error, "audio thread failed"),
+            Some(Ok(Err(error))) => warn!(error = %ErrorChain(&error), "audio thread failed"),
             Some(Err(_)) => warn!("audio thread panicked"),
         }
     }
@@ -192,12 +197,14 @@ where
     S: AudioSink,
     F: FnOnce(&AudioFormat) -> S,
 {
-    lower_priority();
+    if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
+        warn!(error = %ErrorChain(&error), "could not lower the audio thread priority");
+    }
     let runtime = MediaRuntime::init()?;
     let result = capture(config, make_sink, stop, ready);
     drop(runtime);
     if let Err(error) = &result {
-        warn!(?error, "audio capture stopped");
+        warn!(error = %ErrorChain(error), "audio capture stopped");
     }
     result
 }
@@ -212,7 +219,6 @@ where
     S: AudioSink,
     F: FnOnce(&AudioFormat) -> S,
 {
-    let clock = qpc_clock()?;
     let mut encoder = AacEncoder::new(config)?;
     // SAFETY: COM is initialized on this thread; creates an in-process object
     // with no aggregation.
@@ -227,7 +233,7 @@ where
     drop(ready);
     info!(bitrate_kbps = config.bitrate.kbps(), "audio encoder ready");
 
-    let mut timeline = Timeline::new(now(clock)?);
+    let mut timeline = Timeline::new(blink_sys::qpc_now()?.ticks());
     let mut on_event = |event: Event<'_>| match event {
         Event::Chunk(chunk) => encoder.encode(chunk, &mut sink),
         Event::SegmentEnd => encoder.drain(&mut sink),
@@ -238,7 +244,7 @@ where
     while !stop.load(Ordering::Acquire) {
         endpoint.ensure_open();
         endpoint.wait();
-        let now = now(clock)?;
+        let now = blink_sys::qpc_now()?.ticks();
         endpoint.drain(&mut |packet, info: PacketInfo| {
             if info.discontinuity {
                 debug!("loopback data discontinuity");
@@ -279,7 +285,7 @@ struct Stats {
 impl Stats {
     fn new() -> Self {
         Self {
-            next_log: Some(Instant::now() + STATS_INTERVAL),
+            next_log: Instant::now().checked_add(STATS_INTERVAL),
             ..Self::default()
         }
     }
@@ -321,7 +327,7 @@ impl Stats {
             "audio timeline stats (last 60 s)"
         );
         *self = Self {
-            next_log: Some(now + STATS_INTERVAL),
+            next_log: now.checked_add(STATS_INTERVAL),
             ..Self::default()
         };
     }
@@ -344,7 +350,7 @@ impl Endpoint {
         Self {
             enumerator,
             stream: None,
-            backoff: Backoff::default(),
+            backoff: Backoff::new(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY),
             next_open: now,
             next_device_check: now,
             open_failures: 0,
@@ -365,21 +371,21 @@ impl Endpoint {
                 );
                 self.backoff.reset();
                 self.open_failures = 0;
-                self.next_device_check = Instant::now() + DEVICE_CHECK_INTERVAL;
+                self.next_device_check = after(DEVICE_CHECK_INTERVAL);
                 self.stream = Some(stream);
             }
             Err(error) => {
                 if self.open_failures == 0 {
-                    warn!(?error, "cannot open the default render endpoint; retrying");
+                    warn!(error = %ErrorChain(&error), "cannot open the default render endpoint; retrying");
                 } else {
                     debug!(
-                        ?error,
+                        error = %ErrorChain(&error),
                         attempt = self.open_failures + 1,
                         "endpoint still unavailable"
                     );
                 }
                 self.open_failures = self.open_failures.saturating_add(1);
-                self.next_open = Instant::now() + self.backoff.next_delay();
+                self.next_open = after(self.backoff.next_delay());
             }
         }
     }
@@ -405,11 +411,11 @@ impl Endpoint {
         let lost = match stream.drain(on_packet) {
             Err(Fault::Fatal(error)) => return Err(error),
             Err(Fault::Device(error)) => {
-                warn!(?error, "loopback stream lost; reopening");
+                warn!(error = %ErrorChain(&error), "loopback stream lost; reopening");
                 true
             }
             Ok(()) if Instant::now() >= self.next_device_check => {
-                self.next_device_check = Instant::now() + DEVICE_CHECK_INTERVAL;
+                self.next_device_check = after(DEVICE_CHECK_INTERVAL);
                 match stream.is_default(&self.enumerator) {
                     Ok(true) => false,
                     Ok(false) => {
@@ -417,7 +423,7 @@ impl Endpoint {
                         true
                     }
                     Err(error) => {
-                        info!(?error, "default render endpoint unavailable");
+                        info!(error = %ErrorChain(&error), "default render endpoint unavailable");
                         true
                     }
                 }
@@ -432,25 +438,8 @@ impl Endpoint {
     }
 }
 
-fn lower_priority() {
-    // SAFETY: returns a pseudo-handle for the calling thread; no arguments.
-    let thread = unsafe { GetCurrentThread() };
-    // SAFETY: the pseudo-handle is always valid for the calling thread.
-    if let Err(error) = unsafe { SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL) } {
-        warn!(?error, "could not lower the audio thread priority");
-    }
-}
-
-fn qpc_clock() -> Result<QpcClock, AudioError> {
-    let mut frequency = 0_i64;
-    // SAFETY: the out-pointer refers to a live local.
-    unsafe { QueryPerformanceFrequency(&raw mut frequency) }.context("read the QPC frequency")?;
-    QpcClock::new(frequency).ok_or(AudioError::InvalidQpcFrequency(frequency))
-}
-
-fn now(clock: QpcClock) -> Result<i64, AudioError> {
-    let mut counter = 0_i64;
-    // SAFETY: the out-pointer refers to a live local.
-    unsafe { QueryPerformanceCounter(&raw mut counter) }.context("read the QPC counter")?;
-    Ok(clock.to_ticks(counter))
+/// `delay` from now, or now if that is past the end of `Instant`'s range.
+fn after(delay: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(delay).unwrap_or(now)
 }

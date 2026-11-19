@@ -8,17 +8,18 @@
 //! never holds the lock.
 
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Context as _, bail};
-use blink_capture::{BackgroundMode, ThreadPriority};
 use blink_ring::ClipBuf;
 use blink_ring::media::Timestamp;
+use blink_sys::{BackgroundMode, ErrorChain, ThreadPriority};
 use time::OffsetDateTime;
 
 use super::EngineEvent;
@@ -54,7 +55,7 @@ pub(super) struct SaveRequest {
 /// The local time now, to the second, or UTC if the local offset is unknown.
 pub(super) fn local_time() -> LocalTime {
     let now = OffsetDateTime::now_local().unwrap_or_else(|error| {
-        tracing::warn!(%error, "local time offset unavailable; naming clips in UTC");
+        tracing::warn!(error = %ErrorChain(&error), "local time offset unavailable; naming clips in UTC");
         OffsetDateTime::now_utc()
     });
     LocalTime {
@@ -102,15 +103,15 @@ impl Saver {
             settle,
             || {
                 if let Err(error) =
-                    blink_capture::set_current_thread_priority(ThreadPriority::BelowNormal)
+                    blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal)
                 {
-                    tracing::warn!(%error, "could not lower the save thread priority");
+                    tracing::warn!(error = %ErrorChain(&error), "could not lower the save thread priority");
                 }
             },
             move || {
                 remove_temp_files(&output_dir);
                 BackgroundMode::enter()
-                    .inspect_err(|error| tracing::warn!(%error, "writing at normal I/O priority"))
+                    .inspect_err(|error| tracing::warn!(error = %ErrorChain(error), "writing at normal I/O priority"))
                     .ok()
             },
             move |job: Job<Written>, clip: Result<&ClipBuf, CutError>| writer.finish(&job, clip),
@@ -190,7 +191,7 @@ impl Writer {
                 SaveResult::Saved(Seconds(clip.duration()))
             }
             Err(error) => {
-                let error = format!("{error:#}");
+                let error = ErrorChain(error.as_ref()).to_string();
                 tracing::error!(error, "failed to save a clip");
                 SaveResult::Failed(error)
             }
@@ -203,19 +204,16 @@ impl Writer {
         fs::create_dir_all(dir)
             .with_context(|| format!("failed to create the clip folder {}", dir.display()))?;
         self.clean(dir);
-        let (name, path) = unused_path(dir, request.time)?;
+        let (attempt, name) = unused_name(dir, request.time)?;
         let temp = dir.join(temp_name(&name));
         if let Err(error) = write(&temp, clip) {
             // Best effort: the write error matters more than a stray temp file.
             let _ = fs::remove_file(&temp);
             return Err(error);
         }
-        if let Err(error) = fs::rename(&temp, &path) {
+        rename_to_unused(&temp, dir, request.time, attempt).inspect_err(|_| {
             let _ = fs::remove_file(&temp);
-            return Err(error)
-                .with_context(|| format!("failed to rename the clip to {}", path.display()));
-        }
-        Ok(path)
+        })
     }
 
     /// Deletes stale temp files in `dir` the first time it is written to.
@@ -238,7 +236,7 @@ fn remove_temp_files(dir: &Path) {
             match fs::remove_file(&path) {
                 Ok(()) => tracing::info!(path = %path.display(), "deleted an unfinished clip"),
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "cannot delete a temp file");
+                    tracing::warn!(error = %ErrorChain(&error), path = %path.display(), "cannot delete a temp file");
                 }
             }
         }
@@ -270,31 +268,52 @@ fn saved(request: &Written, path: &Path, clip: &ClipBuf) {
 /// Waits until [`SETTLE`] after `now` on the QPC clock.
 fn settle(now: Timestamp) {
     let target = now.saturating_add(SETTLE);
-    let Ok(current) = blink_capture::qpc_now() else {
-        thread::sleep(Duration::from_millis(200));
-        return;
-    };
-    let remaining = target.saturating_sub(Timestamp(current)).ticks();
-    if let Ok(ticks) = u64::try_from(remaining) {
-        // 100 ns ticks.
-        thread::sleep(Duration::from_nanos(ticks.saturating_mul(100)));
-    }
+    let remaining = blink_sys::qpc_now().map_or(SETTLE, |current| target.saturating_sub(current));
+    thread::sleep(remaining.to_duration());
 }
 
 fn write(temp: &Path, clip: &ClipBuf) -> anyhow::Result<()> {
     let file =
         File::create(temp).with_context(|| format!("failed to create {}", temp.display()))?;
-    blink_mux::write_mp4(&file, clip).context("failed to write the MP4")?;
+    blink_mux::write_mp4(&file, clip)
+        .with_context(|| format!("failed to mux {}", temp.display()))?;
     file.sync_all()
         .with_context(|| format!("failed to flush {}", temp.display()))
 }
 
-fn unused_path(dir: &Path, time: LocalTime) -> anyhow::Result<(String, PathBuf)> {
+/// The first clip name for `time` that is free in `dir`, and its attempt
+/// number.
+fn unused_name(dir: &Path, time: LocalTime) -> anyhow::Result<(u32, String)> {
     for attempt in 0..NAME_ATTEMPTS {
         let name = file_name(time, attempt);
-        let path = dir.join(&name);
-        if !path.try_exists().unwrap_or(true) {
-            return Ok((name, path));
+        if !dir.join(&name).try_exists().unwrap_or(true) {
+            return Ok((attempt, name));
+        }
+    }
+    bail!(
+        "{NAME_ATTEMPTS} clips already exist for this second in {}",
+        dir.display()
+    )
+}
+
+/// Moves `temp` to the first free clip name for `time` from attempt `first`
+/// on. The rename never replaces a file, so a clip that took the name since
+/// [`unused_name`] looked moves this one on to the next name.
+fn rename_to_unused(
+    temp: &Path,
+    dir: &Path,
+    time: LocalTime,
+    first: u32,
+) -> anyhow::Result<PathBuf> {
+    for attempt in first..NAME_ATTEMPTS {
+        let path = dir.join(file_name(time, attempt));
+        match blink_sys::rename_no_replace(temp, &path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to rename the clip to {}", path.display()));
+            }
         }
     }
     bail!(

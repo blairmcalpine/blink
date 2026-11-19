@@ -11,50 +11,39 @@
 //! [`AudioCapture::audio_format`] as soon as [`AudioCapture::start`] returns.
 //!
 //! Windows only. The Windows API is gated behind `#[cfg(windows)]`; on other
-//! hosts [`AudioCapture::start`] returns [`AudioError::Unsupported`], and the
-//! portable clock, PCM, and `AudioSpecificConfig` helpers are compiled only for
-//! their tests. Every `unsafe` block needs a `// SAFETY:` comment and may
-//! contain only one unsafe operation.
+//! hosts [`AudioCapture::start`] returns `AudioError::Unsupported`, and the
+//! portable timeline, PCM, and `AudioSpecificConfig` helpers are compiled only
+//! for their tests. The QPC clock and thread priority come from `blink-sys`.
+//! Every `unsafe` block needs a `// SAFETY:` comment and may contain only one
+//! unsafe operation.
 
 use blink_ring::media::Timestamp;
 
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod asc;
-#[cfg(any(windows, test))]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
-)]
-mod backoff;
 mod config;
 mod error;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod pcm;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod pts_queue;
-#[cfg(any(windows, test))]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
-)]
-mod qpc;
 mod sink;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "`pub` here would trip the denied `unreachable_pub`"
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
 mod timeline;
 
@@ -78,10 +67,10 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
 
 /// PCM frames (one sample per channel) in one AAC-LC access unit.
-pub const FRAMES_PER_PACKET: u32 = 1024;
+pub const FRAMES_PER_PACKET: u32 = blink_ring::media::AAC_FRAME_SAMPLES;
 
 /// Nominal duration of one AAC packet, in whole 100 ns ticks (21.3333 ms).
 ///
 /// 1024 frames at 48 kHz, truncated. Packet timestamps are computed from the
 /// exact sample count, so the truncation never accumulates.
-pub const PACKET_DURATION: Timestamp = Timestamp(213_333);
+pub const PACKET_DURATION: Timestamp = Timestamp::from_ticks(213_333);

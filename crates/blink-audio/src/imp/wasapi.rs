@@ -22,6 +22,7 @@ use std::ptr;
 use std::thread;
 use std::time::Duration;
 
+use blink_sys::ErrorChain;
 use tracing::{debug, warn};
 use windows::Win32::Foundation::{HANDLE, WAIT_FAILED};
 use windows::Win32::Media::Audio::{
@@ -221,7 +222,7 @@ impl Drop for LoopbackStream {
         // SAFETY: plain COM call on the started client; an error (for example
         // an invalidated device) leaves nothing to clean up.
         if let Err(error) = unsafe { self.client.Stop() } {
-            debug!(?error, "IAudioClient::Stop failed");
+            debug!(error = %ErrorChain(&error), "IAudioClient::Stop failed");
         }
     }
 }
@@ -247,7 +248,7 @@ fn initialize(
             match try_initialize(device, (&raw const wave).cast(), convert, event_driven) {
                 Ok((client, event)) => return Ok((client, format, event)),
                 Err(error) => {
-                    debug!(?format, event_driven, ?error, "loopback format refused");
+                    debug!(?format, event_driven, error = %ErrorChain(&error), "loopback format refused");
                 }
             }
         }
@@ -274,14 +275,9 @@ fn initialize(
         "audio engine refused converted 48 kHz stereo capture; trying the endpoint mix format"
     );
     let format = classify(&wave, sub_format)?;
-    let mut last = None;
-    for event_driven in [true, false] {
-        match try_initialize(device, mix.as_ptr(), 0, event_driven) {
-            Ok((client, event)) => return Ok((client, format, event)),
-            Err(error) => last = Some(error),
-        }
-    }
-    Err(last.unwrap_or(AudioError::Unsupported))
+    try_initialize(device, mix.as_ptr(), 0, true)
+        .or_else(|_| try_initialize(device, mix.as_ptr(), 0, false))
+        .map(|(client, event)| (client, format, event))
 }
 
 fn activate(device: &IMMDevice) -> Result<IAudioClient, AudioError> {
@@ -361,7 +357,10 @@ fn requested_format(format: SampleFormat) -> WAVEFORMATEXTENSIBLE {
 fn read_mix(mix: &CoTaskMem<WAVEFORMATEX>) -> Result<(WAVEFORMATEX, Option<GUID>), AudioError> {
     let ptr = mix.as_ptr();
     if ptr.is_null() {
-        return Err(AudioError::Unsupported);
+        return Err(AudioError::NullOutput {
+            call: "IAudioClient::GetMixFormat",
+            what: "mix format",
+        });
     }
     // SAFETY: `GetMixFormat` succeeded, so `ptr` points to a valid
     // `WAVEFORMATEX` that `mix` keeps allocated. The struct is packed, hence

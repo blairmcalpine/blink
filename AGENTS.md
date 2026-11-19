@@ -18,6 +18,7 @@ changing capture, encode, ring, or mux code.
 | `crates/blink-capture` | DXGI Desktop Duplication (Windows FFI) | allowed, documented |
 | `crates/blink-audio` | WASAPI loopback + AAC MFT (Windows FFI) | allowed, documented |
 | `crates/blink-encode` | NVENC (Windows FFI) | allowed, documented |
+| `crates/blink-sys` | QPC clock, thread priority, single instance, message pump (Windows FFI); portable `Backoff`, `ErrorChain`, file renames | allowed, documented |
 
 ## Commands
 
@@ -36,14 +37,19 @@ table, or `clippy.toml` to make code pass.
   Libraries return `thiserror` errors; `anyhow` is only for `blink-app`.
 - Every `unsafe` block has a `// SAFETY:` comment explaining why it is sound,
   and contains exactly one unsafe operation. `unsafe fn` bodies still need
-  explicit `unsafe` blocks. `unsafe` is only allowed in the three FFI crates.
+  explicit `unsafe` blocks. `unsafe` is only allowed in the four FFI crates
+  (`blink-capture`, `blink-audio`, `blink-encode`, `blink-sys`).
 - Suppress a lint only with `#[expect(lint, reason = "...")]`, never `#[allow]`.
 - All output goes through `tracing`. No `println!`, `eprintln!`, or `dbg!`.
 - No `as` casts; use `From`/`TryFrom`. No panicking indexing in `blink-ring` or
   `blink-mux`; use `get` and iterators.
 - Windows code stays behind `#[cfg(windows)]`, with dependencies under
   `[target.'cfg(windows)'.dependencies]`, so the workspace builds on macOS and
-  Linux.
+  Linux. Off Windows an FFI crate exports only its portable items (config,
+  errors, pure logic). The entry points of `blink-capture` (`create_device`)
+  and `blink-audio` (`AudioCapture`) also have stubs that return an
+  `Unsupported` error; `blink-encode` and `blink-sys` have none. Do not add
+  new stubs without a portable caller.
 - Every public item has a doc comment.
 - The engine process links eframe/egui (one binary) but must never initialize
   or run it. UI runs only in the short-lived `blink.exe --settings` child

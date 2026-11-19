@@ -27,8 +27,11 @@ pub enum MuxError {
     #[error("clip has audio packets but no audio format")]
     MissingAudioFormat,
     /// The video format's SPS cannot be used to build an `avcC` box.
-    #[error("invalid H.264 SPS: {0}")]
-    InvalidSps(&'static str),
+    #[error("invalid H.264 SPS: {reason}")]
+    InvalidSps {
+        /// What is wrong with it.
+        reason: &'static str,
+    },
     /// The video format's PPS is empty or not a PPS NAL unit.
     #[error("invalid H.264 PPS")]
     InvalidPps,

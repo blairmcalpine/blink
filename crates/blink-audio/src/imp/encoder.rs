@@ -14,6 +14,7 @@
 use std::mem::ManuallyDrop;
 
 use blink_ring::media::{AudioFormat, PacketMeta, StreamKind, Timestamp};
+use blink_sys::ErrorChain;
 use tracing::{debug, warn};
 use windows::Win32::Media::MediaFoundation::{
     AACMFTEncoder, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING,
@@ -35,15 +36,12 @@ use super::{Context, has_flag};
 use crate::asc::{self, AscInfo};
 use crate::pcm;
 use crate::pts_queue::PtsQueue;
-use crate::timeline::{CHUNK_SAMPLES, Chunk, frames_to_ticks};
+use crate::timeline::{CHUNK_BYTES, Chunk, frames_to_ticks};
 use crate::{AudioConfig, AudioError, AudioSink, CHANNELS, PACKET_DURATION, SAMPLE_RATE};
 
 /// Input and output stream ID. The AAC encoder has fixed streams numbered
 /// from zero (`GetStreamIDs` returns `E_NOTIMPL`).
 const STREAM: u32 = 0;
-
-/// Bytes in one input chunk: 1024 frames of two 16-bit samples.
-const INPUT_BYTES: u32 = 4096;
 
 /// Input samples used round robin. The MFT may keep a reference to an input
 /// sample after `ProcessInput` returns (unless it reports
@@ -119,7 +117,7 @@ impl AacEncoder {
             "AAC encoder stream info"
         );
 
-        let input = || media_slot(INPUT_BYTES, input_info.cbAlignment);
+        let input = || media_slot(CHUNK_BYTES, input_info.cbAlignment);
         let inputs = [
             input()?,
             input()?,
@@ -141,7 +139,7 @@ impl AacEncoder {
             transform,
             inputs,
             output,
-            pts: PtsQueue::with_delay(Timestamp(frames_to_ticks(ENCODER_DELAY_FRAMES))),
+            pts: PtsQueue::with_delay(Timestamp::from_ticks(frames_to_ticks(ENCODER_DELAY_FRAMES))),
             format,
             first_output_logged: false,
             overflow_warned: false,
@@ -279,7 +277,7 @@ impl AacEncoder {
 impl Drop for AacEncoder {
     fn drop(&mut self) {
         if let Err(error) = self.message(MFT_MESSAGE_NOTIFY_END_STREAMING, "end streaming") {
-            debug!(?error, "AAC encoder did not accept end of streaming");
+            debug!(error = %ErrorChain(&error), "AAC encoder did not accept end of streaming");
         }
     }
 }
@@ -290,11 +288,10 @@ fn fill_input(slot: &MediaSlot, chunk: Chunk<'_>) -> Result<(), AudioError> {
         let mut locked = Locked::new(&slot.buffer)?;
         pcm::write_le(chunk.pcm, locked.whole())
     };
-    let expected = CHUNK_SAMPLES * 2;
-    if written != expected {
-        return Err(AudioError::InvalidEncoderBuffer(written));
-    }
-    let length = u32::try_from(written).map_err(|_| AudioError::InvalidEncoderBuffer(written))?;
+    let length = u32::try_from(written)
+        .ok()
+        .filter(|&length| length == CHUNK_BYTES)
+        .ok_or(AudioError::InvalidEncoderBuffer(written))?;
     // SAFETY: plain COM call; `length` is within the buffer's maximum length
     // (it was just written).
     unsafe { slot.buffer.SetCurrentLength(length) }.context("size the PCM input buffer")?;
@@ -360,7 +357,7 @@ impl Drop for Locked<'_> {
     fn drop(&mut self) {
         // SAFETY: balances the successful `Lock` in `new`.
         if let Err(error) = unsafe { self.buffer.Unlock() } {
-            debug!(?error, "IMFMediaBuffer::Unlock failed");
+            debug!(error = %ErrorChain(&error), "IMFMediaBuffer::Unlock failed");
         }
     }
 }
@@ -451,13 +448,13 @@ fn set_types(
         return Ok(());
     };
     debug!(
-        ?error,
+        error = %ErrorChain(&error),
         "AAC encoder refused output-then-input; trying input first"
     );
     // A half-applied output type would constrain the input type; clear it.
     // SAFETY: plain COM call; a null type clears the stream's output type.
     if let Err(error) = unsafe { transform.SetOutputType(STREAM, None::<&IMFMediaType>, 0) } {
-        debug!(?error, "could not clear the AAC encoder output type");
+        debug!(error = %ErrorChain(&error), "could not clear the AAC encoder output type");
     }
     // SAFETY: plain COM call with a live media type.
     unsafe { transform.SetInputType(STREAM, input, 0) }
@@ -488,7 +485,7 @@ fn audio_format(transform: &IMFTransform) -> Result<AudioFormat, AudioError> {
             .and_then(asc::from_user_data),
         Err(error) => {
             debug!(
-                ?error,
+                error = %ErrorChain(&error),
                 "AAC encoder output type has no usable MF_MT_USER_DATA"
             );
             None
@@ -543,7 +540,7 @@ mod tests {
         let mut sink = move |meta: PacketMeta, payload: &[u8]| {
             tx.send((meta, payload.len())).unwrap();
         };
-        let mut pcm = [0_i16; CHUNK_SAMPLES];
+        let mut pcm = [0_i16; crate::timeline::CHUNK_SAMPLES];
         let mut frame = 0_u32;
         for chunk_index in 0..50_u64 {
             for pair in pcm.as_chunks_mut::<2>().0 {
@@ -555,7 +552,7 @@ mod tests {
             }
             let chunk = Chunk {
                 pcm: &pcm,
-                pts: Timestamp(frames_to_ticks(chunk_index * 1024)),
+                pts: Timestamp::from_ticks(frames_to_ticks(chunk_index * 1024)),
             };
             encoder.encode(chunk, &mut sink).unwrap();
         }

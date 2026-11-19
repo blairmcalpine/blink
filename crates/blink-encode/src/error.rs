@@ -1,6 +1,6 @@
 //! Encoder errors.
 
-use crate::{ConfigError, NvencStatus, ParameterSetError};
+use crate::{EncoderConfigError, NvencStatus, ParameterSetError};
 
 /// Errors from loading NVENC, configuring a session, and encoding.
 #[derive(Debug, thiserror::Error)]
@@ -50,9 +50,17 @@ pub enum EncodeError {
         /// The output that was null.
         what: &'static str,
     },
+    /// The frame's timestamp was before the QPC epoch; NVENC takes unsigned
+    /// timestamps.
+    #[error("frame timestamp {0} is negative")]
+    NegativeTimestamp(i64),
+    /// The encoder's own state broke an invariant it relies on. A bug in
+    /// blink, not a driver failure.
+    #[error("internal encoder error: {0}")]
+    Invariant(&'static str),
     /// The configuration or a reconfigure size was invalid.
     #[error(transparent)]
-    Config(#[from] ConfigError),
+    Config(#[from] EncoderConfigError),
     /// The texture's size differs from the encoder's current size; call
     /// [`Encoder::reconfigure`](crate::Encoder::reconfigure) first.
     #[error(

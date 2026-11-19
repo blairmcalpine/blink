@@ -1,7 +1,7 @@
 //! Converts a clip into tracks of timed samples grouped into interleaved chunks.
 
 use blink_ring::ClipBuf;
-use blink_ring::media::{AudioFormat, PacketMeta, Timestamp, VideoFormat};
+use blink_ring::media::{AAC_FRAME_SAMPLES, AudioFormat, PacketMeta, Timestamp, VideoFormat};
 use tracing::warn;
 
 use super::annexb;
@@ -14,9 +14,6 @@ pub(super) const MOVIE_TIMESCALE: u32 = 90_000;
 /// Video media timescale. 90 kHz is exact for 24, 25, 30, 50, 60, 120, 144,
 /// and 240 fps, and the conventional H.264 clock.
 pub(super) const VIDEO_TIMESCALE: u32 = 90_000;
-
-/// Samples per AAC-LC frame, the fallback audio frame duration.
-const AAC_FRAME_SAMPLES: u64 = 1024;
 
 /// Target span of one chunk; chunks of both tracks interleave in the `mdat`.
 const CHUNK_TICKS: i64 = Timestamp::TICKS_PER_SECOND / 2;
@@ -316,19 +313,19 @@ fn audio_durations(packets: &[Packet<'_>], timescale: u32) -> Result<Vec<u32>, M
         .first()
         .map(|(meta, _)| ticks_to_units(meta.duration, timescale))
         .filter(|&nominal| nominal > 0)
-        .unwrap_or(AAC_FRAME_SAMPLES);
+        .unwrap_or_else(|| u64::from(AAC_FRAME_SAMPLES));
     let mut durations = Vec::with_capacity(packets.len());
     let mut timeline = 0_u64;
     let mut adjusted = 0_usize;
     for (_, (next, _)) in packets.iter().zip(packets.iter().skip(1)) {
         let actual = ticks_to_units(next.pts.saturating_sub(first), timescale);
-        let duration = if actual.abs_diff(timeline + nominal) > nominal / 2 {
+        let duration = if actual.abs_diff(timeline.saturating_add(nominal)) > nominal / 2 {
             adjusted += 1;
             actual.saturating_sub(timeline).max(1)
         } else {
             nominal
         };
-        timeline += duration;
+        timeline = timeline.saturating_add(duration);
         durations.push(duration);
     }
     if !packets.is_empty() {
@@ -425,8 +422,8 @@ mod tests {
     fn packet(kind: StreamKind, pts: i64, duration: i64) -> Packet<'static> {
         let meta = PacketMeta {
             kind,
-            pts: Timestamp(pts),
-            duration: Timestamp(duration),
+            pts: Timestamp::from_ticks(pts),
+            duration: Timestamp::from_ticks(duration),
             keyframe: true,
         };
         (meta, PAYLOAD)
@@ -440,9 +437,18 @@ mod tests {
 
     #[test]
     fn converts_ticks_without_drift() {
-        assert_eq!(ticks_to_units(Timestamp(333_333), VIDEO_TIMESCALE), 3000);
-        assert_eq!(ticks_to_units(Timestamp(-5), VIDEO_TIMESCALE), 0);
-        assert_eq!(ticks_to_units(Timestamp(i64::MAX), u32::MAX), u64::MAX);
+        assert_eq!(
+            ticks_to_units(Timestamp::from_ticks(333_333), VIDEO_TIMESCALE),
+            3000
+        );
+        assert_eq!(
+            ticks_to_units(Timestamp::from_ticks(-5), VIDEO_TIMESCALE),
+            0
+        );
+        assert_eq!(
+            ticks_to_units(Timestamp::from_ticks(i64::MAX), u32::MAX),
+            u64::MAX
+        );
         assert_eq!(rescale(48_000, 48_000, MOVIE_TIMESCALE), 90_000);
         assert_eq!(rescale(5, 0, 10), 50);
     }
@@ -451,7 +457,7 @@ mod tests {
     fn video_durations_follow_timestamps_and_clip_end() {
         // 30 fps with QPC-rounded timestamps, then a 100 ms stall.
         let packets = videos(&[0, 333_333, 666_667, 1_000_000, 2_000_000]);
-        let end = Timestamp(2_000_000);
+        let end = Timestamp::from_ticks(2_000_000);
         let durations = video_durations(&packets, VIDEO_TIMESCALE, end, 3000).expect("fits");
         assert_eq!(
             durations,
@@ -459,11 +465,11 @@ mod tests {
             "end not after last: own duration"
         );
         // A static screen after the last frame: it lasts until the save time.
-        let end = Timestamp(32_000_000);
+        let end = Timestamp::from_ticks(32_000_000);
         let durations = video_durations(&packets, VIDEO_TIMESCALE, end, 3000).expect("fits");
         assert_eq!(durations.last(), Some(&(3 * 90_000)));
         let single = videos(&[5]);
-        let durations = video_durations(&single, VIDEO_TIMESCALE, Timestamp(0), 1500);
+        let durations = video_durations(&single, VIDEO_TIMESCALE, Timestamp::from_ticks(0), 1500);
         assert_eq!(durations.expect("fits"), [3000]);
     }
 
@@ -473,15 +479,21 @@ mod tests {
             packet(StreamKind::Video, 10, 0),
             packet(StreamKind::Video, 5, 0),
         ];
-        let durations = video_durations(&backwards, 90_000, Timestamp(0), 7).expect("fits");
+        let durations =
+            video_durations(&backwards, 90_000, Timestamp::from_ticks(0), 7).expect("fits");
         assert_eq!(durations, [1, 7]);
         assert_eq!(
-            video_durations(&[], 90_000, Timestamp(0), 0).expect("fits"),
+            video_durations(&[], 90_000, Timestamp::from_ticks(0), 0).expect("fits"),
             Vec::<u32>::new()
         );
         let huge = vec![packet(StreamKind::Video, 0, 0)];
         assert!(matches!(
-            video_durations(&huge, VIDEO_TIMESCALE, Timestamp(i64::MAX), 3000),
+            video_durations(
+                &huge,
+                VIDEO_TIMESCALE,
+                Timestamp::from_ticks(i64::MAX),
+                3000
+            ),
             Err(MuxError::ValueOutOfRange { .. })
         ));
     }

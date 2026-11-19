@@ -11,13 +11,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use blink_capture::{
-    CaptureDevice, CaptureError, CaptureEvent, CapturedFrame, DesktopDuplicator, ThreadPriority,
-};
+use blink_capture::{CaptureDevice, CaptureError, CaptureEvent, CapturedFrame, DesktopDuplicator};
 use blink_config::Config;
 use blink_encode::{EncodeError, Encoder};
 use blink_ring::PushOutcome;
 use blink_ring::media::{Timestamp, VideoFormat};
+use blink_sys::{Backoff, ErrorChain, SysError, ThreadPriority};
 
 use super::EngineEvent;
 use super::signal::StopSignal;
@@ -29,6 +28,11 @@ use crate::status::CaptureState;
 /// Longest wait in `next_frame`. Bounds how late a stop request or a
 /// static-screen IDR refresh is noticed.
 const POLL: Duration = Duration::from_millis(100);
+
+const _: () = assert!(
+    blink_capture::TEXTURE_POOL_SIZE <= blink_encode::MAX_REGISTERED_TEXTURES,
+    "every pooled capture texture must stay registered with NVENC"
+);
 
 /// First and longest delay before rebuilding the device after a failure.
 const FIRST_RETRY: Duration = Duration::from_millis(250);
@@ -65,16 +69,21 @@ impl From<CaptureError> for Failure {
     }
 }
 
+impl From<SysError> for Failure {
+    fn from(error: SysError) -> Self {
+        Self::Retry(error.into())
+    }
+}
+
 impl From<EncodeError> for Failure {
     fn from(error: EncodeError) -> Self {
         match error {
             EncodeError::NoNvidiaDriver(_)
             | EncodeError::DriverTooOld { .. }
             | EncodeError::MissingExport(_)
-            | EncodeError::MissingFunction(_) => Self::Fatal(format!(
-                "NVENC is unavailable: {:#}",
-                anyhow::Error::from(error)
-            )),
+            | EncodeError::MissingFunction(_) => {
+                Self::Fatal(format!("NVENC is unavailable: {}", ErrorChain(&error)))
+            }
             error => Self::Retry(error.into()),
         }
     }
@@ -99,8 +108,8 @@ impl Run<'_> {
 }
 
 fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<EngineEvent>) {
-    if let Err(error) = blink_capture::set_current_thread_priority(ThreadPriority::BelowNormal) {
-        tracing::warn!(%error, "could not lower the capture thread priority");
+    if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
+        tracing::warn!(error = %ErrorChain(&error), "could not lower the capture thread priority");
     }
     let Some(fps) = NonZeroU32::new(config.fps) else {
         let _ = events.send(EngineEvent::CaptureFatal(format!(
@@ -115,7 +124,7 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
         encoded_any: false,
         paused_since: None,
     };
-    let mut delay = FIRST_RETRY;
+    let mut backoff = Backoff::new(FIRST_RETRY, MAX_RETRY);
     let mut failures = 0_u32;
     while !stop.is_stopped() {
         run.encoded_any = false;
@@ -128,11 +137,12 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
             }
             Err(Failure::Retry(error)) => {
                 if run.encoded_any {
-                    delay = FIRST_RETRY;
+                    backoff.reset();
                     failures = 0;
                 }
+                let delay = backoff.next_delay();
                 failures = failures.saturating_add(1);
-                let error = format!("{error:#}");
+                let error = ErrorChain(error.as_ref()).to_string();
                 tracing::warn!(
                     error,
                     failures,
@@ -143,7 +153,6 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
                 if stop.wait(delay) {
                     return;
                 }
-                delay = delay.saturating_mul(2).min(MAX_RETRY);
             }
         }
     }
@@ -187,8 +196,8 @@ fn session(
                     run.report(CaptureState::Recording);
                 }
             }
-            CaptureEvent::Unchanged { timestamp } => state.refresh_idr(Timestamp(timestamp))?,
-            CaptureEvent::Timeout => state.refresh_idr(Timestamp(blink_capture::qpc_now()?))?,
+            CaptureEvent::Unchanged { timestamp } => state.refresh_idr(timestamp)?,
+            CaptureEvent::Timeout => state.refresh_idr(blink_sys::qpc_now()?)?,
         }
     }
     Ok(())
@@ -240,7 +249,7 @@ impl State<'_> {
                 run.encoded_any = false;
                 let since = match run.paused_since {
                     Some(since) => since,
-                    None => Timestamp(blink_capture::qpc_now()?),
+                    None => blink_sys::qpc_now()?,
                 };
                 run.paused_since = Some(since);
                 run.report(CaptureState::Unsupported {
@@ -282,7 +291,7 @@ impl State<'_> {
         if self.paused {
             return Ok(false);
         }
-        let pts = next_pts(self.last_pts, Timestamp(frame.timestamp()));
+        let pts = next_pts(self.last_pts, frame.timestamp());
         let encoded = self.encode(&frame, pts)?;
         self.last_frame = Some(frame);
         Ok(encoded)
@@ -316,7 +325,9 @@ impl State<'_> {
         match video.push(self.ring, packet.meta, packet.data) {
             Ok(PushOutcome::Stored) => {}
             Ok(PushOutcome::DroppedAwaitingKeyframe) => encoder.request_idr(),
-            Err(error) => tracing::warn!(%error, "video packet rejected by the ring"),
+            Err(error) => {
+                tracing::warn!(error = %ErrorChain(&error), "video packet rejected by the ring");
+            }
         }
         Ok(true)
     }

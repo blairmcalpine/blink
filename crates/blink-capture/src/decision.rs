@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+use blink_ring::media::Timestamp;
+
 use crate::schedule::FrameScheduler;
 
 /// `AcquireNextFrame` treats `u32::MAX` as INFINITE; longer waits are capped
@@ -114,8 +116,10 @@ pub(crate) fn acquire_timeout_ms(remaining: Duration, until_slot: Option<Duratio
 /// Keeps emitted frame timestamps strictly increasing. A copy triggered by a
 /// pointer update carries the pointer time, which can trail the present time
 /// of the frame before it.
-pub(crate) fn monotonic(last: Option<i64>, timestamp: i64) -> i64 {
-    last.map_or(timestamp, |last| timestamp.max(last.saturating_add(1)))
+pub(crate) fn monotonic(last: Option<Timestamp>, timestamp: Timestamp) -> Timestamp {
+    last.map_or(timestamp, |last| {
+        timestamp.max(last.saturating_add(Timestamp::from_ticks(1)))
+    })
 }
 
 #[cfg(test)]
@@ -250,10 +254,11 @@ mod tests {
 
     #[test]
     fn timestamps_never_go_backwards() {
-        assert_eq!(monotonic(None, 5), 5);
-        assert_eq!(monotonic(Some(5), 9), 9);
-        assert_eq!(monotonic(Some(5), 5), 6);
-        assert_eq!(monotonic(Some(5), 2), 6);
-        assert_eq!(monotonic(Some(i64::MAX), 0), i64::MAX);
+        let t = Timestamp::from_ticks;
+        assert_eq!(monotonic(None, t(5)), t(5));
+        assert_eq!(monotonic(Some(t(5)), t(9)), t(9));
+        assert_eq!(monotonic(Some(t(5)), t(5)), t(6));
+        assert_eq!(monotonic(Some(t(5)), t(2)), t(6));
+        assert_eq!(monotonic(Some(t(i64::MAX)), t(0)), t(i64::MAX));
     }
 }

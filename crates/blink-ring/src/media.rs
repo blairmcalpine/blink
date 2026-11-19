@@ -1,4 +1,10 @@
-//! Media types shared by the capture, encode, audio, ring, and mux crates.
+//! Media types shared across the pipeline: the capture, encode, audio, ring,
+//! and mux crates, and `blink-sys`'s clock.
+
+use std::time::Duration;
+
+/// Nanoseconds in one [`Timestamp`] tick.
+const NANOS_PER_TICK: u64 = 100;
 
 /// A point or span on blink's single media clock, in 100 ns ticks.
 ///
@@ -7,7 +13,7 @@
 /// [`Timestamp::TICKS_PER_SECOND`] ticks make a second. The same type is used
 /// for durations.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Timestamp(pub i64);
+pub struct Timestamp(i64);
 
 impl Timestamp {
     /// Ticks in one second.
@@ -15,6 +21,33 @@ impl Timestamp {
 
     /// The zero timestamp.
     pub const ZERO: Self = Self(0);
+
+    /// Creates a timestamp from a raw tick count.
+    #[must_use]
+    pub const fn from_ticks(ticks: i64) -> Self {
+        Self(ticks)
+    }
+
+    /// Creates a span from a `Duration`, truncated to whole ticks and
+    /// saturating at [`i64::MAX`] ticks.
+    #[must_use]
+    pub fn from_duration(duration: Duration) -> Self {
+        let ticks = duration.as_nanos() / u128::from(NANOS_PER_TICK);
+        Self(i64::try_from(ticks).unwrap_or(i64::MAX))
+    }
+
+    /// Converts a span to a `Duration`. Negative spans are zero.
+    #[must_use]
+    pub const fn to_duration(self) -> Duration {
+        if self.0 <= 0 {
+            return Duration::ZERO;
+        }
+        let ticks = self.0.unsigned_abs();
+        let per_second = Self::TICKS_PER_SECOND.unsigned_abs();
+        // The remainder is below 10^7 ticks, so its nanoseconds fit easily.
+        Duration::from_secs(ticks / per_second)
+            .saturating_add(Duration::from_nanos((ticks % per_second) * NANOS_PER_TICK))
+    }
 
     /// Creates a timestamp from a whole number of seconds, saturating on overflow.
     #[must_use]
@@ -73,6 +106,11 @@ pub struct VideoFormat {
     pub sample_aspect: Option<(u32, u32)>,
 }
 
+/// PCM frames (one sample per channel) in one AAC-LC access unit. The audio
+/// encoder packetizes on it and the muxer falls back to it as a sample
+/// duration.
+pub const AAC_FRAME_SAMPLES: u32 = 1024;
+
 /// Format of the AAC audio stream in the current segment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AudioFormat {
@@ -97,6 +135,8 @@ pub struct PacketMeta {
     pub pts: Timestamp,
     /// Nominal duration of the packet.
     pub duration: Timestamp,
-    /// Whether the packet is an IDR access unit. Ignored for audio.
+    /// Whether the packet is an IDR access unit. Every AAC frame decodes on
+    /// its own, so audio packets set it to `true`; the ring and muxer only
+    /// read it for video.
     pub keyframe: bool,
 }

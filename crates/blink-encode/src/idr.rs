@@ -29,7 +29,9 @@ impl IdrScheduler {
     /// IDR instead of pushing the GOP to almost two seconds.
     pub(crate) const fn new(frame_duration: Timestamp) -> Self {
         Self {
-            interval: Timestamp(Timestamp::TICKS_PER_SECOND - frame_duration.0 / 2),
+            interval: Timestamp::from_ticks(
+                Timestamp::TICKS_PER_SECOND - frame_duration.ticks() / 2,
+            ),
             last_idr: None,
             requested: false,
         }
@@ -54,7 +56,7 @@ impl IdrScheduler {
             return true;
         }
         self.last_idr
-            .is_none_or(|last| pts.0.saturating_sub(last.0) >= self.interval.0)
+            .is_none_or(|last| pts.ticks().saturating_sub(last.ticks()) >= self.interval.ticks())
     }
 
     /// Records the picture type the encoder actually produced for `pts`.
@@ -70,7 +72,7 @@ impl IdrScheduler {
 mod tests {
     use super::*;
 
-    const FRAME_60: Timestamp = Timestamp(166_666);
+    const FRAME_60: Timestamp = Timestamp::from_ticks(166_666);
 
     fn ms(millis: i64) -> Timestamp {
         Timestamp::from_millis(millis)
@@ -99,17 +101,19 @@ mod tests {
     #[test]
     fn constant_rate_gets_one_idr_per_second() {
         let mut scheduler = IdrScheduler::new(FRAME_60);
-        let pts: Vec<Timestamp> = (0..181).map(|n| Timestamp(n * FRAME_60.0)).collect();
+        let pts: Vec<Timestamp> = (0..181)
+            .map(|n| Timestamp::from_ticks(n * FRAME_60.ticks()))
+            .collect();
         let idrs = idr_frames(&mut scheduler, &pts);
         // Frames 0, 60, 120, 180 (60 frames of 166 666 ticks is 0.99999 s,
         // within half a frame of one second).
         assert_eq!(
             idrs,
             [
-                Timestamp(0),
-                Timestamp(60 * FRAME_60.0),
-                Timestamp(120 * FRAME_60.0),
-                Timestamp(180 * FRAME_60.0)
+                Timestamp::from_ticks(0),
+                Timestamp::from_ticks(60 * FRAME_60.ticks()),
+                Timestamp::from_ticks(120 * FRAME_60.ticks()),
+                Timestamp::from_ticks(180 * FRAME_60.ticks())
             ]
         );
     }

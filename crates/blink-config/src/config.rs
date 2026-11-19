@@ -254,8 +254,8 @@ impl Config {
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(dir).map_err(write_error)?;
         let (temp, file) = create_temp(dir, file_name).map_err(write_error)?;
-        let result =
-            write_synced(file, text.as_bytes()).and_then(|()| rename_replacing(&temp, path));
+        let result = write_synced(file, text.as_bytes())
+            .and_then(|()| blink_sys::rename_replacing(&temp, path));
         result.map_err(|source| {
             // Best effort: the original error matters more than a stray temp file.
             let _ = fs::remove_file(&temp);
@@ -289,66 +289,18 @@ fn write_synced(mut file: File, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-#[cfg(not(windows))]
-fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
-}
-
-/// Renames with a short retry, because antivirus and the search indexer
-/// briefly open the destination without `FILE_SHARE_DELETE`.
-#[cfg(windows)]
-fn rename_replacing(from: &Path, to: &Path) -> io::Result<()> {
-    use std::time::Duration;
-
-    const RETRIES: u32 = 5;
-    const BACKOFF: Duration = Duration::from_millis(20);
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-
-    let mut attempt = 0;
-    loop {
-        match fs::rename(from, to) {
-            Err(err)
-                if attempt < RETRIES
-                    && (err.kind() == io::ErrorKind::PermissionDenied
-                        || err.raw_os_error() == Some(ERROR_SHARING_VIOLATION)) =>
-            {
-                attempt += 1;
-                std::thread::sleep(BACKOFF * attempt);
-            }
-            result => return result,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A unique scratch directory, removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("blink-config-test-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            Self(dir)
-        }
-
-        fn entries(&self) -> Vec<OsString> {
-            let mut names: Vec<_> = fs::read_dir(&self.0)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect();
-            names.sort();
-            names
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    /// The sorted names in `dir`.
+    fn entries(dir: &Path) -> Vec<OsString> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
     }
 
     fn clips_dir() -> PathBuf {
@@ -589,8 +541,8 @@ stretch_to = "1920x1080"
 
     #[test]
     fn load_missing_file_yields_defaults() {
-        let dir = TempDir::new("missing");
-        let path = dir.0.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         assert_eq!(Config::load_unvalidated(&path).unwrap(), Config::default());
         if default_output_dir().is_some() {
             assert_eq!(Config::load(&path).unwrap(), Config::default());
@@ -599,8 +551,8 @@ stretch_to = "1920x1080"
 
     #[test]
     fn save_then_load_round_trips_and_creates_dirs() {
-        let dir = TempDir::new("round-trip");
-        let path = dir.0.join("nested").join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
         let config = sample();
         config.save_atomic(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), config);
@@ -609,14 +561,17 @@ stretch_to = "1920x1080"
         updated.save_atomic(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), updated);
 
-        let nested = TempDir(path.parent().unwrap().to_owned());
-        assert_eq!(nested.entries(), ["config.toml"], "temp file left behind");
+        assert_eq!(
+            entries(path.parent().unwrap()),
+            ["config.toml"],
+            "temp file left behind"
+        );
     }
 
     #[test]
     fn concurrent_saves_do_not_collide() {
-        let dir = TempDir::new("concurrent");
-        let path = dir.0.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         std::thread::scope(|scope| {
             for fps in 1..=8 {
                 let path = &path;
@@ -624,26 +579,26 @@ stretch_to = "1920x1080"
             }
         });
         assert!((1..=8).contains(&Config::load(&path).unwrap().fps));
-        assert_eq!(dir.entries(), ["config.toml"]);
+        assert_eq!(entries(dir.path()), ["config.toml"]);
     }
 
     #[test]
     fn failed_save_leaves_destination_and_no_temp_file() {
-        let dir = TempDir::new("failed-save");
-        let path = dir.0.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         fs::create_dir_all(path.join("keep")).unwrap();
         assert!(matches!(
             sample().save_atomic(&path),
             Err(ConfigError::Write { .. })
         ));
         assert!(path.join("keep").is_dir());
-        assert_eq!(dir.entries(), ["config.toml"]);
+        assert_eq!(entries(dir.path()), ["config.toml"]);
     }
 
     #[test]
     fn save_rejects_path_without_file_name() {
-        let dir = TempDir::new("no-file-name");
-        let path = dir.0.join("..");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("..");
         assert!(matches!(
             sample().save_atomic(&path),
             Err(ConfigError::NoFileName { .. })
@@ -652,8 +607,8 @@ stretch_to = "1920x1080"
 
     #[test]
     fn save_rejects_invalid_config_without_writing() {
-        let dir = TempDir::new("invalid-save");
-        let path = dir.0.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         let config = Config { fps: 0, ..sample() };
         assert!(matches!(
             config.save_atomic(&path),
@@ -667,9 +622,8 @@ stretch_to = "1920x1080"
 
     #[test]
     fn load_unvalidated_opens_out_of_range_files() {
-        let dir = TempDir::new("unvalidated");
-        fs::create_dir_all(&dir.0).unwrap();
-        let path = dir.0.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         let invalid = Config {
             clip_seconds: 1,
             ..sample()
@@ -685,9 +639,8 @@ stretch_to = "1920x1080"
 
     #[test]
     fn load_reports_parse_errors_including_bad_utf8() {
-        let dir = TempDir::new("parse-errors");
-        fs::create_dir_all(&dir.0).unwrap();
-        let path = dir.0.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
 
         fs::write(&path, "clip_seconds = \"long\"\n").unwrap();
         assert!(matches!(
@@ -704,10 +657,9 @@ stretch_to = "1920x1080"
 
     #[test]
     fn load_reports_read_errors() {
-        let dir = TempDir::new("read-error");
-        fs::create_dir_all(&dir.0).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         assert!(matches!(
-            Config::load(&dir.0),
+            Config::load(dir.path()),
             Err(ConfigError::Read { .. })
         ));
     }

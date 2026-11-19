@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use blink_audio::{AudioCapture, AudioConfig};
 use blink_ring::media::{AudioFormat, PacketMeta};
+use blink_sys::{Backoff, ErrorChain};
 
 use crate::shared::{Producer, SharedRing};
 
@@ -18,7 +19,6 @@ const FIRST_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(60);
 
 /// The audio capture, if enabled, and its restart schedule.
-#[derive(Default)]
 pub(super) struct AudioSupervisor {
     /// The settings to run with; `None` while audio is disabled.
     config: Option<AudioConfig>,
@@ -26,7 +26,19 @@ pub(super) struct AudioSupervisor {
     /// When the running capture started.
     started_at: Option<Instant>,
     retry_at: Option<Instant>,
-    delay: Option<Duration>,
+    backoff: Backoff,
+}
+
+impl Default for AudioSupervisor {
+    fn default() -> Self {
+        Self {
+            config: None,
+            capture: None,
+            started_at: None,
+            retry_at: None,
+            backoff: Backoff::new(FIRST_RETRY, MAX_RETRY),
+        }
+    }
 }
 
 impl AudioSupervisor {
@@ -34,7 +46,7 @@ impl AudioSupervisor {
     pub(super) fn start(&mut self, config: AudioConfig, ring: &Arc<SharedRing>) {
         self.stop();
         self.config = Some(config);
-        self.delay = None;
+        self.backoff.reset();
         self.try_start(ring);
     }
 
@@ -45,7 +57,9 @@ impl AudioSupervisor {
         if let Some(capture) = self.capture.take() {
             match capture.stop() {
                 Ok(()) => tracing::info!("audio capture stopped"),
-                Err(error) => tracing::warn!(%error, "audio capture had failed"),
+                Err(error) => {
+                    tracing::warn!(error = %ErrorChain(&error), "audio capture had failed");
+                }
             }
         }
     }
@@ -59,8 +73,12 @@ impl AudioSupervisor {
         if self.capture.as_ref().is_some_and(AudioCapture::is_finished)
             && let Some(capture) = self.capture.take()
         {
-            let error = capture.stop().err();
-            tracing::warn!(?error, "audio capture ended; restarting");
+            match capture.stop() {
+                Ok(()) => tracing::warn!("audio capture ended; restarting"),
+                Err(error) => {
+                    tracing::warn!(error = %ErrorChain(&error), "audio capture ended; restarting");
+                }
+            }
             // A capture that ran a good while (until a device change, say)
             // restarts promptly instead of continuing the old backoff.
             if self
@@ -68,7 +86,7 @@ impl AudioSupervisor {
                 .take()
                 .is_some_and(|started| started.elapsed() >= MAX_RETRY)
             {
-                self.delay = None;
+                self.backoff.reset();
             }
             self.schedule_retry();
         }
@@ -94,18 +112,14 @@ impl AudioSupervisor {
                 self.retry_at = None;
             }
             Err(error) => {
-                tracing::warn!(%error, "audio capture failed to start");
+                tracing::warn!(error = %ErrorChain(&error), "audio capture failed to start");
                 self.schedule_retry();
             }
         }
     }
 
     fn schedule_retry(&mut self) {
-        let delay = self
-            .delay
-            .map_or(FIRST_RETRY, |delay| delay.saturating_mul(2).min(MAX_RETRY));
-        self.delay = Some(delay);
-        self.retry_at = Instant::now().checked_add(delay);
+        self.retry_at = Instant::now().checked_add(self.backoff.next_delay());
     }
 }
 
@@ -118,7 +132,7 @@ fn sink(
     let mut producer = Producer::new(format.clone());
     move |meta, payload| {
         if let Err(error) = producer.push(&ring, meta, payload) {
-            tracing::warn!(%error, "audio packet rejected by the ring");
+            tracing::warn!(error = %ErrorChain(&error), "audio packet rejected by the ring");
         }
     }
 }

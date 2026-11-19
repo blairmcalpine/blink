@@ -53,7 +53,7 @@ pub struct EncoderConfig {
 /// A rejected [`EncoderConfig`] or reconfigure size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum ConfigError {
+pub enum EncoderConfigError {
     /// A width or height was zero.
     #[error("frame size {width}x{height} has a zero dimension")]
     ZeroSize {
@@ -121,11 +121,11 @@ impl EncoderConfig {
     ///
     /// # Errors
     ///
-    /// The first [`ConfigError`] found.
-    pub fn validate(&self) -> Result<(), ConfigError> {
+    /// The first [`EncoderConfigError`] found.
+    pub fn validate(&self) -> Result<(), EncoderConfigError> {
         check_size(self.width, self.height, self.max_width, self.max_height)?;
         if self.fps == 0 {
-            return Err(ConfigError::ZeroFps);
+            return Err(EncoderConfigError::ZeroFps);
         }
         bitrate_bps(self.bitrate_kbps)?;
         self.sample_aspect()?;
@@ -135,7 +135,7 @@ impl EncoderConfig {
     /// Length of one frame at the nominal frame rate, in 100 ns ticks,
     /// truncated (166 666 ticks at 60 fps).
     pub(crate) fn frame_duration(&self) -> Timestamp {
-        Timestamp(Timestamp::TICKS_PER_SECOND / i64::from(self.fps.max(1)))
+        Timestamp::from_ticks(Timestamp::TICKS_PER_SECOND / i64::from(self.fps.max(1)))
     }
 
     /// The display aspect ratio for `NV_ENC_INITIALIZE_PARAMS::darWidth` and
@@ -145,10 +145,10 @@ impl EncoderConfig {
     /// SPS sample aspect ratio from the display aspect ratio and the coded size
     /// (`SAR = DAR * height / width`). The frame's own shape signals square
     /// pixels (the same choice `FFmpeg`'s `nvenc.c` makes).
-    pub(crate) fn display_aspect(&self) -> Result<(u32, u32), ConfigError> {
+    pub(crate) fn display_aspect(&self) -> Result<(u32, u32), EncoderConfigError> {
         let (width, height) = self.stretch()?.unwrap_or((self.width, self.height));
         // Reducing never grows a value, so the conversions back cannot fail.
-        let zero = ConfigError::ZeroSize { width, height };
+        let zero = EncoderConfigError::ZeroSize { width, height };
         let (width, height) = reduce(u64::from(width), u64::from(height)).ok_or(zero)?;
         Ok((
             u32::try_from(width).map_err(|_| zero)?,
@@ -159,12 +159,12 @@ impl EncoderConfig {
     /// The sample aspect ratio for `VideoFormat::sample_aspect` (and the MP4
     /// `pasp` box): `stretch_w * height : stretch_h * width`, reduced, or
     /// `None` for square pixels.
-    pub(crate) fn sample_aspect(&self) -> Result<Option<(u32, u32)>, ConfigError> {
+    pub(crate) fn sample_aspect(&self) -> Result<Option<(u32, u32)>, EncoderConfigError> {
         let Some((stretch_width, stretch_height)) = self.stretch()? else {
             return Ok(None);
         };
         let (width, height) = (self.width, self.height);
-        let overflow = ConfigError::AspectOverflow {
+        let overflow = EncoderConfigError::AspectOverflow {
             width,
             height,
             stretch_width,
@@ -173,7 +173,7 @@ impl EncoderConfig {
         let horizontal = u64::from(stretch_width) * u64::from(height);
         let vertical = u64::from(stretch_height) * u64::from(width);
         let (horizontal, vertical) =
-            reduce(horizontal, vertical).ok_or(ConfigError::ZeroSize { width, height })?;
+            reduce(horizontal, vertical).ok_or(EncoderConfigError::ZeroSize { width, height })?;
         let sample = (
             u32::try_from(horizontal).map_err(|_| overflow)?,
             u32::try_from(vertical).map_err(|_| overflow)?,
@@ -181,10 +181,10 @@ impl EncoderConfig {
         Ok((sample.0 != sample.1).then_some(sample))
     }
 
-    const fn stretch(&self) -> Result<Option<(u32, u32)>, ConfigError> {
+    const fn stretch(&self) -> Result<Option<(u32, u32)>, EncoderConfigError> {
         match self.stretch_to {
             Some((width, height)) if width == 0 || height == 0 => {
-                Err(ConfigError::ZeroStretch(width, height))
+                Err(EncoderConfigError::ZeroStretch(width, height))
             }
             stretch => Ok(stretch),
         }
@@ -197,12 +197,12 @@ const fn check_size(
     height: u32,
     max_width: u32,
     max_height: u32,
-) -> Result<(), ConfigError> {
+) -> Result<(), EncoderConfigError> {
     if width == 0 || height == 0 {
-        return Err(ConfigError::ZeroSize { width, height });
+        return Err(EncoderConfigError::ZeroSize { width, height });
     }
     if width > max_width || height > max_height {
-        return Err(ConfigError::ExceedsMax {
+        return Err(EncoderConfigError::ExceedsMax {
             width,
             height,
             max_width,
@@ -213,10 +213,10 @@ const fn check_size(
 }
 
 /// The bitrate in bits per second, as NVENC's `averageBitRate` wants it.
-pub(crate) const fn bitrate_bps(kbps: u32) -> Result<u32, ConfigError> {
+pub(crate) const fn bitrate_bps(kbps: u32) -> Result<u32, EncoderConfigError> {
     match kbps.checked_mul(1000) {
         Some(bps) if bps > 0 => Ok(bps),
-        _ => Err(ConfigError::Bitrate(kbps)),
+        _ => Err(EncoderConfigError::Bitrate(kbps)),
     }
 }
 
@@ -281,7 +281,7 @@ mod tests {
         };
         assert_eq!(
             zero.validate(),
-            Err(ConfigError::ZeroSize {
+            Err(EncoderConfigError::ZeroSize {
                 width: 0,
                 height: 1080
             })
@@ -292,30 +292,33 @@ mod tests {
         };
         assert!(matches!(
             too_big.validate(),
-            Err(ConfigError::ExceedsMax { height: 1600, .. })
+            Err(EncoderConfigError::ExceedsMax { height: 1600, .. })
         ));
     }
 
     #[test]
     fn validate_rejects_bad_rates() {
         let no_fps = EncoderConfig { fps: 0, ..valid() };
-        assert_eq!(no_fps.validate(), Err(ConfigError::ZeroFps));
+        assert_eq!(no_fps.validate(), Err(EncoderConfigError::ZeroFps));
         let no_bitrate = EncoderConfig {
             bitrate_kbps: 0,
             ..valid()
         };
-        assert_eq!(no_bitrate.validate(), Err(ConfigError::Bitrate(0)));
+        assert_eq!(no_bitrate.validate(), Err(EncoderConfigError::Bitrate(0)));
         let huge = EncoderConfig {
             bitrate_kbps: 4_294_968,
             ..valid()
         };
-        assert_eq!(huge.validate(), Err(ConfigError::Bitrate(4_294_968)));
+        assert_eq!(huge.validate(), Err(EncoderConfigError::Bitrate(4_294_968)));
     }
 
     #[test]
     fn validate_rejects_a_zero_stretch() {
         let config = sized(1920, 1080, Some((1920, 0)));
-        assert_eq!(config.validate(), Err(ConfigError::ZeroStretch(1920, 0)));
+        assert_eq!(
+            config.validate(),
+            Err(EncoderConfigError::ZeroStretch(1920, 0))
+        );
     }
 
     #[test]
@@ -326,9 +329,9 @@ mod tests {
 
     #[test]
     fn frame_duration_is_one_frame_in_ticks() {
-        assert_eq!(valid().frame_duration(), Timestamp(166_666));
+        assert_eq!(valid().frame_duration(), Timestamp::from_ticks(166_666));
         let thirty = EncoderConfig { fps: 30, ..valid() };
-        assert_eq!(thirty.frame_duration(), Timestamp(333_333));
+        assert_eq!(thirty.frame_duration(), Timestamp::from_ticks(333_333));
     }
 
     #[test]
@@ -373,7 +376,7 @@ mod tests {
         };
         assert!(matches!(
             config.sample_aspect(),
-            Err(ConfigError::AspectOverflow { .. })
+            Err(EncoderConfigError::AspectOverflow { .. })
         ));
     }
 

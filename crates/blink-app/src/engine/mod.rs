@@ -32,9 +32,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use blink_capture::{SingleInstance, ThreadPriority};
 use blink_config::Config;
 use blink_ring::media::Timestamp;
+use blink_sys::{ErrorChain, SingleInstance, ThreadPriority};
 
 use self::audio::AudioSupervisor;
 use self::save::{SaveRequest, Saver, local_time};
@@ -72,8 +72,13 @@ pub(super) enum EngineEvent {
 /// Shows an error in a native message box. Release builds have no console,
 /// so this is how a startup failure reaches the user.
 pub(crate) fn show_error(message: &str) {
+    message_box(rfd::MessageLevel::Error, message);
+}
+
+/// Shows a blocking message box with an OK button.
+fn message_box(level: rfd::MessageLevel, message: &str) {
     let _ = rfd::MessageDialog::new()
-        .set_level(rfd::MessageLevel::Error)
+        .set_level(level)
         .set_title("blink")
         .set_description(message)
         .set_buttons(rfd::MessageButtons::Ok)
@@ -90,35 +95,26 @@ fn warn_in_background(message: String) {
 fn report_in_background(level: rfd::MessageLevel, message: String) {
     let shown = thread::Builder::new()
         .name("blink-dialog".to_owned())
-        .spawn(move || {
-            let _ = rfd::MessageDialog::new()
-                .set_level(level)
-                .set_title("blink")
-                .set_description(message)
-                .set_buttons(rfd::MessageButtons::Ok)
-                .show();
-        });
+        .spawn(move || message_box(level, &message));
     if let Err(error) = shown {
-        tracing::warn!(%error, "cannot show a warning dialog");
+        tracing::warn!(error = %ErrorChain(&error), "cannot show a warning dialog");
     }
 }
 
 /// Runs the recorder until Quit. Startup failures are returned; the caller
 /// logs and shows them.
 pub(crate) fn run() -> anyhow::Result<ExitCode> {
-    if let Err(error) = blink_capture::set_current_thread_priority(ThreadPriority::BelowNormal) {
-        tracing::warn!(%error, "could not lower the tray thread priority");
+    if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
+        tracing::warn!(error = %ErrorChain(&error), "could not lower the tray thread priority");
     }
     let Some(_instance) = SingleInstance::acquire(INSTANCE_MUTEX)
         .context("cannot check whether blink is already running")?
     else {
         tracing::info!("blink is already running; exiting");
-        let _ = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Info)
-            .set_title("blink")
-            .set_description("blink is already running. Find it in the notification area.")
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+        message_box(
+            rfd::MessageLevel::Info,
+            "blink is already running. Find it in the notification area.",
+        );
         return Ok(ExitCode::FAILURE);
     };
     let config_path = blink_config::default_config_path()
@@ -143,7 +139,7 @@ fn load_config(path: &Path) -> Option<Config> {
         Ok(config) => Some(config),
         Err(error) => {
             tracing::error!(
-                error = format!("{:#}", anyhow::Error::from(error)),
+                error = %ErrorChain(&error),
                 "cannot use the config file"
             );
             None
@@ -212,7 +208,7 @@ impl Engine {
     /// The tray thread's loop. Returns the process exit code.
     fn run(&mut self) -> ExitCode {
         loop {
-            if !blink_capture::pump_messages(TICK) {
+            if !blink_sys::pump_messages(TICK) {
                 tracing::info!("window messages ended; quitting");
                 return ExitCode::SUCCESS;
             }
@@ -297,7 +293,7 @@ impl Engine {
         if self.config.audio_enabled {
             match audio_config(&self.config) {
                 Ok(config) => self.audio.start(config, &self.ring),
-                Err(error) => tracing::error!(%error, "audio disabled"),
+                Err(error) => tracing::error!(error = %ErrorChain(&error), "audio disabled"),
             }
         }
         Ok(())
@@ -315,10 +311,10 @@ impl Engine {
     }
 
     fn request_save(&self) {
-        let now = match blink_capture::qpc_now() {
-            Ok(now) => Timestamp(now),
+        let now = match blink_sys::qpc_now() {
+            Ok(now) => now,
             Err(error) => {
-                tracing::error!(%error, "cannot read the clock; clip not saved");
+                tracing::error!(error = %ErrorChain(&error), "cannot read the clock; clip not saved");
                 return;
             }
         };
@@ -338,10 +334,10 @@ impl Engine {
     fn open_clips_folder(&self) {
         let dir = &self.config.output_dir;
         if let Err(error) = std::fs::create_dir_all(dir) {
-            tracing::warn!(%error, dir = %dir.display(), "cannot create the clips folder");
+            tracing::warn!(error = %ErrorChain(&error), dir = %dir.display(), "cannot create the clips folder");
         }
         if let Err(error) = Command::new("explorer.exe").arg(dir).spawn() {
-            tracing::warn!(%error, "cannot open the clips folder");
+            tracing::warn!(error = %ErrorChain(&error), "cannot open the clips folder");
         }
     }
 
@@ -364,7 +360,7 @@ impl Engine {
         let mut child = match child {
             Ok(child) => child,
             Err(error) => {
-                tracing::error!(error = format!("{error:#}"), "settings unavailable");
+                tracing::error!(error = %ErrorChain(error.as_ref()), "settings unavailable");
                 return;
             }
         };
@@ -379,7 +375,9 @@ impl Engine {
                 self.settings_open = true;
                 self.hotkey.unbind();
             }
-            Err(error) => tracing::error!(%error, "cannot watch the settings window"),
+            Err(error) => {
+                tracing::error!(error = %ErrorChain(&error), "cannot watch the settings window");
+            }
         }
     }
 
@@ -390,7 +388,9 @@ impl Engine {
         match status {
             Ok(status) if status.success() => {}
             Ok(status) => tracing::warn!(%status, "settings window exited with an error"),
-            Err(error) => tracing::warn!(%error, "lost track of the settings window"),
+            Err(error) => {
+                tracing::warn!(error = %ErrorChain(&error), "lost track of the settings window");
+            }
         }
         if let Some(config) = load_config(&self.config_path) {
             self.apply(config);
@@ -414,7 +414,7 @@ impl Engine {
             self.stop_pipeline();
             self.ring.replace(RingSize::for_config(&self.config));
             if let Err(error) = self.start_pipeline() {
-                let message = format!("{error:#}");
+                let message = ErrorChain(error.as_ref()).to_string();
                 tracing::error!(error = message, "cannot restart capture");
                 report_in_background(rfd::MessageLevel::Error, message);
             }
@@ -432,7 +432,7 @@ impl Engine {
         match self.hotkey.bind(self.config.hotkey) {
             Ok(()) => self.hotkey_retry_at = None,
             Err(error) => {
-                let error = format!("{error:#}");
+                let error = ErrorChain(error.as_ref()).to_string();
                 if retrying {
                     tracing::debug!(error, "save hotkey still unavailable");
                 } else {
@@ -457,10 +457,10 @@ impl Engine {
 
 fn open_log_folder() {
     let Some(dir) = crate::logging::log_dir() else {
-        tracing::warn!("no log folder: LOCALAPPDATA is not set");
+        tracing::warn!("no log folder: the per-user local data folder is unknown");
         return;
     };
     if let Err(error) = Command::new("explorer.exe").arg(&dir).spawn() {
-        tracing::warn!(%error, dir = %dir.display(), "cannot open the log folder");
+        tracing::warn!(error = %ErrorChain(&error), dir = %dir.display(), "cannot open the log folder");
     }
 }

@@ -33,8 +33,6 @@ mod draft;
 mod keys;
 
 use std::cell::Cell;
-use std::error::Error;
-use std::fmt::Write as _;
 use std::path::Path;
 
 use blink_config::{Config, ConfigError};
@@ -122,37 +120,29 @@ fn configure(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| style.visuals.text_cursor.blink = false);
 }
 
+/// Tells the user why the window will not open. The error itself is logged
+/// by the caller, which gets it back from [`run`].
 fn show_load_error(config_path: &Path, err: &ConfigError) {
-    let message = describe(err);
-    tracing::error!(error = %message, "cannot open the config for editing");
     #[cfg(any(windows, target_os = "macos"))]
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
         .set_title("blink settings")
         .set_description(format!(
-            "blink cannot open its settings file:\n{}\n\n{message}\n\nFix or delete the file, \
+            "blink cannot open its settings file:\n{}\n\n{}\n\nFix or delete the file, \
              then open Settings again.",
-            config_path.display()
+            config_path.display(),
+            blink_sys::ErrorChain(err)
         ))
         .set_buttons(rfd::MessageButtons::Ok)
         .show();
     #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = config_path;
-}
-
-/// Formats an error with its chain of sources.
-fn describe(err: &dyn Error) -> String {
-    let mut message = err.to_string();
-    let mut source = err.source();
-    while let Some(err) = source {
-        let _ = write!(message, ": {err}");
-        source = err.source();
-    }
-    message
+    let _ = (config_path, err);
 }
 
 #[cfg(test)]
 mod tests {
+    use blink_sys::ErrorChain;
+
     use super::*;
 
     #[test]
@@ -169,13 +159,12 @@ mod tests {
     }
 
     #[test]
-    fn describe_includes_the_source_chain() {
-        let path =
-            std::env::temp_dir().join(format!("blink-ui-describe-{}.toml", std::process::id()));
+    fn load_errors_render_with_their_source_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
         std::fs::write(&path, "clip_seconds = \"long\"\n").unwrap();
         let err = Config::load_unvalidated(&path).unwrap_err();
-        std::fs::remove_file(&path).unwrap();
-        let message = describe(&err);
+        let message = ErrorChain(&err).to_string();
         let prefix = format!("failed to parse config {}", path.display());
         assert!(message.starts_with(&prefix), "{message}");
         assert!(message.contains(": "), "{message}");

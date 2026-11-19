@@ -3,14 +3,10 @@
 //! `create_device` makes the hardware D3D11 device that capture and the
 //! encoder share, and `DesktopDuplicator` turns one output into a stream of
 //! `CaptureEvent`s: BGRA textures on that device, decimated to the target
-//! frame rate and stamped with QPC time in 100 ns ticks. Frames never leave
+//! frame rate and stamped with a `blink_ring` `Timestamp` on the shared QPC
+//! timeline. Frames never leave
 //! the GPU. The duplicator recovers from `DXGI_ERROR_ACCESS_LOST` on display
 //! mode changes and reports size changes.
-//!
-//! It also hosts a few safe wrappers that `blink-app` (which forbids
-//! `unsafe`) needs on its own threads: `qpc_now` for the shared clock,
-//! `set_current_thread_priority` and `BackgroundMode`, `SingleInstance`, and
-//! `pump_messages` for the tray thread.
 //!
 //! Windows only. On other hosts the crate is a stub: [`create_device`] exists
 //! but always returns `CaptureError::Unsupported`, so callers report that
@@ -22,18 +18,6 @@
 // any restricted visibility on their items (`pub(crate)` or `pub(super)`, which
 // are the same here) trips `clippy::redundant_pub_crate`, while plain `pub`
 // trips the denied `unreachable_pub`. `expect` documents that conflict.
-#[cfg(any(windows, test))]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
-)]
-mod backoff;
-#[cfg(any(windows, test))]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
-)]
-mod clock;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
@@ -65,8 +49,6 @@ mod duplicator;
     )
 )]
 mod error;
-#[cfg(windows)]
-mod system;
 #[cfg(not(windows))]
 mod unsupported;
 
@@ -75,10 +57,5 @@ pub use device::{AdapterInfo, CaptureDevice, create_device};
 #[cfg(windows)]
 pub use duplicator::{CaptureEvent, CapturedFrame, DesktopDuplicator, TEXTURE_POOL_SIZE};
 pub use error::CaptureError;
-#[cfg(windows)]
-pub use system::{
-    BackgroundMode, SingleInstance, ThreadPriority, pump_messages, qpc_now,
-    set_current_thread_priority,
-};
 #[cfg(not(windows))]
 pub use unsupported::{CaptureDevice, create_device};

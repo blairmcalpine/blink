@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 const APP_DIR: &str = "blink";
 const CONFIG_FILE: &str = "config.toml";
+const LOG_DIR: &str = "logs";
 
 /// Returns the default config file path, or `None` when the per-user config
 /// directory is unknown.
@@ -22,6 +23,21 @@ pub fn default_output_dir() -> Option<PathBuf> {
     videos_root()
         .or_else(home_dir)
         .map(|root| root.join(APP_DIR))
+}
+
+/// Returns the default log folder, or `None` when the per-user local data
+/// directory is unknown.
+///
+/// The folder is `%LOCALAPPDATA%\blink\logs` on Windows, and
+/// `$XDG_STATE_HOME/blink/logs` (falling back to `~/.local/state`) elsewhere.
+#[must_use]
+pub fn default_log_dir() -> Option<PathBuf> {
+    state_root().map(|root| root.join(APP_DIR).join(LOG_DIR))
+}
+
+#[cfg(windows)]
+fn state_root() -> Option<PathBuf> {
+    known_folders::get_known_folder_path(known_folders::KnownFolder::LocalAppData)
 }
 
 #[cfg(windows)]
@@ -48,6 +64,14 @@ fn config_root() -> Option<PathBuf> {
 }
 
 #[cfg(not(windows))]
+fn state_root() -> Option<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| home_dir().map(|home| home.join(".local").join("state")))
+}
+
+#[cfg(not(windows))]
 fn videos_root() -> Option<PathBuf> {
     home_dir().map(|home| home.join("Videos"))
 }
@@ -68,6 +92,14 @@ mod tests {
         if let Some(path) = default_config_path() {
             assert!(path.is_absolute());
             assert!(path.ends_with("blink/config.toml"));
+        }
+    }
+
+    #[test]
+    fn log_dir_when_known_is_absolute_app_folder() {
+        if let Some(dir) = default_log_dir() {
+            assert!(dir.is_absolute());
+            assert!(dir.ends_with("blink/logs"));
         }
     }
 

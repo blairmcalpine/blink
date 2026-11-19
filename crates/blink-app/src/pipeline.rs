@@ -192,7 +192,7 @@ mod tests {
     /// gives up waiting, pushes, and the second clip is cut short.
     #[test]
     fn a_queued_save_is_cut_before_a_slow_write_finishes() {
-        const SENTINEL: Timestamp = Timestamp(i64::MAX);
+        const SENTINEL: Timestamp = Timestamp::from_ticks(i64::MAX);
         let ring = Arc::new(SharedRing::new(RingSize::for_config(&config())));
         let mut source = Source::new();
         source.run_until(&ring, NOW_MS + 400);
@@ -223,8 +223,8 @@ mod tests {
         .unwrap();
         let clip = Timestamp::from_secs(CLIP_SECS.into());
         for (payload, now) in [
-            (1, Timestamp(NOW_MS * MS)),
-            (2, Timestamp((NOW_MS + 100) * MS)),
+            (1, Timestamp::from_ticks(NOW_MS * MS)),
+            (2, Timestamp::from_ticks((NOW_MS + 100) * MS)),
             (3, SENTINEL),
         ] {
             assert!(pipeline.submit(Job {
@@ -266,7 +266,7 @@ mod tests {
         .unwrap();
         for payload in 0..3 {
             assert!(pipeline.submit(Job {
-                now: Timestamp(MS),
+                now: Timestamp::from_ticks(MS),
                 duration: Timestamp::from_secs(5),
                 payload,
             }));
@@ -280,7 +280,7 @@ mod tests {
             [0, 1, 2].map(|payload| (payload, Some(CutError::NothingYet)))
         );
         assert!(!pipeline.submit(Job {
-            now: Timestamp(MS),
+            now: Timestamp::from_ticks(MS),
             duration: Timestamp::from_secs(5),
             payload: 3,
         }));
@@ -309,7 +309,7 @@ mod tests {
         *pipeline.spare.lock() = Some(ClipBuf::with_capacity(MARK, 0));
         for payload in 0..2 {
             assert!(pipeline.submit(Job {
-                now: Timestamp(NOW_MS * MS),
+                now: Timestamp::from_ticks(NOW_MS * MS),
                 duration: Timestamp::from_secs(CLIP_SECS.into()),
                 payload,
             }));

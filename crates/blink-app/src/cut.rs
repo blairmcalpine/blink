@@ -5,8 +5,6 @@
 //! and handed back with a fair unlock, so a capture or audio push waits at
 //! most one chunk (about 100 µs per MB) behind a save.
 
-use std::fmt;
-
 use blink_ring::media::Timestamp;
 use blink_ring::{ClipBuf, ClipError, CopyProgress};
 
@@ -24,37 +22,25 @@ const EXTRA_BYTES: usize = 1 << 20;
 const EXTRA_PACKETS: usize = 256;
 
 /// Why no clip could be cut.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CutError {
     /// No keyframe is stored before the save time.
+    #[error("nothing to save yet: no keyframe has been captured before the save time")]
     NothingYet,
     /// The ring kept evicting packets the copy still needed.
+    #[error("the clip buffer overwrote the clip faster than it could be copied")]
     Evicted,
-    /// The video format changed (display mode or encoder restart) mid-copy.
+    /// A stream's format changed mid-copy: the display mode, an encoder
+    /// restart, or the audio device's format.
+    #[error("the video or audio format changed while saving, which starts a new recording")]
     FormatChanged,
     /// A settings change replaced the ring mid-copy; its packets are gone.
+    #[error("a settings change replaced the clip buffer while saving")]
     RingReplaced,
     /// Any other ring error.
-    Ring(ClipError),
+    #[error("failed to copy the clip")]
+    Ring(#[source] ClipError),
 }
-
-impl fmt::Display for CutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NothingYet => {
-                "nothing to save yet: no keyframe has been captured before the save time"
-            }
-            Self::Evicted => "the clip buffer overwrote the clip faster than it could be copied",
-            Self::FormatChanged => {
-                "the display mode changed while saving, which starts a new recording"
-            }
-            Self::RingReplaced => "a settings change replaced the clip buffer while saving",
-            Self::Ring(error) => return write!(f, "failed to copy the clip: {error}"),
-        })
-    }
-}
-
-impl std::error::Error for CutError {}
 
 /// Copies the clip that ends at `now` and covers about `duration` into
 /// `clip`, retrying when eviction overtakes the copy.
@@ -222,7 +208,7 @@ pub(crate) mod tests {
         let result = cut_with(
             ring,
             &mut clip,
-            Timestamp(NOW_MS * MS),
+            Timestamp::from_ticks(NOW_MS * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || {
@@ -243,7 +229,7 @@ pub(crate) mod tests {
             "clip is {:?} long",
             clip.duration()
         );
-        assert_eq!(clip.end(), Timestamp(NOW_MS * MS));
+        assert_eq!(clip.end(), Timestamp::from_ticks(NOW_MS * MS));
         assert!(clip.video().all(|(meta, _)| meta.pts < clip.end()));
         assert!(clip.audio_len() > 0);
     }
@@ -277,7 +263,7 @@ pub(crate) mod tests {
         let result = cut_with(
             &ring,
             &mut clip,
-            Timestamp(10_000 * MS),
+            Timestamp::from_ticks(10_000 * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || ring.replace(replacement),
@@ -294,7 +280,7 @@ pub(crate) mod tests {
         let result = cut_with(
             &ring,
             &mut clip,
-            Timestamp(10_000 * MS),
+            Timestamp::from_ticks(10_000 * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || source.video.set_format(&ring, video_format(1920)),
@@ -312,7 +298,7 @@ pub(crate) mod tests {
         let result = cut_with(
             &ring,
             &mut clip,
-            Timestamp(20_000 * MS),
+            Timestamp::from_ticks(20_000 * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
             8 << 10,
             &mut || {
@@ -326,7 +312,7 @@ pub(crate) mod tests {
         assert_eq!(result, Ok(()));
         assert!(calls > 2, "the copy started over");
         assert!(clip.duration() > Timestamp::ZERO);
-        assert_eq!(clip.end(), Timestamp(20_000 * MS));
+        assert_eq!(clip.end(), Timestamp::from_ticks(20_000 * MS));
     }
 
     #[test]
@@ -334,7 +320,12 @@ pub(crate) mod tests {
         let ring = SharedRing::new(RingSize::for_config(&config()));
         let mut clip = ClipBuf::new();
         assert_eq!(
-            cut(&ring, &mut clip, Timestamp(MS), Timestamp::from_secs(5)),
+            cut(
+                &ring,
+                &mut clip,
+                Timestamp::from_ticks(MS),
+                Timestamp::from_secs(5)
+            ),
             Err(CutError::NothingYet)
         );
     }

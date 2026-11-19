@@ -4,7 +4,8 @@ use std::num::NonZeroU32;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED};
+use blink_ring::media::Timestamp;
+use blink_sys::{Backoff, ErrorChain, QpcClock, qpc_counter};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
@@ -17,11 +18,8 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice,
     IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
 };
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::Interface;
 
-use crate::backoff::{Backoff, MAX_RETRY_DELAY};
-use crate::clock::QpcClock;
 use crate::decision::{
     Acquired, FrameAction, Staleness, TimeoutAction, acquire_timeout_ms, decide, monotonic,
     on_timeout,
@@ -43,6 +41,14 @@ use crate::schedule::FrameScheduler;
 /// contents.
 pub const TEXTURE_POOL_SIZE: usize = 3;
 
+/// Delay before the first retry after a failed recreation.
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Longest delay between retries. Recovery never gives up, because the
+/// secure desktop (UAC, lock screen) can block duplication for minutes, so the
+/// cap keeps polling cheap rather than ending it.
+const MAX_RETRY_DELAY: Duration = Duration::from_millis(500);
+
 /// How long a lost session may stay unrecoverable before it is logged as a
 /// warning rather than at debug level.
 const LONG_OUTAGE: Duration = Duration::from_secs(3);
@@ -57,7 +63,7 @@ pub struct CapturedFrame {
     texture: ID3D11Texture2D,
     width: u32,
     height: u32,
-    timestamp: i64,
+    timestamp: Timestamp,
     sequence: u64,
 }
 
@@ -85,11 +91,10 @@ impl CapturedFrame {
         self.height
     }
 
-    /// Presentation time in 100 ns ticks on the QPC timeline (the
-    /// `blink_ring` `Timestamp` unit). Strictly increasing across the frames
-    /// of one duplicator.
+    /// Presentation time on the shared QPC timeline. Strictly increasing
+    /// across the frames of one duplicator.
     #[must_use]
-    pub const fn timestamp(&self) -> i64 {
+    pub const fn timestamp(&self) -> Timestamp {
         self.timestamp
     }
 
@@ -113,9 +118,10 @@ pub enum CaptureEvent {
     /// mouse pointer moved). Nothing was copied; the previous frame still
     /// stands.
     Unchanged {
-        /// When the update happened, in 100 ns QPC ticks: the pointer update
-        /// time if DXGI reported one, otherwise the time it was observed.
-        timestamp: i64,
+        /// When the update happened on the shared QPC timeline: the pointer
+        /// update time if DXGI reported one, otherwise the time it was
+        /// observed.
+        timestamp: Timestamp,
     },
     /// Nothing to report before the timeout elapsed. Also returned while the
     /// duplication session is being recreated after a mode change or desktop
@@ -196,7 +202,7 @@ pub struct DesktopDuplicator {
     warned_outage: bool,
     /// `ProtectedContentMaskedOut` has been logged.
     logged_protected: bool,
-    last_timestamp: Option<i64>,
+    last_timestamp: Option<Timestamp>,
     next_sequence: u64,
 }
 
@@ -225,11 +231,7 @@ impl DesktopDuplicator {
         // reference to its immediate context.
         let context =
             unsafe { device.GetImmediateContext() }.context("get the immediate context")?;
-        let mut frequency = 0;
-        // SAFETY: `frequency` is a valid, writable i64 for the call.
-        unsafe { QueryPerformanceFrequency(&raw mut frequency) }
-            .context("read the QPC frequency")?;
-        let clock = QpcClock::new(frequency).ok_or(CaptureError::InvalidQpcFrequency(frequency))?;
+        let clock = QpcClock::system()?;
         let mut duplicator = Self {
             device: device.clone(),
             context,
@@ -238,7 +240,7 @@ impl DesktopDuplicator {
             pool: None,
             clock,
             scheduler: FrameScheduler::new(target_fps, clock.frequency()),
-            backoff: Backoff::default(),
+            backoff: Backoff::new(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY),
             retry_at: None,
             staleness: Staleness::NewSession,
             pending: None,
@@ -253,7 +255,7 @@ impl DesktopDuplicator {
             Ok(event) => duplicator.pending = event,
             Err(error @ CaptureError::OutputNotFound { .. }) => return Err(error),
             Err(error) if error.is_session_lost() => {
-                tracing::warn!(%error, "desktop duplication unavailable, will retry");
+                tracing::warn!(error = %ErrorChain(&error), "desktop duplication unavailable, will retry");
                 duplicator.lost_since = Some(Instant::now());
                 duplicator.schedule_retry();
             }
@@ -341,14 +343,14 @@ impl DesktopDuplicator {
         match acquired {
             Ok(()) => {}
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                let slot_due = self.scheduler.is_due(query_qpc()?);
+                let slot_due = self.scheduler.is_due(qpc_counter()?);
                 return Ok(match on_timeout(self.staleness, slot_due) {
                     TimeoutAction::Resync => Step::Resync,
                     TimeoutAction::Report => Step::Event(CaptureEvent::Timeout),
                 });
             }
             Err(error) if is_session_lost(error.code()) => {
-                tracing::info!(%error, "desktop duplication session lost, recreating");
+                tracing::info!(error = %ErrorChain(&error), "desktop duplication session lost, recreating");
                 return Ok(Step::Lost);
             }
             Err(error) => return Err(error).context("acquire the next desktop frame"),
@@ -369,7 +371,7 @@ impl DesktopDuplicator {
         } else if info.LastMouseUpdateTime != 0 {
             info.LastMouseUpdateTime
         } else {
-            query_qpc()?
+            qpc_counter()?
         };
         let facts = Acquired {
             content_changed,
@@ -397,7 +399,7 @@ impl DesktopDuplicator {
         let Some(slot) = self.scheduler.next_admit_qpc() else {
             return Ok(None);
         };
-        let now = query_qpc()?;
+        let now = qpc_counter()?;
         Ok(Some(self.clock.to_duration(slot.saturating_sub(now))))
     }
 
@@ -416,10 +418,7 @@ impl DesktopDuplicator {
         }
         let (pool, resized) = pool_for(&mut self.pool, &self.device, desc.Width, desc.Height)?;
         let Some(texture) = pool.textures.next().cloned() else {
-            return Err(CaptureError::Windows {
-                context: "pick a capture texture",
-                source: windows::core::Error::from(E_UNEXPECTED),
-            });
+            return Err(CaptureError::Invariant("the capture texture pool is empty"));
         };
         // SAFETY: both textures belong to `self.device` and share size and
         // format (checked above) and sample count; the duplicator never maps
@@ -501,9 +500,13 @@ impl DesktopDuplicator {
         let since = *self.lost_since.get_or_insert_with(Instant::now);
         if !self.warned_outage && since.elapsed() >= LONG_OUTAGE {
             self.warned_outage = true;
-            tracing::warn!(%error, outage = ?since.elapsed(), "desktop capture interrupted");
+            tracing::warn!(
+                error = %ErrorChain(error),
+                outage = ?since.elapsed(),
+                "desktop capture interrupted"
+            );
         } else {
-            tracing::debug!(%error, "desktop duplication still unavailable");
+            tracing::debug!(error = %ErrorChain(error), "desktop duplication still unavailable");
         }
     }
 
@@ -581,7 +584,7 @@ impl Drop for ReleaseGuard<'_> {
         // frame is held when this runs.
         if let Err(error) = unsafe { self.0.ReleaseFrame() } {
             // The session is gone; the next acquire reports it and recovers.
-            tracing::debug!(%error, "ReleaseFrame failed");
+            tracing::debug!(error = %ErrorChain(&error), "ReleaseFrame failed");
         }
     }
 }
@@ -652,15 +655,8 @@ fn create_texture(
     // no initial data is supplied, and `texture` is a valid out-pointer.
     unsafe { device.CreateTexture2D(desc, None, Some(&raw mut texture)) }
         .context("create a capture texture")?;
-    texture.ok_or_else(|| CaptureError::Windows {
-        context: "create a capture texture",
-        source: windows::core::Error::from(E_POINTER),
+    texture.ok_or(CaptureError::NullOutput {
+        call: "CreateTexture2D",
+        what: "texture",
     })
-}
-
-fn query_qpc() -> Result<i64, CaptureError> {
-    let mut counter = 0;
-    // SAFETY: `counter` is a valid, writable i64 for the call.
-    unsafe { QueryPerformanceCounter(&raw mut counter) }.context("read the QPC counter")?;
-    Ok(counter)
 }

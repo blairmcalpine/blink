@@ -193,7 +193,7 @@ mod tests {
             capture: CaptureState::Unsupported {
                 width: 5120,
                 height: 1440,
-                since: Timestamp(0),
+                since: Timestamp::from_ticks(0),
             },
             last_save: Some(SaveResult::Saved(Seconds(Timestamp::from_secs(30)))),
             ..status()
@@ -233,18 +233,27 @@ mod tests {
         let paused = CaptureState::Unsupported {
             width: 5120,
             height: 1440,
-            since: Timestamp(500),
+            since: Timestamp::from_ticks(500),
         };
         let since = paused.paused_since(None);
-        assert_eq!(since, Some(Timestamp(500)));
-        assert_eq!(clip_end(since, Timestamp(900)), Timestamp(500));
-        assert_eq!(clip_end(since, Timestamp(400)), Timestamp(400));
-        assert_eq!(clip_end(None, Timestamp(900)), Timestamp(900));
+        assert_eq!(since, Some(Timestamp::from_ticks(500)));
+        assert_eq!(
+            clip_end(since, Timestamp::from_ticks(900)),
+            Timestamp::from_ticks(500)
+        );
+        assert_eq!(
+            clip_end(since, Timestamp::from_ticks(400)),
+            Timestamp::from_ticks(400)
+        );
+        assert_eq!(
+            clip_end(None, Timestamp::from_ticks(900)),
+            Timestamp::from_ticks(900)
+        );
     }
 
     #[test]
     fn a_pause_survives_failures_until_frames_are_recorded() {
-        let since = Some(Timestamp(500));
+        let since = Some(Timestamp::from_ticks(500));
         let retrying = CaptureState::Retrying {
             failures: 1,
             error: "access lost".to_owned(),

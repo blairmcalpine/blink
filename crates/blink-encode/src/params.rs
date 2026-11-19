@@ -1,7 +1,7 @@
 //! Filling the NVENC configuration structs. Pure functions over the FFI
 //! layouts, so they build and are tested on every host.
 
-use crate::config::{ConfigError, EncoderConfig, Preset, bitrate_bps};
+use crate::config::{EncoderConfig, EncoderConfigError, Preset, bitrate_bps};
 use crate::ffi::{
     GUID, H264_DISABLE_SPSPPS_BIT, H264_ENABLE_INTRA_REFRESH_BIT, H264_ENABLE_LTR_BIT,
     H264_ENABLE_VFR_BIT, H264_HIERARCHICAL_B_FRAMES_BIT, H264_HIERARCHICAL_P_FRAMES_BIT,
@@ -36,7 +36,7 @@ pub(crate) const fn preset_guid(preset: Preset) -> GUID {
 pub(crate) fn apply_config(
     config: &mut NV_ENC_CONFIG,
     settings: &EncoderConfig,
-) -> Result<(), ConfigError> {
+) -> Result<(), EncoderConfigError> {
     let bps = bitrate_bps(settings.bitrate_kbps)?;
 
     config.version = NV_ENC_CONFIG_VER;
@@ -97,7 +97,7 @@ pub(crate) fn apply_config(
 pub(crate) fn fill_initialize(
     init: &mut NV_ENC_INITIALIZE_PARAMS,
     settings: &EncoderConfig,
-) -> Result<(), ConfigError> {
+) -> Result<(), EncoderConfigError> {
     let (dar_width, dar_height) = settings.display_aspect()?;
     init.version = NV_ENC_INITIALIZE_PARAMS_VER;
     init.encodeGUID = NV_ENC_CODEC_H264_GUID;
@@ -218,7 +218,7 @@ mod tests {
         };
         assert_eq!(
             apply_config(&mut config, &bad),
-            Err(ConfigError::Bitrate(0))
+            Err(EncoderConfigError::Bitrate(0))
         );
     }
 

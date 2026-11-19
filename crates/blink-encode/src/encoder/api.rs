@@ -57,7 +57,10 @@ impl Drop for Library {
         // here. `Api` declares its library last, so no function pointer into
         // the DLL outlives this.
         if let Err(error) = unsafe { FreeLibrary(self.0) } {
-            tracing::warn!(%error, "FreeLibrary(nvEncodeAPI64.dll) failed");
+            tracing::warn!(
+                error = %blink_sys::ErrorChain(&error),
+                "FreeLibrary(nvEncodeAPI64.dll) failed"
+            );
         }
     }
 }

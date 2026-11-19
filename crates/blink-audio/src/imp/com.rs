@@ -54,7 +54,7 @@ impl Drop for MediaRuntime {
             // thread (`Self` is `!Send`), after the caller released its Media
             // Foundation objects.
             if let Err(error) = unsafe { MFShutdown() } {
-                tracing::debug!(?error, "MFShutdown failed");
+                tracing::debug!(error = %blink_sys::ErrorChain(&error), "MFShutdown failed");
             }
         }
         // SAFETY: balances the successful `CoInitializeEx` in `init` on the

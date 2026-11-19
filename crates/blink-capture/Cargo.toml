@@ -12,7 +12,13 @@ publish.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+blink-ring = { path = "../blink-ring" }
+blink-sys = { path = "../blink-sys" }
 tracing.workspace = true
+
+# `decision` is unit tested on every host.
+[dev-dependencies]
+blink-ring = { path = "../blink-ring" }
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
@@ -23,10 +29,6 @@ features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
-    "Win32_Security",
-    "Win32_System_Performance",
-    "Win32_System_Threading",
-    "Win32_UI_WindowsAndMessaging",
 ]
 
 [lints]

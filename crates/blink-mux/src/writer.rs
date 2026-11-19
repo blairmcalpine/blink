@@ -153,15 +153,20 @@ mod tests {
     fn meta(pts: i64, keyframe: bool) -> PacketMeta {
         PacketMeta {
             kind: StreamKind::Video,
-            pts: Timestamp(pts),
-            duration: Timestamp(333_333),
+            pts: Timestamp::from_ticks(pts),
+            duration: Timestamp::from_ticks(333_333),
             keyframe,
         }
     }
 
     fn clip_with(format: &VideoFormat, extra: &[(PacketMeta, &[u8])]) -> ClipBuf {
         let mut clip = ClipBuf::new();
-        clip.begin(format, None, Timestamp(0), Timestamp(666_666));
+        clip.begin(
+            format,
+            None,
+            Timestamp::from_ticks(0),
+            Timestamp::from_ticks(666_666),
+        );
         clip.push_video(meta(0, true), &[0, 0, 0, 1, 0x65, 0x88]);
         clip.push_video(meta(333_333, false), &[0, 0, 1, 0x41, 0x9a]);
         for (meta, payload) in extra {
@@ -228,7 +233,12 @@ mod tests {
             Err(MuxError::MissingVideoFormat)
         ));
         let mut empty = ClipBuf::new();
-        empty.begin(&format(), None, Timestamp(0), Timestamp(1));
+        empty.begin(
+            &format(),
+            None,
+            Timestamp::from_ticks(0),
+            Timestamp::from_ticks(1),
+        );
         assert!(matches!(write(&empty), Err(MuxError::NoVideo)));
         let delimiter_only: &[u8] = &[0, 0, 1, 0x09, 0xf0];
         let clip = clip_with(&format(), &[(meta(666_666, false), delimiter_only)]);

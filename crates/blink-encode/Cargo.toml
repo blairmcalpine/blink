@@ -13,6 +13,7 @@ blink-ring = { path = "../blink-ring" }
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+blink-sys = { path = "../blink-sys" }
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]

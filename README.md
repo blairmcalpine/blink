@@ -12,9 +12,12 @@ window opens only on demand in a separate process.
 
 ## Status
 
-Pre-alpha. The repository currently contains the project foundation (workspace
-layout, tooling, guardrails, design docs) and no working capture, encode, or mux
-code. Nothing is usable yet.
+Pre-alpha. The whole pipeline is implemented: desktop capture, NVENC encode,
+system-audio capture with AAC encode, the packet ring, MP4 muxing, the tray and
+hotkey, and the settings window. It has not had broad hardware testing yet, and
+the items marked **needs hardware verification** in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) are still open. Expect rough
+edges.
 
 ## Requirements
 
@@ -28,9 +31,9 @@ loaded from the installed driver at runtime.
 ## Building
 
 The workspace builds and lints on macOS and Linux as well as Windows. Windows
-capture, audio, and encode code is gated behind `cfg(windows)` and compiles to a
-stub elsewhere, so `cargo check`, `cargo test`, and `cargo clippy` work on any
-host.
+capture, audio, encode, and system code is gated behind `cfg(windows)`, and
+those crates export only their portable parts elsewhere, so `cargo check`,
+`cargo test`, and `cargo clippy` work on any host.
 
 ```sh
 just check
