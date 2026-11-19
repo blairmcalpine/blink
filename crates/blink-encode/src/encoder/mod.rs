@@ -8,6 +8,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::Interface;
 
 use blink_ring::media::{PacketMeta, StreamKind, Timestamp, VideoFormat};
+use blink_sys::ErrorChain;
 
 use self::api::Api;
 use self::session::{Bitstream, PictureInput, Registered, Session};
@@ -103,6 +104,9 @@ pub struct Encoder {
     output: Vec<u8>,
     frame_duration: Timestamp,
     idr: IdrScheduler,
+    /// The last forced IDR came back as a P-frame; logged once per run of
+    /// such frames.
+    idr_ignored: bool,
     session: Session,
 }
 
@@ -147,6 +151,7 @@ impl Encoder {
             output: Vec::with_capacity(capacity),
             frame_duration: config.frame_duration(),
             idr: IdrScheduler::new(config.frame_duration()),
+            idr_ignored: false,
             session,
         };
         tracing::info!(
@@ -196,10 +201,9 @@ impl Encoder {
             .registrations
             .get(index)
             .map(|registration| &registration.handle)
-            .ok_or(EncodeError::NullOutput {
-                call: "nvEncRegisterResource",
-                what: "cached registration",
-            })?;
+            .ok_or(EncodeError::Invariant(
+                "the cached texture registration is missing",
+            ))?;
 
         let force_idr = self.idr.due(timestamp);
         let mapped = self.session.map(registered)?;
@@ -229,9 +233,11 @@ impl Encoder {
         unmapped?;
 
         self.idr.observe(timestamp, keyframe);
-        if force_idr && !keyframe {
-            tracing::warn!("NVENC ignored a forced IDR; retrying on the next frame");
+        let ignored = force_idr && !keyframe;
+        if ignored && !self.idr_ignored {
+            tracing::warn!("NVENC ignored a forced IDR; retrying on every frame until one lands");
         }
+        self.idr_ignored = ignored;
         Ok(EncodedFrame {
             meta: PacketMeta {
                 kind: StreamKind::Video,
@@ -401,7 +407,10 @@ impl Drop for Encoder {
     fn drop(&mut self) {
         self.release_textures();
         if let Err(error) = self.session.destroy_bitstream(&self.bitstream) {
-            tracing::warn!(%error, "failed to destroy the NVENC bitstream buffer");
+            tracing::warn!(
+                error = %ErrorChain(&error),
+                "failed to destroy the NVENC bitstream buffer"
+            );
         }
         // `session` drops next and destroys the encoder.
     }
@@ -436,7 +445,10 @@ fn read_format(session: &Session, settings: &EncoderConfig) -> Result<VideoForma
 /// texture, so the COM reference is leaked rather than released.
 fn unregister(session: &Session, registration: Registration) {
     if let Err(error) = session.unregister(&registration.handle) {
-        tracing::warn!(%error, "failed to unregister a texture from NVENC; leaking it");
+        tracing::warn!(
+            error = %ErrorChain(&error),
+            "failed to unregister a texture from NVENC; leaking it"
+        );
         core::mem::forget(registration.texture);
     }
 }

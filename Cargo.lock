@@ -157,6 +157,7 @@ dependencies = [
  "keyboard-types",
  "parking_lot",
  "rfd",
+ "thiserror 2.0.21",
  "time",
  "tracing",
  "tracing-appender",
@@ -201,6 +202,7 @@ name = "blink-encode"
 version = "0.0.0"
 dependencies = [
  "blink-ring",
+ "blink-sys",
  "thiserror 2.0.21",
  "tracing",
  "windows",
@@ -238,6 +240,7 @@ name = "blink-ui"
 version = "0.0.0"
 dependencies = [
  "blink-config",
+ "blink-sys",
  "eframe",
  "rfd",
  "thiserror 2.0.21",

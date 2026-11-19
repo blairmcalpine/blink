@@ -70,7 +70,7 @@ impl BackgroundMode {
 impl Drop for BackgroundMode {
     fn drop(&mut self) {
         if let Err(error) = set_priority(THREAD_MODE_BACKGROUND_END) {
-            tracing::warn!(%error, "failed to leave thread background mode");
+            tracing::warn!(error = %crate::ErrorChain(&error), "failed to leave thread background mode");
         }
     }
 }

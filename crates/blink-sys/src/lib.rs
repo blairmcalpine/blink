@@ -10,12 +10,14 @@
 //! them.
 //!
 //! Windows only, like the other FFI crates. On other hosts only the portable
-//! items exist ([`QpcClock`]'s arithmetic, [`Backoff`], and [`SysError`]), so
+//! items exist ([`QpcClock`]'s arithmetic, [`Backoff`], [`ErrorChain`], and
+//! [`SysError`]), so
 //! the workspace
 //! still builds and their logic is unit tested everywhere.
 //!
-//! [`Backoff`], the retry delay every reconnect loop uses, is portable and
-//! lives here for the same reason. Every `unsafe`
+//! Two portable helpers live here for the same reason: [`Backoff`], the retry
+//! delay every reconnect loop uses, and [`ErrorChain`], which renders an
+//! error with its sources for logs and dialogs. Every `unsafe`
 //! block needs a `// SAFETY:` comment and may contain only one unsafe
 //! operation.
 
@@ -29,6 +31,7 @@ mod clock;
     )
 )]
 mod error;
+mod error_chain;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]
@@ -41,6 +44,7 @@ pub use clock::QpcClock;
 #[cfg(windows)]
 pub use clock::{qpc_counter, qpc_now};
 pub use error::SysError;
+pub use error_chain::ErrorChain;
 #[cfg(windows)]
 pub use instance::SingleInstance;
 #[cfg(windows)]

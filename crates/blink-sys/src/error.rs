@@ -6,7 +6,7 @@
 pub enum SysError {
     /// A Windows API call failed.
     #[cfg(windows)]
-    #[error("{context}")]
+    #[error("failed to {context}")]
     Windows {
         /// What was being attempted.
         context: &'static str,

@@ -18,7 +18,7 @@ use std::time::Instant;
 use anyhow::{Context as _, bail};
 use blink_ring::ClipBuf;
 use blink_ring::media::Timestamp;
-use blink_sys::{BackgroundMode, ThreadPriority};
+use blink_sys::{BackgroundMode, ErrorChain, ThreadPriority};
 use time::OffsetDateTime;
 
 use super::EngineEvent;
@@ -54,7 +54,7 @@ pub(super) struct SaveRequest {
 /// The local time now, to the second, or UTC if the local offset is unknown.
 pub(super) fn local_time() -> LocalTime {
     let now = OffsetDateTime::now_local().unwrap_or_else(|error| {
-        tracing::warn!(%error, "local time offset unavailable; naming clips in UTC");
+        tracing::warn!(error = %ErrorChain(&error), "local time offset unavailable; naming clips in UTC");
         OffsetDateTime::now_utc()
     });
     LocalTime {
@@ -104,13 +104,13 @@ impl Saver {
                 if let Err(error) =
                     blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal)
                 {
-                    tracing::warn!(%error, "could not lower the save thread priority");
+                    tracing::warn!(error = %ErrorChain(&error), "could not lower the save thread priority");
                 }
             },
             move || {
                 remove_temp_files(&output_dir);
                 BackgroundMode::enter()
-                    .inspect_err(|error| tracing::warn!(%error, "writing at normal I/O priority"))
+                    .inspect_err(|error| tracing::warn!(error = %ErrorChain(error), "writing at normal I/O priority"))
                     .ok()
             },
             move |job: Job<Written>, clip: Result<&ClipBuf, CutError>| writer.finish(&job, clip),
@@ -190,7 +190,7 @@ impl Writer {
                 SaveResult::Saved(Seconds(clip.duration()))
             }
             Err(error) => {
-                let error = format!("{error:#}");
+                let error = ErrorChain(error.as_ref()).to_string();
                 tracing::error!(error, "failed to save a clip");
                 SaveResult::Failed(error)
             }
@@ -238,7 +238,7 @@ fn remove_temp_files(dir: &Path) {
             match fs::remove_file(&path) {
                 Ok(()) => tracing::info!(path = %path.display(), "deleted an unfinished clip"),
                 Err(error) => {
-                    tracing::warn!(%error, path = %path.display(), "cannot delete a temp file");
+                    tracing::warn!(error = %ErrorChain(&error), path = %path.display(), "cannot delete a temp file");
                 }
             }
         }

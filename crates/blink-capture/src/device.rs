@@ -1,6 +1,6 @@
 //! D3D11 device creation on the adapter that drives the primary output.
 
-use windows::Win32::Foundation::{E_POINTER, HMODULE};
+use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -158,9 +158,9 @@ fn create_on(
     .context("create the D3D11 device")?;
     match (device, context) {
         (Some(device), Some(context)) => Ok((device, context)),
-        _ => Err(CaptureError::Windows {
-            context: "create the D3D11 device",
-            source: windows::core::Error::from(E_POINTER),
+        _ => Err(CaptureError::NullOutput {
+            call: "D3D11CreateDevice",
+            what: "device or context",
         }),
     }
 }

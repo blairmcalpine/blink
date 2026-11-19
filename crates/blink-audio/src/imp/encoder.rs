@@ -14,6 +14,7 @@
 use std::mem::ManuallyDrop;
 
 use blink_ring::media::{AudioFormat, PacketMeta, StreamKind, Timestamp};
+use blink_sys::ErrorChain;
 use tracing::{debug, warn};
 use windows::Win32::Media::MediaFoundation::{
     AACMFTEncoder, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MF_E_NOTACCEPTING,
@@ -279,7 +280,7 @@ impl AacEncoder {
 impl Drop for AacEncoder {
     fn drop(&mut self) {
         if let Err(error) = self.message(MFT_MESSAGE_NOTIFY_END_STREAMING, "end streaming") {
-            debug!(?error, "AAC encoder did not accept end of streaming");
+            debug!(error = %ErrorChain(&error), "AAC encoder did not accept end of streaming");
         }
     }
 }
@@ -360,7 +361,7 @@ impl Drop for Locked<'_> {
     fn drop(&mut self) {
         // SAFETY: balances the successful `Lock` in `new`.
         if let Err(error) = unsafe { self.buffer.Unlock() } {
-            debug!(?error, "IMFMediaBuffer::Unlock failed");
+            debug!(error = %ErrorChain(&error), "IMFMediaBuffer::Unlock failed");
         }
     }
 }
@@ -451,13 +452,13 @@ fn set_types(
         return Ok(());
     };
     debug!(
-        ?error,
+        error = %ErrorChain(&error),
         "AAC encoder refused output-then-input; trying input first"
     );
     // A half-applied output type would constrain the input type; clear it.
     // SAFETY: plain COM call; a null type clears the stream's output type.
     if let Err(error) = unsafe { transform.SetOutputType(STREAM, None::<&IMFMediaType>, 0) } {
-        debug!(?error, "could not clear the AAC encoder output type");
+        debug!(error = %ErrorChain(&error), "could not clear the AAC encoder output type");
     }
     // SAFETY: plain COM call with a live media type.
     unsafe { transform.SetInputType(STREAM, input, 0) }
@@ -488,7 +489,7 @@ fn audio_format(transform: &IMFTransform) -> Result<AudioFormat, AudioError> {
             .and_then(asc::from_user_data),
         Err(error) => {
             debug!(
-                ?error,
+                error = %ErrorChain(&error),
                 "AAC encoder output type has no usable MF_MT_USER_DATA"
             );
             None

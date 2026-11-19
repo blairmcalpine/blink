@@ -54,7 +54,7 @@ pub(crate) fn init(prefix: &str) -> LogGuard {
         if installed.is_ok()
             && let Some(error) = file_error
         {
-            tracing::warn!(error = format!("{error:#}"), "logging to stderr only");
+            tracing::warn!(error = %blink_sys::ErrorChain(error.as_ref()), "logging to stderr only");
         }
         LogGuard { _worker: worker }
     }

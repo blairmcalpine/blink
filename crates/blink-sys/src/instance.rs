@@ -40,7 +40,10 @@ impl Drop for SingleInstance {
     fn drop(&mut self) {
         // SAFETY: `handle` came from CreateMutexW and is closed exactly once.
         if let Err(error) = unsafe { CloseHandle(self.handle) } {
-            tracing::warn!(%error, "failed to close the single-instance mutex");
+            tracing::warn!(
+                error = %crate::ErrorChain(&error),
+                "failed to close the single-instance mutex"
+            );
         }
     }
 }

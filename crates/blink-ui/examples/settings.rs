@@ -25,7 +25,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            tracing::error!(error = %err, "settings failed");
+            tracing::error!(error = %blink_sys::ErrorChain(&err), "settings failed");
             ExitCode::FAILURE
         }
     }

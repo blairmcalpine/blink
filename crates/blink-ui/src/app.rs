@@ -1,6 +1,7 @@
 //! The settings window: an [`eframe::App`] that edits a [`Draft`] in place
 //! and validates it every frame.
 
+use blink_sys::ErrorChain;
 use std::cell::Cell;
 use std::path::PathBuf;
 
@@ -208,7 +209,7 @@ impl<'a> SettingsApp<'a> {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 Err(err) => {
-                    let message = crate::describe(&err);
+                    let message = ErrorChain(&err).to_string();
                     tracing::error!(error = %message, "failed to save settings");
                     self.status = Some((self.draft.clone(), format!("Could not save: {message}")));
                 }

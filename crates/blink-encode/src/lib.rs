@@ -89,7 +89,7 @@ mod encoder;
 mod error;
 
 pub use annexb::ParameterSetError;
-pub use config::{ConfigError, EncoderConfig, Preset};
+pub use config::{EncoderConfig, EncoderConfigError, Preset};
 #[cfg(windows)]
 pub use encoder::{EncodedFrame, Encoder};
 #[cfg(windows)]

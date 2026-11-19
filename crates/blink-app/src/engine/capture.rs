@@ -16,7 +16,7 @@ use blink_config::Config;
 use blink_encode::{EncodeError, Encoder};
 use blink_ring::PushOutcome;
 use blink_ring::media::{Timestamp, VideoFormat};
-use blink_sys::{Backoff, SysError, ThreadPriority};
+use blink_sys::{Backoff, ErrorChain, SysError, ThreadPriority};
 
 use super::EngineEvent;
 use super::signal::StopSignal;
@@ -76,10 +76,9 @@ impl From<EncodeError> for Failure {
             EncodeError::NoNvidiaDriver(_)
             | EncodeError::DriverTooOld { .. }
             | EncodeError::MissingExport(_)
-            | EncodeError::MissingFunction(_) => Self::Fatal(format!(
-                "NVENC is unavailable: {:#}",
-                anyhow::Error::from(error)
-            )),
+            | EncodeError::MissingFunction(_) => {
+                Self::Fatal(format!("NVENC is unavailable: {}", ErrorChain(&error)))
+            }
             error => Self::Retry(error.into()),
         }
     }
@@ -105,7 +104,7 @@ impl Run<'_> {
 
 fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<EngineEvent>) {
     if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
-        tracing::warn!(%error, "could not lower the capture thread priority");
+        tracing::warn!(error = %ErrorChain(&error), "could not lower the capture thread priority");
     }
     let Some(fps) = NonZeroU32::new(config.fps) else {
         let _ = events.send(EngineEvent::CaptureFatal(format!(
@@ -138,7 +137,7 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
                 }
                 let delay = backoff.next_delay();
                 failures = failures.saturating_add(1);
-                let error = format!("{error:#}");
+                let error = ErrorChain(error.as_ref()).to_string();
                 tracing::warn!(
                     error,
                     failures,
@@ -321,7 +320,9 @@ impl State<'_> {
         match video.push(self.ring, packet.meta, packet.data) {
             Ok(PushOutcome::Stored) => {}
             Ok(PushOutcome::DroppedAwaitingKeyframe) => encoder.request_idr(),
-            Err(error) => tracing::warn!(%error, "video packet rejected by the ring"),
+            Err(error) => {
+                tracing::warn!(error = %ErrorChain(&error), "video packet rejected by the ring");
+            }
         }
         Ok(true)
     }

@@ -17,11 +17,13 @@ blink-audio = { path = "../blink-audio" }
 blink-config = { path = "../blink-config" }
 blink-encode = { path = "../blink-encode" }
 blink-ring = { path = "../blink-ring" }
+blink-sys = { path = "../blink-sys" }
 blink-ui = { path = "../blink-ui" }
 # The `Code` and `Modifiers` types `global-hotkey` re-exports; depending on
 # them directly keeps the key mapping portable and unit tested on every host.
 keyboard-types = { version = "0.8", default-features = false }
 parking_lot = "0.12"
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -29,7 +31,6 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 blink-capture = { path = "../blink-capture" }
 blink-mux = { path = "../blink-mux" }
-blink-sys = { path = "../blink-sys" }
 global-hotkey = "0.10"
 rfd.workspace = true
 time = { version = "0.3", default-features = false, features = ["local-offset", "std"] }

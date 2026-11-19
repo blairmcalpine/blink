@@ -27,6 +27,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use blink_ring::media::AudioFormat;
+use blink_sys::ErrorChain;
 use blink_sys::{Backoff, ThreadPriority};
 use tracing::{debug, info, warn};
 use windows::Win32::Media::Audio::{IMMDeviceEnumerator, MMDeviceEnumerator};
@@ -178,7 +179,7 @@ impl Drop for AudioCapture {
         self.stop.store(true, Ordering::Release);
         match self.thread.take().map(JoinHandle::join) {
             None | Some(Ok(Ok(()))) => {}
-            Some(Ok(Err(error))) => warn!(?error, "audio thread failed"),
+            Some(Ok(Err(error))) => warn!(error = %ErrorChain(&error), "audio thread failed"),
             Some(Err(_)) => warn!("audio thread panicked"),
         }
     }
@@ -197,13 +198,13 @@ where
     F: FnOnce(&AudioFormat) -> S,
 {
     if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
-        warn!(?error, "could not lower the audio thread priority");
+        warn!(error = %ErrorChain(&error), "could not lower the audio thread priority");
     }
     let runtime = MediaRuntime::init()?;
     let result = capture(config, make_sink, stop, ready);
     drop(runtime);
     if let Err(error) = &result {
-        warn!(?error, "audio capture stopped");
+        warn!(error = %ErrorChain(error), "audio capture stopped");
     }
     result
 }
@@ -375,10 +376,10 @@ impl Endpoint {
             }
             Err(error) => {
                 if self.open_failures == 0 {
-                    warn!(?error, "cannot open the default render endpoint; retrying");
+                    warn!(error = %ErrorChain(&error), "cannot open the default render endpoint; retrying");
                 } else {
                     debug!(
-                        ?error,
+                        error = %ErrorChain(&error),
                         attempt = self.open_failures + 1,
                         "endpoint still unavailable"
                     );
@@ -410,7 +411,7 @@ impl Endpoint {
         let lost = match stream.drain(on_packet) {
             Err(Fault::Fatal(error)) => return Err(error),
             Err(Fault::Device(error)) => {
-                warn!(?error, "loopback stream lost; reopening");
+                warn!(error = %ErrorChain(&error), "loopback stream lost; reopening");
                 true
             }
             Ok(()) if Instant::now() >= self.next_device_check => {
@@ -422,7 +423,7 @@ impl Endpoint {
                         true
                     }
                     Err(error) => {
-                        info!(?error, "default render endpoint unavailable");
+                        info!(error = %ErrorChain(&error), "default render endpoint unavailable");
                         true
                     }
                 }

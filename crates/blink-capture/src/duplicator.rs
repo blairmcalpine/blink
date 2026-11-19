@@ -5,8 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use blink_ring::media::Timestamp;
-use blink_sys::{Backoff, QpcClock, qpc_counter};
-use windows::Win32::Foundation::{E_POINTER, E_UNEXPECTED};
+use blink_sys::{Backoff, ErrorChain, QpcClock, qpc_counter};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_RENDER_TARGET, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
     ID3D11DeviceContext, ID3D11Texture2D,
@@ -256,7 +255,7 @@ impl DesktopDuplicator {
             Ok(event) => duplicator.pending = event,
             Err(error @ CaptureError::OutputNotFound { .. }) => return Err(error),
             Err(error) if error.is_session_lost() => {
-                tracing::warn!(%error, "desktop duplication unavailable, will retry");
+                tracing::warn!(error = %ErrorChain(&error), "desktop duplication unavailable, will retry");
                 duplicator.lost_since = Some(Instant::now());
                 duplicator.schedule_retry();
             }
@@ -351,7 +350,7 @@ impl DesktopDuplicator {
                 });
             }
             Err(error) if is_session_lost(error.code()) => {
-                tracing::info!(%error, "desktop duplication session lost, recreating");
+                tracing::info!(error = %ErrorChain(&error), "desktop duplication session lost, recreating");
                 return Ok(Step::Lost);
             }
             Err(error) => return Err(error).context("acquire the next desktop frame"),
@@ -419,10 +418,7 @@ impl DesktopDuplicator {
         }
         let (pool, resized) = pool_for(&mut self.pool, &self.device, desc.Width, desc.Height)?;
         let Some(texture) = pool.textures.next().cloned() else {
-            return Err(CaptureError::Windows {
-                context: "pick a capture texture",
-                source: windows::core::Error::from(E_UNEXPECTED),
-            });
+            return Err(CaptureError::Invariant("the capture texture pool is empty"));
         };
         // SAFETY: both textures belong to `self.device` and share size and
         // format (checked above) and sample count; the duplicator never maps
@@ -504,9 +500,13 @@ impl DesktopDuplicator {
         let since = *self.lost_since.get_or_insert_with(Instant::now);
         if !self.warned_outage && since.elapsed() >= LONG_OUTAGE {
             self.warned_outage = true;
-            tracing::warn!(%error, outage = ?since.elapsed(), "desktop capture interrupted");
+            tracing::warn!(
+                error = %ErrorChain(error),
+                outage = ?since.elapsed(),
+                "desktop capture interrupted"
+            );
         } else {
-            tracing::debug!(%error, "desktop duplication still unavailable");
+            tracing::debug!(error = %ErrorChain(error), "desktop duplication still unavailable");
         }
     }
 
@@ -584,7 +584,7 @@ impl Drop for ReleaseGuard<'_> {
         // frame is held when this runs.
         if let Err(error) = unsafe { self.0.ReleaseFrame() } {
             // The session is gone; the next acquire reports it and recovers.
-            tracing::debug!(%error, "ReleaseFrame failed");
+            tracing::debug!(error = %ErrorChain(&error), "ReleaseFrame failed");
         }
     }
 }
@@ -655,8 +655,8 @@ fn create_texture(
     // no initial data is supplied, and `texture` is a valid out-pointer.
     unsafe { device.CreateTexture2D(desc, None, Some(&raw mut texture)) }
         .context("create a capture texture")?;
-    texture.ok_or_else(|| CaptureError::Windows {
-        context: "create a capture texture",
-        source: windows::core::Error::from(E_POINTER),
+    texture.ok_or(CaptureError::NullOutput {
+        call: "CreateTexture2D",
+        what: "texture",
     })
 }

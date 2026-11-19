@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 blink-config = { path = "../blink-config" }
+blink-sys = { path = "../blink-sys" }
 eframe.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

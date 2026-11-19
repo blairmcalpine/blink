@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use blink_audio::{AudioCapture, AudioConfig};
 use blink_ring::media::{AudioFormat, PacketMeta};
-use blink_sys::Backoff;
+use blink_sys::{Backoff, ErrorChain};
 
 use crate::shared::{Producer, SharedRing};
 
@@ -57,7 +57,9 @@ impl AudioSupervisor {
         if let Some(capture) = self.capture.take() {
             match capture.stop() {
                 Ok(()) => tracing::info!("audio capture stopped"),
-                Err(error) => tracing::warn!(%error, "audio capture had failed"),
+                Err(error) => {
+                    tracing::warn!(error = %ErrorChain(&error), "audio capture had failed");
+                }
             }
         }
     }
@@ -71,8 +73,12 @@ impl AudioSupervisor {
         if self.capture.as_ref().is_some_and(AudioCapture::is_finished)
             && let Some(capture) = self.capture.take()
         {
-            let error = capture.stop().err();
-            tracing::warn!(?error, "audio capture ended; restarting");
+            match capture.stop() {
+                Ok(()) => tracing::warn!("audio capture ended; restarting"),
+                Err(error) => {
+                    tracing::warn!(error = %ErrorChain(&error), "audio capture ended; restarting");
+                }
+            }
             // A capture that ran a good while (until a device change, say)
             // restarts promptly instead of continuing the old backoff.
             if self
@@ -106,7 +112,7 @@ impl AudioSupervisor {
                 self.retry_at = None;
             }
             Err(error) => {
-                tracing::warn!(%error, "audio capture failed to start");
+                tracing::warn!(error = %ErrorChain(&error), "audio capture failed to start");
                 self.schedule_retry();
             }
         }
@@ -126,7 +132,7 @@ fn sink(
     let mut producer = Producer::new(format.clone());
     move |meta, payload| {
         if let Err(error) = producer.push(&ring, meta, payload) {
-            tracing::warn!(%error, "audio packet rejected by the ring");
+            tracing::warn!(error = %ErrorChain(&error), "audio packet rejected by the ring");
         }
     }
 }

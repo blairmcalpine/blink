@@ -5,7 +5,9 @@ use crate::MuxError;
 
 const SPS_NAL_TYPE: u8 = 7;
 const PPS_NAL_TYPE: u8 = 8;
-const TRUNCATED: MuxError = MuxError::InvalidSps("truncated");
+const TRUNCATED: MuxError = MuxError::InvalidSps {
+    reason: "truncated",
+};
 
 /// Profiles whose SPS carries `chroma_format_idc` and the bit depths, and
 /// whose `avcC` therefore gets the chroma format and bit depth extension.
@@ -20,15 +22,20 @@ const CHROMA_PROFILES: [u8; 13] = [100, 110, 122, 144, 244, 44, 83, 86, 118, 128
 /// depths parsed from the SPS (every profile but 66, 77, and 88).
 pub(super) fn decoder_config(sps: &[u8], pps: &[u8]) -> Result<Vec<u8>, MuxError> {
     let &[_, profile, compatibility, level, ..] = sps else {
-        return Err(MuxError::InvalidSps("shorter than 4 bytes"));
+        return Err(MuxError::InvalidSps {
+            reason: "shorter than 4 bytes",
+        });
     };
     if nal_type(sps) != Some(SPS_NAL_TYPE) {
-        return Err(MuxError::InvalidSps("not an SPS NAL unit"));
+        return Err(MuxError::InvalidSps {
+            reason: "not an SPS NAL unit",
+        });
     }
     if nal_type(pps) != Some(PPS_NAL_TYPE) {
         return Err(MuxError::InvalidPps);
     }
-    let sps_len = u16::try_from(sps.len()).map_err(|_| MuxError::InvalidSps("too long"))?;
+    let sps_len =
+        u16::try_from(sps.len()).map_err(|_| MuxError::InvalidSps { reason: "too long" })?;
     let pps_len = u16::try_from(pps.len()).map_err(|_| MuxError::InvalidPps)?;
 
     let mut out = Vec::with_capacity(sps.len() + pps.len() + 15);
@@ -74,7 +81,9 @@ fn parse_chroma(after_level: &[u8]) -> Result<SpsChroma, MuxError> {
         u8::try_from(value)
             .ok()
             .filter(|_| value <= max)
-            .ok_or(MuxError::InvalidSps("field out of range"))
+            .ok_or(MuxError::InvalidSps {
+                reason: "field out of range",
+            })
     };
     Ok(SpsChroma {
         format: field(format, 3)?,
@@ -191,11 +200,11 @@ mod tests {
     fn rejects_bad_parameter_sets() {
         assert!(matches!(
             decoder_config(&[0x67, 0x42], &PPS),
-            Err(MuxError::InvalidSps(_))
+            Err(MuxError::InvalidSps { .. })
         ));
         assert!(matches!(
             decoder_config(&PPS, &PPS),
-            Err(MuxError::InvalidSps(_))
+            Err(MuxError::InvalidSps { .. })
         ));
         assert!(matches!(
             decoder_config(&BASELINE_SPS, &[]),
@@ -203,11 +212,13 @@ mod tests {
         ));
         assert!(matches!(
             decoder_config(&[0x67, 100, 0, 10], &PPS),
-            Err(MuxError::InvalidSps("truncated"))
+            Err(MuxError::InvalidSps {
+                reason: "truncated"
+            })
         ));
         assert!(matches!(
             parse_chroma(&[0x80, 0x01]),
-            Err(MuxError::InvalidSps(_))
+            Err(MuxError::InvalidSps { .. })
         ));
     }
 

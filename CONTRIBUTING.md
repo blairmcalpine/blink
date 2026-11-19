@@ -110,8 +110,10 @@ that fights the compiler.
   once the exception is stale, which keeps suppressions from rotting. A reason
   is mandatory.
 - All output goes through `tracing`. `println!` and `eprintln!` are denied.
-  Never log a line from the capture or encode threads at a level that is enabled
-  by default.
+  The capture and encode threads never log per frame at a level that is
+  enabled by default; state changes, retries, and failures are fine. Log
+  errors as `error = %ErrorChain(&error)` (`blink_sys::ErrorChain`) so the
+  source chain, including any HRESULT, reaches the log.
 - Windows code stays behind `#[cfg(windows)]`. FFI crates declare their
   dependencies under `[target.'cfg(windows)'.dependencies]` and compile to a
   stub elsewhere, so the whole workspace keeps building on macOS and Linux.

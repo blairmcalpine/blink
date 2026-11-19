@@ -5,17 +5,27 @@
 #[non_exhaustive]
 pub enum AudioError {
     /// Audio capture only exists on Windows; this is a stub build.
+    #[cfg(not(windows))]
     #[error("audio capture is only available on Windows")]
     Unsupported,
     /// A Windows API call failed.
     #[cfg(windows)]
-    #[error("{context}")]
+    #[error("failed to {context}")]
     Windows {
         /// What was being attempted.
         context: &'static str,
         /// The underlying COM error.
         #[source]
         source: windows::core::Error,
+    },
+    /// A Windows call reported success but returned no object.
+    #[cfg(windows)]
+    #[error("{call} succeeded but returned no {what}")]
+    NullOutput {
+        /// The Windows function.
+        call: &'static str,
+        /// The output that was missing.
+        what: &'static str,
     },
     /// The QPC clock could not be read.
     #[cfg(windows)]

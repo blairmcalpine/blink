@@ -16,6 +16,7 @@ use windows::core::HRESULT;
 
 /// Errors from device creation and desktop duplication.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CaptureError {
     /// Desktop capture is only implemented on Windows; this build has no
     /// capture backend.
@@ -24,7 +25,7 @@ pub enum CaptureError {
     Unsupported,
     /// A Windows API call failed.
     #[cfg(windows)]
-    #[error("{context}")]
+    #[error("failed to {context}")]
     Windows {
         /// What was being attempted.
         context: &'static str,
@@ -59,6 +60,20 @@ pub enum CaptureError {
     #[cfg(windows)]
     #[error(transparent)]
     Clock(#[from] blink_sys::SysError),
+    /// A Windows call reported success but returned no object.
+    #[cfg(windows)]
+    #[error("{call} succeeded but returned no {what}")]
+    NullOutput {
+        /// The Windows function.
+        call: &'static str,
+        /// The output that was missing.
+        what: &'static str,
+    },
+    /// The duplicator's own state broke an invariant it relies on. A bug in
+    /// blink, not a Windows failure.
+    #[cfg(windows)]
+    #[error("internal capture error: {0}")]
+    Invariant(&'static str),
     /// The duplicated desktop image is not `DXGI_FORMAT_B8G8R8A8_UNORM`.
     #[cfg(windows)]
     #[error("unsupported desktop image format {0:?}")]
