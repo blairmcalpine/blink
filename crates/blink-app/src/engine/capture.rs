@@ -105,9 +105,33 @@ struct Run<'a> {
     /// When encoding paused for an unsupported mode; kept across sessions
     /// and repeated mode changes until a frame is encoded again.
     paused_since: Option<Timestamp>,
+    /// Periodic encode counters, kept across sessions.
+    stats: EncodeStats,
+    stats_since: Instant,
 }
 
 impl Run<'_> {
+    const fn count_refresh(&mut self, refreshed: bool) {
+        if refreshed {
+            self.stats.refreshed = self.stats.refreshed.saturating_add(1);
+        }
+    }
+
+    fn log_stats(&mut self) {
+        let elapsed = self.stats_since.elapsed();
+        if elapsed < STATS_PERIOD {
+            return;
+        }
+        let stats = std::mem::take(&mut self.stats);
+        tracing::info!(
+            encoded = stats.encoded,
+            refreshed = stats.refreshed,
+            elapsed_s = elapsed.as_secs(),
+            "encode stats"
+        );
+        self.stats_since = Instant::now();
+    }
+
     fn report(&self, state: CaptureState) {
         let _ = self.events.send(EngineEvent::Capture(state));
     }
@@ -130,6 +154,8 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
         encoding_since: None,
         frames: 0,
         paused_since: None,
+        stats: EncodeStats::default(),
+        stats_since: Instant::now(),
     };
     let mut retry = RetryPolicy::new(FIRST_RETRY, MAX_RETRY);
     while !stop.is_stopped() {
@@ -188,11 +214,9 @@ fn session(
         paused: false,
         last_frame: None,
         last_pts: None,
-        stats: EncodeStats::default(),
-        stats_since: Instant::now(),
     };
     while !stop.is_stopped() {
-        state.log_stats();
+        run.log_stats();
         match duplicator.next_frame(POLL)? {
             CaptureEvent::ModeChanged { width, height } => {
                 state.mode_changed(&device, run, width, height)?;
@@ -200,6 +224,7 @@ fn session(
             CaptureEvent::Frame(frame) => {
                 if state.frame(frame)? {
                     run.frames = run.frames.saturating_add(1);
+                    run.stats.encoded = run.stats.encoded.saturating_add(1);
                     if run.encoding_since.is_none() {
                         run.encoding_since = Some(Instant::now());
                         run.paused_since = None;
@@ -207,8 +232,14 @@ fn session(
                     }
                 }
             }
-            CaptureEvent::Unchanged { timestamp } => state.refresh_idr(timestamp)?,
-            CaptureEvent::Timeout => state.refresh_idr(blink_sys::qpc_now()?)?,
+            CaptureEvent::Unchanged { timestamp } => {
+                let refreshed = state.refresh_idr(timestamp)?;
+                run.count_refresh(refreshed);
+            }
+            CaptureEvent::Timeout => {
+                let refreshed = state.refresh_idr(blink_sys::qpc_now()?)?;
+                run.count_refresh(refreshed);
+            }
         }
     }
     Ok(())
@@ -231,8 +262,6 @@ struct State<'a> {
     last_frame: Option<CapturedFrame>,
     /// Timestamp of the last encoded frame; encode timestamps must increase.
     last_pts: Option<Timestamp>,
-    stats: EncodeStats,
-    stats_since: Instant,
 }
 
 /// Counters for the periodic encode summary.
@@ -315,46 +344,27 @@ impl State<'_> {
         }
         let pts = next_pts(self.last_pts, frame.timestamp());
         let encoded = self.encode(&frame, pts)?;
-        if encoded {
-            self.stats.encoded = self.stats.encoded.saturating_add(1);
-        }
         self.last_frame = Some(frame);
         Ok(encoded)
     }
 
     /// On a static screen nothing is encoded, so re-encode the last frame
     /// when the encoder wants an IDR: once a second, or right after the ring
-    /// dropped packets waiting for a keyframe.
-    fn refresh_idr(&mut self, now: Timestamp) -> Result<(), Failure> {
+    /// dropped packets waiting for a keyframe. Returns whether it did.
+    fn refresh_idr(&mut self, now: Timestamp) -> Result<bool, Failure> {
         let due = self
             .encoder
             .as_ref()
             .is_some_and(|encoder| encoder.idr_due(now));
         if !should_refresh(due, self.last_pts, now, self.last_frame.is_some()) {
-            return Ok(());
+            return Ok(false);
         }
         let Some(frame) = self.last_frame.take() else {
-            return Ok(());
+            return Ok(false);
         };
         let result = self.encode(&frame, now);
         self.last_frame = Some(frame);
-        if matches!(result, Ok(true)) {
-            self.stats.refreshed = self.stats.refreshed.saturating_add(1);
-        }
-        result.map(drop)
-    }
-
-    fn log_stats(&mut self) {
-        if self.stats_since.elapsed() < STATS_PERIOD {
-            return;
-        }
-        let stats = std::mem::take(&mut self.stats);
-        tracing::info!(
-            encoded = stats.encoded,
-            refreshed = stats.refreshed,
-            "encode stats (last 60 s)"
-        );
-        self.stats_since = Instant::now();
+        result
     }
 
     fn encode(&mut self, frame: &CapturedFrame, pts: Timestamp) -> Result<bool, Failure> {

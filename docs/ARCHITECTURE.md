@@ -260,8 +260,14 @@ resync after a dropped change.
 Only frames with new desktop content (`LastPresentTime != 0`) are copied. A
 pointer-only update's surface is not guaranteed to hold the desktop, and on
 a new session it is black, so copying one encodes a black frame. A new
-session therefore waits for its first content update, and a dropped change
-whose slot comes due with only pointer updates is delivered by a resync.
+session therefore waits for its first content update. A change the decimator
+dropped is delivered by the next content update, or by a resync once its slot
+has gone a whole frame interval without one: at 144 Hz into 60 fps the next
+update can land up to 6.9 ms after the slot opens, so resyncing as soon as it
+opens would recreate the session on most frames of continuous motion. A new
+session with nothing to show (startup, or after a resize) that gets no content
+update within a second is re-duplicated, backing off to every 8 s, rather than
+copying a pointer-only frame.
 
 ### Encoder reconfiguration
 

@@ -56,6 +56,11 @@ const LONG_OUTAGE: Duration = Duration::from_secs(3);
 /// How often the frame counters are logged.
 const STATS_PERIOD: Duration = Duration::from_secs(60);
 
+/// How long a session with nothing to show waits for a content update before
+/// it is re-duplicated, doubling up to [`MAX_EMPTY_SESSION_WAIT`].
+const EMPTY_SESSION_WAIT: Duration = Duration::from_secs(1);
+const MAX_EMPTY_SESSION_WAIT: Duration = Duration::from_secs(8);
+
 /// A desktop image copied into one of the duplicator's pooled textures.
 ///
 /// Cloning is cheap: it adds a COM reference to the same texture. Holding a
@@ -162,10 +167,13 @@ pub enum CaptureEvent {
 /// surface is not guaranteed to hold the desktop (on a new session it is
 /// black). If the last content change before the desktop goes idle was
 /// dropped by the decimator, the session is recreated once that change's slot
-/// is due (on a timeout or a pointer-only update); the first content update of
-/// a new session carries the whole desktop, so the change is still captured.
-/// That costs one `DuplicateOutput` per such idle transition and nothing in
-/// the steady state.
+/// has gone a whole frame interval without a content update (seen on a
+/// timeout or a pointer-only update); the first content update of a new
+/// session carries the whole desktop, so the change is still captured. That
+/// costs one `DuplicateOutput` per such idle transition and nothing during
+/// continuous motion. A new session with nothing to show yet (startup, or
+/// after a resize) that gets no content update within a second is
+/// re-duplicated, backing off to every 8 s on a static screen.
 ///
 /// When a session ends (`DXGI_ERROR_ACCESS_LOST` on a mode change or alt-tab,
 /// `DXGI_ERROR_INVALID_CALL` or access denied around a desktop switch), it is
@@ -214,6 +222,10 @@ pub struct DesktopDuplicator {
     resyncs: u64,
     stats: CaptureStats,
     stats_since: Instant,
+    /// When the current session was created.
+    session_started: Instant,
+    /// How long the next session with nothing to show may wait for content.
+    empty_wait: Duration,
 }
 
 impl DesktopDuplicator {
@@ -263,6 +275,8 @@ impl DesktopDuplicator {
             resyncs: 0,
             stats: CaptureStats::default(),
             stats_since: Instant::now(),
+            session_started: Instant::now(),
+            empty_wait: EMPTY_SESSION_WAIT,
         };
         match duplicator.recreate() {
             Ok(event) => duplicator.pending = event,
@@ -334,7 +348,22 @@ impl DesktopDuplicator {
                 self.duplication = Some(duplication);
             }
             match step {
-                Step::Event(event) => return Ok(event),
+                Step::Event(event) => {
+                    if self.empty_session_overdue() {
+                        self.stats.empty_resyncs = self.stats.empty_resyncs.saturating_add(1);
+                        tracing::debug!(
+                            waited = ?self.session_started.elapsed(),
+                            "no desktop content on a session with nothing to show; re-duplicating"
+                        );
+                        self.empty_wait = self
+                            .empty_wait
+                            .saturating_mul(2)
+                            .min(MAX_EMPTY_SESSION_WAIT);
+                        self.duplication = None;
+                        self.try_recover(Recovery::Empty)?;
+                    }
+                    return Ok(event);
+                }
                 Step::Dropped if remaining.is_zero() => return Ok(CaptureEvent::Timeout),
                 Step::Dropped => {}
                 Step::Lost => {
@@ -365,7 +394,7 @@ impl DesktopDuplicator {
         remaining: Duration,
     ) -> Result<Step, CaptureError> {
         let until_slot = if self.staleness == Staleness::DroppedChange {
-            self.time_until_slot()?
+            self.time_until_overdue()?
         } else {
             None
         };
@@ -381,8 +410,8 @@ impl DesktopDuplicator {
         match acquired {
             Ok(()) => {}
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                let slot_due = self.scheduler.is_due(qpc_counter()?);
-                return Ok(match on_timeout(self.staleness, slot_due) {
+                let overdue = self.scheduler.is_overdue(qpc_counter()?);
+                return Ok(match on_timeout(self.staleness, overdue) {
                     TimeoutAction::Resync => Step::Resync,
                     TimeoutAction::Report => Step::Event(CaptureEvent::Timeout),
                 });
@@ -419,6 +448,10 @@ impl DesktopDuplicator {
         let before = self.staleness;
         let action = decide(facts, &mut self.staleness, &mut self.scheduler);
         self.stats.record(facts, before, action);
+        if before == Staleness::NewSession && action == FrameAction::Copy {
+            self.stats
+                .record_first_content(self.session_started.elapsed());
+        }
         match action {
             FrameAction::Drop => Ok(Step::Dropped),
             FrameAction::Resync => Ok(Step::Resync),
@@ -431,9 +464,9 @@ impl DesktopDuplicator {
         }
     }
 
-    /// Time from now until the decimator's next slot opens.
-    fn time_until_slot(&self) -> Result<Option<Duration>, CaptureError> {
-        let Some(slot) = self.scheduler.next_admit_qpc() else {
+    /// Time from now until the decimator's pending slot is overdue.
+    fn time_until_overdue(&self) -> Result<Option<Duration>, CaptureError> {
+        let Some(slot) = self.scheduler.overdue_qpc() else {
             return Ok(None);
         };
         let now = qpc_counter()?;
@@ -454,6 +487,7 @@ impl DesktopDuplicator {
             return Err(CaptureError::UnsupportedFormat(desc.Format));
         }
         let (pool, resized) = pool_for(&mut self.pool, &self.device, desc.Width, desc.Height)?;
+        pool.filled = true;
         let Some(texture) = pool.textures.next().cloned() else {
             return Err(CaptureError::Invariant("the capture texture pool is empty"));
         };
@@ -469,6 +503,7 @@ impl DesktopDuplicator {
         self.last_timestamp = Some(timestamp);
         let sequence = self.next_sequence;
         self.next_sequence = sequence.saturating_add(1);
+        self.empty_wait = EMPTY_SESSION_WAIT;
         let frame = CaptureEvent::Frame(CapturedFrame {
             texture,
             width: desc.Width,
@@ -486,6 +521,18 @@ impl DesktopDuplicator {
         Ok(frame)
     }
 
+    /// Whether the session has gone `empty_wait` without the content update
+    /// that would give it something to show: it is new, and nothing of the
+    /// current size has been copied yet (startup, or after a resize). A
+    /// pointer-only frame is never copied instead, since its surface can be
+    /// black; re-duplicating is the documented way to get the full desktop.
+    fn empty_session_overdue(&self) -> bool {
+        self.staleness == Staleness::NewSession
+            && !self.pool.as_ref().is_some_and(|pool| pool.filled)
+            && self.duplication.is_some()
+            && self.session_started.elapsed() >= self.empty_wait
+    }
+
     /// Logs and restarts the periodic frame counters.
     fn log_stats(&mut self, now: Instant) {
         let stats = std::mem::take(&mut self.stats);
@@ -497,7 +544,10 @@ impl DesktopDuplicator {
             no_image = stats.no_image,
             resyncs = stats.resyncs,
             slowest_resync = ?stats.slowest_resync,
-            "capture stats (last 60 s)"
+            slowest_first_content = ?stats.slowest_first_content,
+            empty_resyncs = stats.empty_resyncs,
+            elapsed_s = now.saturating_duration_since(self.stats_since).as_secs(),
+            "capture stats"
         );
         self.stats_since = now;
     }
@@ -610,6 +660,7 @@ impl DesktopDuplicator {
         self.scheduler.reset();
         self.retry_at = None;
         self.staleness = Staleness::NewSession;
+        self.session_started = Instant::now();
         let (_, resized) = pool_for(&mut self.pool, &self.device, width, height)?;
         if first || resized {
             log_session(&output, &desc);
@@ -660,6 +711,8 @@ enum Recovery {
     Lost,
     /// The desktop went idle after a dropped change.
     Resync,
+    /// A session with nothing to show got no content update.
+    Empty,
 }
 
 impl Recovery {
@@ -667,6 +720,7 @@ impl Recovery {
         match self {
             Self::Lost => "session lost",
             Self::Resync => "idle resync",
+            Self::Empty => "no content on a new session",
         }
     }
 }
@@ -702,6 +756,8 @@ struct TexturePool {
     textures: RoundRobin<ID3D11Texture2D, TEXTURE_POOL_SIZE>,
     width: u32,
     height: u32,
+    /// A frame has been copied into the pool.
+    filled: bool,
 }
 
 impl TexturePool {
@@ -731,6 +787,7 @@ impl TexturePool {
             textures,
             width,
             height,
+            filled: false,
         })
     }
 }

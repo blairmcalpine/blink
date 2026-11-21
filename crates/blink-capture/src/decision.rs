@@ -52,7 +52,8 @@ pub(crate) enum FrameAction {
     /// Release without copying and keep waiting.
     Drop,
     /// Release without copying and recreate the session: a dropped change's
-    /// slot is due, but this frame has no image to deliver it with.
+    /// slot has gone a whole interval without a content update to deliver
+    /// it, and this frame has no image to deliver it with.
     Resync,
 }
 
@@ -63,15 +64,20 @@ pub(crate) enum FrameAction {
 /// update as "the desktop image was not updated", and on the first acquire
 /// of a new session that surface has never been written: copying it encodes
 /// a black frame. A dropped change waiting for its slot is delivered by the
-/// next content update or, once the slot is due, by a resync; a new session
-/// waits for its first content update.
+/// next content update or, once the slot is a whole interval overdue (the
+/// desktop went idle), by a resync; a new session waits for its first content
+/// update.
+///
+/// The overdue margin matters: at 144 Hz into 60 fps the next update lands
+/// up to 6.9 ms after the slot opens, so resyncing as soon as the slot opened
+/// would recreate the session on most frames of continuous motion.
 pub(crate) fn decide(
     frame: Acquired,
     staleness: &mut Staleness,
     scheduler: &mut FrameScheduler,
 ) -> FrameAction {
     if !frame.content_changed {
-        return if *staleness == Staleness::DroppedChange && scheduler.is_due(frame.qpc) {
+        return if *staleness == Staleness::DroppedChange && scheduler.is_overdue(frame.qpc) {
             FrameAction::Resync
         } else {
             FrameAction::Unchanged
@@ -107,6 +113,11 @@ pub(crate) struct CaptureStats {
     pub(crate) resyncs: u64,
     /// The slowest of those recreations.
     pub(crate) slowest_resync: Duration,
+    /// The longest a new session waited for its first content update.
+    pub(crate) slowest_first_content: Duration,
+    /// Sessions re-duplicated because they had nothing to show and got no
+    /// content update in time.
+    pub(crate) empty_resyncs: u64,
 }
 
 impl CaptureStats {
@@ -128,6 +139,11 @@ impl CaptureStats {
         *counter = counter.saturating_add(1);
     }
 
+    /// Records how long a new session waited for its first content update.
+    pub(crate) fn record_first_content(&mut self, waited: Duration) {
+        self.slowest_first_content = self.slowest_first_content.max(waited);
+    }
+
     /// Counts one resync that took `elapsed`.
     pub(crate) fn record_resync(&mut self, elapsed: Duration) {
         self.resyncs = self.resyncs.saturating_add(1);
@@ -140,16 +156,16 @@ impl CaptureStats {
 pub(crate) enum TimeoutAction {
     /// Report `Timeout`.
     Report,
-    /// The desktop went idle after a dropped change and its slot is due:
-    /// recreate the session, whose first acquire returns the full desktop, so
-    /// the last change is not lost.
+    /// The desktop went idle after a dropped change and its slot is a whole
+    /// interval overdue: recreate the session, whose first content update
+    /// carries the full desktop, so the last change is not lost.
     Resync,
 }
 
-/// Decides what an acquire timeout means. `slot_due` is whether the decimator
-/// would admit a frame now.
-pub(crate) fn on_timeout(staleness: Staleness, slot_due: bool) -> TimeoutAction {
-    if staleness == Staleness::DroppedChange && slot_due {
+/// Decides what an acquire timeout means. `overdue` is the decimator's
+/// [`is_overdue`](FrameScheduler::is_overdue) now.
+pub(crate) fn on_timeout(staleness: Staleness, overdue: bool) -> TimeoutAction {
+    if staleness == Staleness::DroppedChange && overdue {
         TimeoutAction::Resync
     } else {
         TimeoutAction::Report
@@ -157,7 +173,8 @@ pub(crate) fn on_timeout(staleness: Staleness, slot_due: bool) -> TimeoutAction 
 }
 
 /// The `AcquireNextFrame` timeout in milliseconds: the caller's `remaining`
-/// time, capped at `until_slot` while a dropped change waits for its slot.
+/// time, capped at `until_slot` (until the slot is overdue) while a dropped
+/// change waits.
 /// Rounds up so a sub-millisecond wait does not become a busy poll, and
 /// never returns INFINITE.
 pub(crate) fn acquire_timeout_ms(remaining: Duration, until_slot: Option<Duration>) -> u32 {
@@ -264,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn early_change_is_dropped_then_resynced_by_a_pointer_move_at_its_slot() {
+    fn early_change_is_dropped_then_resynced_by_a_pointer_move_once_overdue() {
         let mut s = scheduler();
         let mut staleness = Staleness::Fresh;
         assert_eq!(
@@ -276,16 +293,18 @@ mod tests {
             FrameAction::Drop
         );
         assert_eq!(staleness, Staleness::DroppedChange);
-        // Pointer moves before the slot do not copy yet.
+        let overdue = s.overdue_qpc().unwrap();
+        // Pointer moves before and after the slot opens, short of a whole
+        // interval past it, wait for a content update.
+        for qpc in [INTERVAL / 2, INTERVAL, overdue - 1] {
+            assert_eq!(
+                decide(pointer(qpc), &mut staleness, &mut s),
+                FrameAction::Unchanged
+            );
+            assert_eq!(staleness, Staleness::DroppedChange);
+        }
         assert_eq!(
-            decide(pointer(INTERVAL / 2), &mut staleness, &mut s),
-            FrameAction::Unchanged
-        );
-        assert_eq!(staleness, Staleness::DroppedChange);
-        // At the slot a pointer move cannot carry the dropped content, so
-        // the session is resynced.
-        assert_eq!(
-            decide(pointer(INTERVAL), &mut staleness, &mut s),
+            decide(pointer(overdue), &mut staleness, &mut s),
             FrameAction::Resync
         );
         // A content update at the slot delivers it directly.
@@ -297,17 +316,133 @@ mod tests {
     }
 
     #[test]
-    fn early_change_then_idle_resyncs_once_the_slot_is_due() {
+    fn early_change_then_idle_resyncs_once_the_slot_is_overdue() {
         let mut s = scheduler();
         let mut staleness = Staleness::Fresh;
         decide(changed(0), &mut staleness, &mut s);
         decide(changed(INTERVAL / 4), &mut staleness, &mut s);
         let slot = s.next_admit_qpc().unwrap();
+        let overdue = s.overdue_qpc().unwrap();
+        for qpc in [slot, overdue - 1] {
+            assert_eq!(
+                on_timeout(staleness, s.is_overdue(qpc)),
+                TimeoutAction::Report
+            );
+        }
         assert_eq!(
-            on_timeout(staleness, s.is_due(slot - 1)),
-            TimeoutAction::Report
+            on_timeout(staleness, s.is_overdue(overdue)),
+            TimeoutAction::Resync
         );
-        assert_eq!(on_timeout(staleness, s.is_due(slot)), TimeoutAction::Resync);
+    }
+
+    /// An acquired update in [`simulate`].
+    #[derive(Clone, Copy)]
+    enum Update {
+        Content(i64),
+        Pointer(i64),
+    }
+
+    impl Update {
+        const fn qpc(self) -> i64 {
+            match self {
+                Self::Content(qpc) | Self::Pointer(qpc) => qpc,
+            }
+        }
+    }
+
+    /// Drives `decide` and `on_timeout` the way the duplicator does: while a
+    /// dropped change is pending, `AcquireNextFrame` times out at the overdue
+    /// time if no update comes first. With `idle_after`, the desktop stays
+    /// idle after the last update. Returns `(copies, resyncs)`.
+    fn simulate(updates: &[Update], idle_after: bool) -> (usize, usize) {
+        let mut s = scheduler();
+        let mut staleness = Staleness::Fresh;
+        let (mut copies, mut resyncs) = (0, 0);
+        let mut resync = |s: &mut FrameScheduler, staleness: &mut Staleness| {
+            resyncs += 1;
+            s.reset();
+            *staleness = Staleness::NewSession;
+        };
+        let mut updates = updates.iter().copied().peekable();
+        loop {
+            let next = updates.peek().map(|update| update.qpc());
+            if next.is_none() && !idle_after {
+                break;
+            }
+            if staleness == Staleness::DroppedChange
+                && let Some(cap) = s.overdue_qpc()
+                && next.is_none_or(|next| cap < next)
+            {
+                assert_eq!(
+                    on_timeout(staleness, s.is_overdue(cap)),
+                    TimeoutAction::Resync
+                );
+                resync(&mut s, &mut staleness);
+                continue;
+            }
+            let Some(update) = updates.next() else {
+                break;
+            };
+            let frame = match update {
+                Update::Content(qpc) => changed(qpc),
+                Update::Pointer(qpc) => pointer(qpc),
+            };
+            match decide(frame, &mut staleness, &mut s) {
+                FrameAction::Copy => copies += 1,
+                FrameAction::Resync => resync(&mut s, &mut staleness),
+                FrameAction::Unchanged | FrameAction::Drop => {}
+            }
+        }
+        (copies, resyncs)
+    }
+
+    const HZ_144: i64 = QPC_HZ / 144;
+
+    fn content_at_144_hz(frames: i64) -> Vec<Update> {
+        (0..frames).map(|i| Update::Content(i * HZ_144)).collect()
+    }
+
+    #[test]
+    fn continuous_motion_at_144_hz_never_resyncs() {
+        let (copies, resyncs) = simulate(&content_at_144_hz(1440), false);
+        assert_eq!(resyncs, 0);
+        assert!((590..=601).contains(&copies), "copied {copies}");
+
+        // Pointer moves between the content updates change nothing.
+        let mixed: Vec<Update> = (0..1440)
+            .flat_map(|i| {
+                [
+                    Update::Content(i * HZ_144),
+                    Update::Pointer(i * HZ_144 + HZ_144 / 2),
+                ]
+            })
+            .collect();
+        assert_eq!(simulate(&mixed, false).1, 0);
+    }
+
+    /// 144 Hz content up to and including the first dropped update after a
+    /// second of motion, so the desktop goes idle with a change pending.
+    fn motion_ending_in_a_dropped_change() -> Vec<Update> {
+        let mut s = scheduler();
+        let last = (0..=144).filter(|&i| !s.admit(i * HZ_144)).last().unwrap();
+        content_at_144_hz(last + 1)
+    }
+
+    #[test]
+    fn idle_after_a_dropped_change_resyncs_exactly_once() {
+        let updates = motion_ending_in_a_dropped_change();
+        assert_eq!(simulate(&updates, true).1, 1);
+
+        // Same with the pointer still moving through the idle period.
+        let end = updates.last().unwrap().qpc();
+        let mut with_pointer = updates;
+        with_pointer.extend((1..100).map(|i| Update::Pointer(end + i * HZ_144)));
+        assert_eq!(simulate(&with_pointer, true).1, 1);
+
+        // Idle after an admitted update leaves nothing to resync.
+        let mut admitted = motion_ending_in_a_dropped_change();
+        admitted.pop();
+        assert_eq!(simulate(&admitted, true).1, 0);
     }
 
     #[test]
@@ -345,6 +480,8 @@ mod tests {
         stats.record(missing, Staleness::Fresh, FrameAction::Drop);
         stats.record_resync(Duration::from_millis(3));
         stats.record_resync(Duration::from_millis(1));
+        stats.record_first_content(Duration::from_millis(40));
+        stats.record_first_content(Duration::from_millis(20));
         assert_eq!(
             stats,
             CaptureStats {
@@ -355,6 +492,8 @@ mod tests {
                 no_image: 1,
                 resyncs: 2,
                 slowest_resync: Duration::from_millis(3),
+                slowest_first_content: Duration::from_millis(40),
+                empty_resyncs: 0,
             }
         );
     }
