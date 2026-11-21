@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  # Finishes a release left as a draft, once its tag already exists.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the draft release to package and publish, such as v1.2.3.
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  # Tags v{version} and opens a draft GitHub release when the workspace version
+  # has no tag yet, that is, when a release PR (or the first release) merges.
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      tag: ${{ steps.released.outputs.tag || steps.requested.outputs.tag }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'push'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        if: github.event_name == 'push'
+        run: rustup show
+
+      - name: release-plz release
+        if: github.event_name == 'push'
+        id: release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+          version: "0.4.3"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find the blink tag
+        if: github.event_name == 'push'
+        id: released
+        env:
+          RELEASES: ${{ steps.release-plz.outputs.releases }}
+        run: |
+          tag="$(jq -r '.[] | select(.package_name == "blink-app") | .tag' <<< "${RELEASES:-[]}")"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the requested draft release
+        if: github.event_name == 'workflow_dispatch'
+        id: requested
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The tag input must look like v1.2.3."
+            exit 1
+          fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "::error::${TAG} is not a draft release."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+  # Opens or updates the release PR. Waits for `release` so it sees a new tag.
+  release-pr:
+    name: release-pr
+    needs: release
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    # Queues rather than cancels, so the newest push to main always gets a run.
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      # Pull requests opened with GITHUB_TOKEN do not trigger CI.
+      - name: release-plz release-pr
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+          version: "0.4.3"
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  package:
+    name: package
+    needs: release
+    if: needs.release.outputs.tag != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/package-windows.yml
+    with:
+      ref: ${{ needs.release.outputs.tag }}
+
+  publish:
+    name: publish
+    needs: [release, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.release.outputs.tag }}
+    steps:
+      - name: Download the MSI
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: blink-msi
+          path: dist
+
+      - name: Attach the MSI to the release
+        run: gh release upload "$TAG" dist/* --clobber
+
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false --latest

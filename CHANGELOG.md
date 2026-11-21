@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1]
+
 ### Added
 
 - `blink-capture`: DXGI Desktop Duplication into a pool of GPU textures, with
@@ -29,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `blink-app`: the tray app that wires the pipeline together, with the save
   hotkey, live settings reload, clip saving off the hot path, and file logging
   with crash reports.
+- A per-user Windows installer (MSI) that needs no administrator rights, and
+  an icon, version information, and application manifest embedded in
+  `blink.exe`, which links the C runtime statically.
+- Releases cut by release-plz from Conventional Commit titles, with the MSI
+  and its SHA-256 checksum attached to each GitHub release.
 - Strict workspace lints, `just` recipes, `lefthook` hooks, and CI covering
   formatting, clippy on the host and Windows target, tests, Miri, dependencies,
   and documentation.

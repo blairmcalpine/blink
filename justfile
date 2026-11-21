@@ -83,6 +83,11 @@ notices-check:
         exit 1
     fi
 
+# Regenerate crates/blink-app/assets/blink.ico from the tray icon drawing.
+# `just test` fails while it is out of date.
+icon:
+    BLINK_WRITE_ICON=1 cargo test --quiet -p blink-app --bin blink -- icon::tests::ico_is_current
+
 # cargo-about's crate licenses, then the licenses of the fonts egui embeds,
 # which are in epaint_default_fonts but not its package metadata.
 _notices out:

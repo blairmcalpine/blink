@@ -15,3 +15,5 @@ trak = "trak"
 # header's own spelling of `NV_ENC_ERR_EVENT_NOT_REGISTERD`.
 ptd = "ptd"
 registerd = "registerd"
+# WiX's suppress-ICE flag.
+sice = "sice"

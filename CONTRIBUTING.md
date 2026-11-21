@@ -95,7 +95,8 @@ It must pass. CI runs the same set of checks.
 | `just machete` | Detect unused dependencies |
 | `just notices-check` | Fail if `THIRD-PARTY-NOTICES.txt` is out of date |
 | `just notices` | Regenerate `THIRD-PARTY-NOTICES.txt`; run it after any dependency change |
-| `just check` | All of the above except `just fmt` and `just notices` |
+| `just icon` | Regenerate `crates/blink-app/assets/blink.ico` after changing the tray icon drawing |
+| `just check` | All of the above except `just fmt`, `just notices`, and `just icon` |
 
 ## Code rules
 
@@ -160,6 +161,53 @@ change.
 
 - Keep changes focused. Small PRs get reviewed faster.
 - Open pull requests as drafts until they are ready for review.
+- Title the PR as a [Conventional Commit](https://www.conventionalcommits.org/),
+  such as `feat: add a clip-saved sound` or `fix(capture): recover from a TDR`.
+  PRs are squash-merged with the title as the commit message, and releases are
+  versioned from those messages. A CI check flags other titles. Commits inside
+  the PR can say whatever helps review.
 - Fill in the template, including the checklist and the smoke-test section.
 - By contributing you agree that your contribution is dual licensed under MIT
   and Apache-2.0, as described in the README.
+
+## Releasing
+
+Releases are cut by [release-plz](https://release-plz.dev), configured in
+`release-plz.toml` and run by `.github/workflows/release.yml` on every push to
+`main`. Git tags are the source of truth: the last release is the newest
+`v{version}` tag, and nothing is published to crates.io. Every crate shares the
+workspace version, and the release covers them all.
+
+1. After a merge to `main`, release-plz opens or updates a release PR titled
+   `chore: release v{version}`. It bumps the workspace version from the
+   Conventional Commits since the last tag and adds their entries to
+   `CHANGELOG.md`. While the version is `0.x`, a breaking change bumps the
+   minor version and anything else bumps the patch. Edit the changelog in that
+   PR if the generated wording needs work.
+2. Merging the release PR tags the merge commit `v{version}` and creates a
+   draft GitHub release whose notes are the new changelog entry.
+3. The same workflow builds the MSI from the tag on `windows-latest`, attaches
+   it and its `.sha256` file to the release, and publishes the release.
+
+If packaging fails, the release stays a draft. If the cause was transient,
+use **Re-run failed jobs**; re-running all jobs does nothing, because the tag
+already exists. To finish a draft from a later run, start the Release workflow
+from the Actions tab with the draft's tag, such as `v1.2.3`; it skips
+release-plz, then packages and publishes that draft. If the fix needs code,
+delete the draft release and its tag and merge the fix; the next push to
+`main` releases the same version again.
+
+### Building the installer
+
+On Windows, with the pinned Rust toolchain, the Visual Studio C++ build tools,
+the .NET SDK, and WiX Toolset 5 (the commands are in
+`packaging/windows/build-msi.ps1`):
+
+```powershell
+./packaging/windows/build-exe.ps1
+./packaging/windows/build-msi.ps1
+```
+
+The MSI lands in `dist/`. `.github/workflows/package-windows.yml` runs the same
+scripts for pull requests that touch packaging inputs, and on demand from the
+Actions tab, and uploads the MSI as an artifact.

@@ -1,0 +1,5 @@
+# Link the C runtime statically so blink.exe runs without the Visual C++
+# redistributable. A RUSTFLAGS environment variable replaces these flags
+# instead of adding to them; packaging/windows/build-exe.ps1 checks the result.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

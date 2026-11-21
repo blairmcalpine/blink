@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The blink installer, for WiX Toolset v5. Build it with build-msi.ps1, which
+  supplies Version, BlinkExe, and RepoRoot.
+
+  A per-user install into %LOCALAPPDATA%\Programs\blink, so it never asks for
+  elevation. Windows Installer requires every component under the user profile
+  to use an HKCU registry value as its key path (ICE38) and to remove the
+  folders it creates (ICE64).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="blink"
+           Manufacturer="The blink contributors"
+           Version="$(var.Version)"
+           UpgradeCode="D94F1B47-E513-40C2-B103-1D08FA9A5994"
+           Language="1033"
+           Scope="perUser"
+           Compressed="yes">
+    <!--
+      Every build has a new ProductCode, so allowing same-version upgrades
+      makes a rebuilt MSI replace the installed one rather than install beside it.
+    -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of blink is already installed. To install this older version, uninstall blink from Installed apps in Windows Settings first." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="blink.ico" SourceFile="$(var.RepoRoot)\crates\blink-app\assets\blink.ico" />
+    <Property Id="ARPPRODUCTICON" Value="blink.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/blairmcalpine/blink" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/blairmcalpine/blink/issues" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!--
+      blink runs in the tray, so it is usually running during an upgrade or
+      uninstall. Ending it before any file is removed avoids a reboot to
+      replace an in-use blink.exe. blink does not exit when Restart Manager
+      asks it to, so Restart Manager is disabled; otherwise it would prompt
+      about files in use, or report a needed reboot in a quiet install.
+    -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <util:CloseApplication Id="CloseBlink" Target="blink.exe" RebootPrompt="no" TerminateProcess="1" />
+    <InstallExecuteSequence>
+      <Custom Action="override Wix4CloseApplications_$(sys.BUILDARCHSHORT)" After="InstallInitialize" />
+    </InstallExecuteSequence>
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="blink">
+          <Component Id="Executable" Guid="CD92EC3F-4E74-47A5-9CB4-CEC4D73A7062">
+            <File Id="blink.exe" Source="$(var.BlinkExe)" Name="blink.exe" />
+            <RegistryValue Root="HKCU" Key="Software\blink\Installer" Name="Executable" Type="integer" Value="1" KeyPath="yes" />
+            <RemoveFolder Id="RemoveInstallFolder" Directory="INSTALLFOLDER" On="uninstall" />
+            <RemoveFolder Id="RemoveLocalProgramsFolder" Directory="LocalProgramsFolder" On="uninstall" />
+          </Component>
+          <Component Id="Notices" Guid="9BCC226B-1E3B-4F23-A8C8-C881B6168075">
+            <File Id="LICENSE_MIT" Source="$(var.RepoRoot)\LICENSE-MIT" Name="LICENSE-MIT" />
+            <File Id="LICENSE_APACHE" Source="$(var.RepoRoot)\LICENSE-APACHE" Name="LICENSE-APACHE" />
+            <File Id="THIRD_PARTY_NOTICES" Source="$(var.RepoRoot)\THIRD-PARTY-NOTICES.txt" Name="THIRD-PARTY-NOTICES.txt" />
+            <RegistryValue Root="HKCU" Key="Software\blink\Installer" Name="Notices" Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="A8DEDF48-268F-4798-A202-6207DCDF9D39">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="blink"
+                  Description="Save the last seconds of your screen as a clip"
+                  Target="[INSTALLFOLDER]blink.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU" Key="Software\blink\Installer" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentRef Id="Executable" />
+      <ComponentRef Id="Notices" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>
