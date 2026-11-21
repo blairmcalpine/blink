@@ -17,7 +17,12 @@
            Language="1033"
            Scope="perUser"
            Compressed="yes">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of blink is already installed. To install this older version, uninstall blink from Installed apps in Windows Settings first." />
+    <!--
+      Every build has a new ProductCode, so allowing same-version upgrades
+      makes a rebuilt MSI replace the installed one rather than install beside it.
+    -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of blink is already installed. To install this older version, uninstall blink from Installed apps in Windows Settings first." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="blink.ico" SourceFile="$(var.RepoRoot)\crates\blink-app\assets\blink.ico" />
@@ -29,8 +34,11 @@
     <!--
       blink runs in the tray, so it is usually running during an upgrade or
       uninstall. Ending it before any file is removed avoids a reboot to
-      replace an in-use blink.exe.
+      replace an in-use blink.exe. blink does not exit when Restart Manager
+      asks it to, so Restart Manager is disabled; otherwise it would prompt
+      about files in use, or report a needed reboot in a quiet install.
     -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
     <util:CloseApplication Id="CloseBlink" Target="blink.exe" RebootPrompt="no" TerminateProcess="1" />
     <InstallExecuteSequence>
       <Custom Action="override Wix4CloseApplications_$(sys.BUILDARCHSHORT)" After="InstallInitialize" />
