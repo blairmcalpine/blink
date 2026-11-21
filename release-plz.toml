@@ -1,0 +1,35 @@
+# https://release-plz.dev/docs/config
+#
+# blink ships one product. Every crate shares the workspace version, and a
+# release is a single `v{version}` tag and GitHub release made from blink-app,
+# whose changelog is the root CHANGELOG.md and covers commits to every crate.
+# The library crates still take part so their commits reach that changelog.
+
+[workspace]
+# Nothing goes to a registry: the last release is the newest matching tag.
+git_only = true
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+git_release_enable = false
+changelog_update = false
+semver_check = false
+
+[[package]]
+name = "blink-app"
+git_tag_enable = true
+git_release_enable = true
+git_release_name = "v{{ version }}"
+# .github/workflows/release.yml publishes it once the installer is attached.
+git_release_draft = true
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = [
+    "blink-audio",
+    "blink-capture",
+    "blink-config",
+    "blink-encode",
+    "blink-mux",
+    "blink-ring",
+    "blink-sys",
+    "blink-ui",
+]
