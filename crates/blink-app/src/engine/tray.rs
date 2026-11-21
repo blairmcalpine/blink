@@ -52,7 +52,7 @@ impl Tray {
         ])
         .context("failed to build the tray menu")?;
 
-        let icon = Icon::from_rgba(rgba(), ICON_SIZE, ICON_SIZE)
+        let icon = Icon::from_rgba(rgba(ICON_SIZE), ICON_SIZE, ICON_SIZE)
             .context("failed to build the tray icon image")?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
