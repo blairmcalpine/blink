@@ -26,7 +26,10 @@ changing capture, encode, ring, or mux code.
 - `just fmt`, `just lint` (host + Windows clippy via `cargo xwin`), `just test`,
   `just miri`, `just deny`, `just doc`, `just machete`.
 - `just notices` regenerates `THIRD-PARTY-NOTICES.txt` after dependency
-  changes; `just check` fails if it is stale.
+  changes; `just check` fails if it is stale. `just icon` does the same for
+  `crates/blink-app/assets/blink.ico` after tray icon changes.
+- PR titles are Conventional Commits (`feat: ...`, `fix(capture): ...`);
+  release-plz versions releases from them (see CONTRIBUTING.md, Releasing).
 
 The toolchain is pinned in `rust-toolchain.toml`. Do not change it, the lint
 table, or `clippy.toml` to make code pass.

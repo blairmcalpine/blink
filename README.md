@@ -28,6 +28,24 @@ edges.
 blink does not ship or redistribute NVIDIA binaries; the encoder library is
 loaded from the installed driver at runtime.
 
+## Install
+
+Download `blink-<version>-x86_64.msi` from the
+[latest release](https://github.com/blairmcalpine/blink/releases/latest) and
+run it. It installs blink for your user only, into
+`%LOCALAPPDATA%\Programs\blink`, without asking for administrator rights, and
+adds blink to the Start menu. Each release also has a `.sha256` file with the
+installer's checksum.
+
+The installer is not code-signed yet, so Microsoft Defender SmartScreen may
+warn that it is from an unknown publisher. Select **More info**, then
+**Run anyway**.
+
+Installing a newer release upgrades blink in place. To remove it, uninstall
+blink from **Settings > Apps > Installed apps**. Uninstalling keeps your
+settings (`%APPDATA%\blink`), logs (`%LOCALAPPDATA%\blink\logs`), and saved
+clips.
+
 ## Building
 
 The workspace builds and lints on macOS and Linux as well as Windows. Windows
