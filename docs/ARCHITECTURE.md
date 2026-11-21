@@ -257,6 +257,12 @@ A process can hold one duplication per output, and `DuplicateOutput` returns
 duplicator drops its session before recreating it, including on the idle
 resync after a dropped change.
 
+Only frames with new desktop content (`LastPresentTime != 0`) are copied. A
+pointer-only update's surface is not guaranteed to hold the desktop, and on
+a new session it is black, so copying one encodes a black frame. A new
+session therefore waits for its first content update, and a dropped change
+whose slot comes due with only pointer updates is delivered by a resync.
+
 ### Encoder reconfiguration
 
 Create the NVENC session once, with its maximum width and height set to the

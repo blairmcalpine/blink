@@ -29,6 +29,9 @@ use crate::status::CaptureState;
 /// static-screen IDR refresh is noticed.
 const POLL: Duration = Duration::from_millis(100);
 
+/// How often the encode counters are logged.
+const STATS_PERIOD: Duration = Duration::from_secs(60);
+
 const _: () = assert!(
     blink_capture::TEXTURE_POOL_SIZE <= blink_encode::MAX_REGISTERED_TEXTURES,
     "every pooled capture texture must stay registered with NVENC"
@@ -185,8 +188,11 @@ fn session(
         paused: false,
         last_frame: None,
         last_pts: None,
+        stats: EncodeStats::default(),
+        stats_since: Instant::now(),
     };
     while !stop.is_stopped() {
+        state.log_stats();
         match duplicator.next_frame(POLL)? {
             CaptureEvent::ModeChanged { width, height } => {
                 state.mode_changed(&device, run, width, height)?;
@@ -225,6 +231,17 @@ struct State<'a> {
     last_frame: Option<CapturedFrame>,
     /// Timestamp of the last encoded frame; encode timestamps must increase.
     last_pts: Option<Timestamp>,
+    stats: EncodeStats,
+    stats_since: Instant,
+}
+
+/// Counters for the periodic encode summary.
+#[derive(Default)]
+struct EncodeStats {
+    /// Captured frames encoded.
+    encoded: u64,
+    /// Static-screen IDR refreshes that re-encoded the last frame.
+    refreshed: u64,
 }
 
 impl State<'_> {
@@ -298,6 +315,9 @@ impl State<'_> {
         }
         let pts = next_pts(self.last_pts, frame.timestamp());
         let encoded = self.encode(&frame, pts)?;
+        if encoded {
+            self.stats.encoded = self.stats.encoded.saturating_add(1);
+        }
         self.last_frame = Some(frame);
         Ok(encoded)
     }
@@ -318,7 +338,23 @@ impl State<'_> {
         };
         let result = self.encode(&frame, now);
         self.last_frame = Some(frame);
+        if matches!(result, Ok(true)) {
+            self.stats.refreshed = self.stats.refreshed.saturating_add(1);
+        }
         result.map(drop)
+    }
+
+    fn log_stats(&mut self) {
+        if self.stats_since.elapsed() < STATS_PERIOD {
+            return;
+        }
+        let stats = std::mem::take(&mut self.stats);
+        tracing::info!(
+            encoded = stats.encoded,
+            refreshed = stats.refreshed,
+            "encode stats (last 60 s)"
+        );
+        self.stats_since = Instant::now();
     }
 
     fn encode(&mut self, frame: &CapturedFrame, pts: Timestamp) -> Result<bool, Failure> {

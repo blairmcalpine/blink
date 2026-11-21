@@ -51,27 +51,35 @@ pub(crate) enum FrameAction {
     Unchanged,
     /// Release without copying and keep waiting.
     Drop,
+    /// Release without copying and recreate the session: a dropped change's
+    /// slot is due, but this frame has no image to deliver it with.
+    Resync,
 }
 
 /// Decides what to do with `frame`, consuming a decimation slot when it is
 /// copied, and updates `staleness`.
 ///
-/// A pointer-only update still carries the full current desktop image, so
-/// while the desktop is ahead of the last copy it can deliver that content.
+/// Only frames with new content are copied. DXGI documents a pointer-only
+/// update as "the desktop image was not updated", and on the first acquire
+/// of a new session that surface has never been written: copying it encodes
+/// a black frame. A dropped change waiting for its slot is delivered by the
+/// next content update or, once the slot is due, by a resync; a new session
+/// waits for its first content update.
 pub(crate) fn decide(
     frame: Acquired,
     staleness: &mut Staleness,
     scheduler: &mut FrameScheduler,
 ) -> FrameAction {
-    if !frame.content_changed && *staleness == Staleness::Fresh {
-        return FrameAction::Unchanged;
+    if !frame.content_changed {
+        return if *staleness == Staleness::DroppedChange && scheduler.is_due(frame.qpc) {
+            FrameAction::Resync
+        } else {
+            FrameAction::Unchanged
+        };
     }
     if !scheduler.admit(frame.qpc) {
-        if frame.content_changed {
-            *staleness = Staleness::DroppedChange;
-            return FrameAction::Drop;
-        }
-        return FrameAction::Unchanged;
+        *staleness = Staleness::DroppedChange;
+        return FrameAction::Drop;
     }
     if !frame.has_image {
         *staleness = Staleness::DroppedChange;
@@ -79,6 +87,52 @@ pub(crate) fn decide(
     }
     *staleness = Staleness::Fresh;
     FrameAction::Copy
+}
+
+/// Frame counters for the duplicator's periodic summary log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CaptureStats {
+    /// Frames copied into the pool and emitted.
+    pub(crate) copied: u64,
+    /// Content updates dropped by the decimator.
+    pub(crate) dropped: u64,
+    /// Updates where only the pointer moved.
+    pub(crate) pointer_only: u64,
+    /// Pointer-only updates on a session with nothing copied yet; earlier
+    /// versions copied these and encoded black frames.
+    pub(crate) new_session_pointer_only: u64,
+    /// Content updates that came without a desktop resource.
+    pub(crate) no_image: u64,
+    /// Sessions recreated to deliver a dropped change.
+    pub(crate) resyncs: u64,
+    /// The slowest of those recreations.
+    pub(crate) slowest_resync: Duration,
+}
+
+impl CaptureStats {
+    /// Counts one acquired frame, given the staleness before [`decide`] ran
+    /// and its answer.
+    pub(crate) fn record(&mut self, frame: Acquired, before: Staleness, action: FrameAction) {
+        let counter = if !frame.content_changed {
+            if before == Staleness::NewSession {
+                self.new_session_pointer_only = self.new_session_pointer_only.saturating_add(1);
+            }
+            &mut self.pointer_only
+        } else if !frame.has_image {
+            &mut self.no_image
+        } else if action == FrameAction::Copy {
+            &mut self.copied
+        } else {
+            &mut self.dropped
+        };
+        *counter = counter.saturating_add(1);
+    }
+
+    /// Counts one resync that took `elapsed`.
+    pub(crate) fn record_resync(&mut self, elapsed: Duration) {
+        self.resyncs = self.resyncs.saturating_add(1);
+        self.slowest_resync = self.slowest_resync.max(elapsed);
+    }
 }
 
 /// What to do when `AcquireNextFrame` times out.
@@ -152,14 +206,46 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_of_session_is_copied_even_without_new_content() {
+    fn new_session_waits_for_content_before_copying() {
         let mut s = scheduler();
         let mut staleness = Staleness::NewSession;
         assert_eq!(
             decide(pointer(0), &mut staleness, &mut s),
+            FrameAction::Unchanged
+        );
+        assert_eq!(staleness, Staleness::NewSession);
+        // Nothing to resync for: the session never dropped a change.
+        assert_eq!(
+            decide(pointer(INTERVAL * 5), &mut staleness, &mut s),
+            FrameAction::Unchanged
+        );
+        assert_eq!(
+            on_timeout(staleness, s.is_due(INTERVAL * 5)),
+            TimeoutAction::Report
+        );
+        assert_eq!(
+            decide(changed(INTERVAL * 6), &mut staleness, &mut s),
             FrameAction::Copy
         );
         assert_eq!(staleness, Staleness::Fresh);
+    }
+
+    #[test]
+    fn pointer_only_frames_are_never_copied() {
+        for start in [
+            Staleness::Fresh,
+            Staleness::NewSession,
+            Staleness::DroppedChange,
+        ] {
+            for qpc in [0, INTERVAL / 2, INTERVAL, INTERVAL * 10] {
+                let mut s = scheduler();
+                let mut staleness = start;
+                assert_ne!(
+                    decide(pointer(qpc), &mut staleness, &mut s),
+                    FrameAction::Copy
+                );
+            }
+        }
     }
 
     #[test]
@@ -178,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn early_change_is_dropped_then_delivered_by_a_pointer_move() {
+    fn early_change_is_dropped_then_resynced_by_a_pointer_move_at_its_slot() {
         let mut s = scheduler();
         let mut staleness = Staleness::Fresh;
         assert_eq!(
@@ -196,9 +282,15 @@ mod tests {
             FrameAction::Unchanged
         );
         assert_eq!(staleness, Staleness::DroppedChange);
-        // At the slot, a pointer move carries the dropped content.
+        // At the slot a pointer move cannot carry the dropped content, so
+        // the session is resynced.
         assert_eq!(
             decide(pointer(INTERVAL), &mut staleness, &mut s),
+            FrameAction::Resync
+        );
+        // A content update at the slot delivers it directly.
+        assert_eq!(
+            decide(changed(INTERVAL), &mut staleness, &mut s),
             FrameAction::Copy
         );
         assert_eq!(staleness, Staleness::Fresh);
@@ -237,6 +329,34 @@ mod tests {
         };
         assert_eq!(decide(missing, &mut staleness, &mut s), FrameAction::Drop);
         assert_eq!(staleness, Staleness::DroppedChange);
+    }
+
+    #[test]
+    fn stats_count_each_kind_of_frame() {
+        let mut stats = CaptureStats::default();
+        stats.record(changed(0), Staleness::Fresh, FrameAction::Copy);
+        stats.record(changed(1), Staleness::Fresh, FrameAction::Drop);
+        stats.record(pointer(2), Staleness::Fresh, FrameAction::Unchanged);
+        stats.record(pointer(3), Staleness::NewSession, FrameAction::Unchanged);
+        let missing = Acquired {
+            has_image: false,
+            ..changed(4)
+        };
+        stats.record(missing, Staleness::Fresh, FrameAction::Drop);
+        stats.record_resync(Duration::from_millis(3));
+        stats.record_resync(Duration::from_millis(1));
+        assert_eq!(
+            stats,
+            CaptureStats {
+                copied: 1,
+                dropped: 1,
+                pointer_only: 2,
+                new_session_pointer_only: 1,
+                no_image: 1,
+                resyncs: 2,
+                slowest_resync: Duration::from_millis(3),
+            }
+        );
     }
 
     #[test]

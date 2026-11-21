@@ -21,8 +21,8 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::Interface;
 
 use crate::decision::{
-    Acquired, FrameAction, Staleness, TimeoutAction, acquire_timeout_ms, decide, monotonic,
-    on_timeout,
+    Acquired, CaptureStats, FrameAction, Staleness, TimeoutAction, acquire_timeout_ms, decide,
+    monotonic, on_timeout,
 };
 use crate::error::{CaptureError, Context, is_session_lost};
 use crate::rotation::RoundRobin;
@@ -52,6 +52,9 @@ const MAX_RETRY_DELAY: Duration = Duration::from_millis(500);
 /// How long a lost session may stay unrecoverable before it is logged as a
 /// warning rather than at debug level.
 const LONG_OUTAGE: Duration = Duration::from_secs(3);
+
+/// How often the frame counters are logged.
+const STATS_PERIOD: Duration = Duration::from_secs(60);
 
 /// A desktop image copied into one of the duplicator's pooled textures.
 ///
@@ -155,11 +158,14 @@ pub enum CaptureEvent {
 /// the pointer, are released without a copy. The steady state performs no
 /// heap allocation.
 ///
-/// If the last content change before the desktop goes idle was dropped by the
-/// decimator, the session is recreated once that change's slot is due; the
-/// first acquire of a new session returns the whole desktop, so the change is
-/// still captured. That costs one `DuplicateOutput` per such idle transition
-/// and nothing in the steady state.
+/// Only frames with new desktop content are copied; a pointer-only update's
+/// surface is not guaranteed to hold the desktop (on a new session it is
+/// black). If the last content change before the desktop goes idle was
+/// dropped by the decimator, the session is recreated once that change's slot
+/// is due (on a timeout or a pointer-only update); the first content update of
+/// a new session carries the whole desktop, so the change is still captured.
+/// That costs one `DuplicateOutput` per such idle transition and nothing in
+/// the steady state.
 ///
 /// When a session ends (`DXGI_ERROR_ACCESS_LOST` on a mode change or alt-tab,
 /// `DXGI_ERROR_INVALID_CALL` or access denied around a desktop switch), it is
@@ -204,8 +210,10 @@ pub struct DesktopDuplicator {
     logged_protected: bool,
     last_timestamp: Option<Timestamp>,
     next_sequence: u64,
-    /// Sessions recreated to resync an idle desktop.
+    /// Sessions recreated to deliver a dropped change.
     resyncs: u64,
+    stats: CaptureStats,
+    stats_since: Instant,
 }
 
 impl DesktopDuplicator {
@@ -253,6 +261,8 @@ impl DesktopDuplicator {
             last_timestamp: None,
             next_sequence: 0,
             resyncs: 0,
+            stats: CaptureStats::default(),
+            stats_since: Instant::now(),
         };
         match duplicator.recreate() {
             Ok(event) => duplicator.pending = event,
@@ -294,7 +304,11 @@ impl DesktopDuplicator {
     /// frames until a later call recreates it, and since recreation is not
     /// expected to succeed, callers should rebuild the device and duplicator.
     pub fn next_frame(&mut self, timeout: Duration) -> Result<CaptureEvent, CaptureError> {
-        let deadline = Instant::now().checked_add(timeout);
+        let now = Instant::now();
+        if now.saturating_duration_since(self.stats_since) >= STATS_PERIOD {
+            self.log_stats(now);
+        }
+        let deadline = now.checked_add(timeout);
         loop {
             if let Some(event) = self.pending.take() {
                 return Ok(event);
@@ -331,11 +345,13 @@ impl DesktopDuplicator {
                     self.resyncs = self.resyncs.saturating_add(1);
                     let started = Instant::now();
                     self.try_recover(Recovery::Resync)?;
+                    let elapsed = started.elapsed();
+                    self.stats.record_resync(elapsed);
                     tracing::debug!(
-                        elapsed = ?started.elapsed(),
+                        ?elapsed,
                         resyncs = self.resyncs,
                         recovering = self.is_recovering(),
-                        "resynced the session after a dropped change went idle"
+                        "resynced the session to deliver a dropped change"
                     );
                 }
             }
@@ -400,13 +416,12 @@ impl DesktopDuplicator {
             has_image: resource.is_some(),
             qpc,
         };
-        match decide(facts, &mut self.staleness, &mut self.scheduler) {
-            FrameAction::Drop => {
-                if !facts.has_image {
-                    tracing::debug!("admitted frame had no desktop resource; will resync");
-                }
-                Ok(Step::Dropped)
-            }
+        let before = self.staleness;
+        let action = decide(facts, &mut self.staleness, &mut self.scheduler);
+        self.stats.record(facts, before, action);
+        match action {
+            FrameAction::Drop => Ok(Step::Dropped),
+            FrameAction::Resync => Ok(Step::Resync),
             FrameAction::Unchanged => Ok(Step::Event(CaptureEvent::Unchanged {
                 timestamp: self.clock.to_ticks(qpc),
             })),
@@ -469,6 +484,22 @@ impl DesktopDuplicator {
             });
         }
         Ok(frame)
+    }
+
+    /// Logs and restarts the periodic frame counters.
+    fn log_stats(&mut self, now: Instant) {
+        let stats = std::mem::take(&mut self.stats);
+        tracing::info!(
+            copied = stats.copied,
+            dropped = stats.dropped,
+            pointer_only = stats.pointer_only,
+            new_session_pointer_only = stats.new_session_pointer_only,
+            no_image = stats.no_image,
+            resyncs = stats.resyncs,
+            slowest_resync = ?stats.slowest_resync,
+            "capture stats (last 60 s)"
+        );
+        self.stats_since = now;
     }
 
     /// Sleeps until the next retry is due. Returns `false` if that is later
