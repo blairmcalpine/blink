@@ -10,7 +10,7 @@ WiX Toolset 5 and its Util extension:
     wix extension add --global WixToolset.Util.wixext/5.0.2
 
 Warnings, including those from the ICE validation that follows the build,
-are errors.
+are errors, except ICE91.
 #>
 [CmdletBinding()]
 param()
@@ -40,7 +40,9 @@ if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)$' -or [int]$Matches[1] -gt 255 -or 
 }
 
 $msi = Join-Path $dist "blink-$version-x86_64.msi"
+# ICE91 warns that per-user files are not copied to every profile in a
+# per-machine install; Scope="perUser" means there never is one.
 wix build (Join-Path $PSScriptRoot 'blink.wxs') -arch x64 -ext WixToolset.Util.wixext `
-    -d "Version=$version" -d "BlinkExe=$exe" -d "RepoRoot=$root" -wx -o $msi
-wix msi validate -wx $msi
+    -d "Version=$version" -d "BlinkExe=$exe" -d "RepoRoot=$root" -sice ICE91 -wx -o $msi
+wix msi validate -sice ICE91 -wx $msi
 Write-Output $msi
