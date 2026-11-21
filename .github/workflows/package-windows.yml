@@ -10,7 +10,7 @@ on:
       - "Cargo.toml"
       - "LICENSE-*"
       - "THIRD-PARTY-NOTICES.txt"
-      - "crates/blink-app/**"
+      - "crates/**"
       - "packaging/**"
       - "rust-toolchain.toml"
   workflow_dispatch:
