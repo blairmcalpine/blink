@@ -290,6 +290,9 @@ impl DesktopDuplicator {
     ///
     /// [`CaptureError::DeviceLost`] when the device is removed; any other error
     /// is a DXGI or D3D11 failure that recreating the session cannot fix.
+    /// Either way the session has been dropped: the duplicator delivers no
+    /// frames until a later call recreates it, and since recreation is not
+    /// expected to succeed, callers should rebuild the device and duplicator.
     pub fn next_frame(&mut self, timeout: Duration) -> Result<CaptureEvent, CaptureError> {
         let deadline = Instant::now().checked_add(timeout);
         loop {
@@ -325,9 +328,15 @@ impl DesktopDuplicator {
                     self.schedule_retry();
                 }
                 Step::Resync => {
-                    tracing::trace!("desktop idle after a dropped change; resyncing session");
                     self.resyncs = self.resyncs.saturating_add(1);
+                    let started = Instant::now();
                     self.try_recover(Recovery::Resync)?;
+                    tracing::debug!(
+                        elapsed = ?started.elapsed(),
+                        resyncs = self.resyncs,
+                        recovering = self.is_recovering(),
+                        "resynced the session after a dropped change went idle"
+                    );
                 }
             }
         }

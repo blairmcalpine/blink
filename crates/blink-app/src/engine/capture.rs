@@ -94,10 +94,8 @@ struct Run<'a> {
     events: &'a Sender<EngineEvent>,
     /// The largest supported mode seen, which sizes new encoder sessions.
     largest: (u32, u32),
-    /// Whether this session has encoded a frame.
-    encoded_any: bool,
-    /// When this session encoded its first frame; a failure long enough after
-    /// it resets the retry backoff.
+    /// When this session encoded its first frame (`None` until it has, or
+    /// while paused); a failure long enough after it resets the retry backoff.
     encoding_since: Option<Instant>,
     /// Frames this session encoded, for the failure log.
     frames: u64,
@@ -126,14 +124,12 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
     let mut run = Run {
         events,
         largest: (0, 0),
-        encoded_any: false,
         encoding_since: None,
         frames: 0,
         paused_since: None,
     };
     let mut retry = RetryPolicy::new(FIRST_RETRY, MAX_RETRY);
     while !stop.is_stopped() {
-        run.encoded_any = false;
         run.encoding_since = None;
         run.frames = 0;
         match session(config, fps, ring, stop, &mut run) {
@@ -198,8 +194,7 @@ fn session(
             CaptureEvent::Frame(frame) => {
                 if state.frame(frame)? {
                     run.frames = run.frames.saturating_add(1);
-                    if !run.encoded_any {
-                        run.encoded_any = true;
+                    if run.encoding_since.is_none() {
                         run.encoding_since = Some(Instant::now());
                         run.paused_since = None;
                         run.report(CaptureState::Recording);
@@ -256,7 +251,6 @@ impl State<'_> {
                     encoder.release_textures();
                 }
                 self.paused = true;
-                run.encoded_any = false;
                 run.encoding_since = None;
                 let since = match run.paused_since {
                     Some(since) => since,
