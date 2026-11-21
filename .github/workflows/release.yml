@@ -3,13 +3,15 @@ name: Release
 on:
   push:
     branches: [main]
+  # Finishes a release left as a draft, once its tag already exists.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag of the draft release to package and publish, such as v1.2.3.
+        required: true
+        type: string
 
 permissions: {}
-
-# Runs queue rather than cancel, so a release is never left half made.
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
 
 jobs:
   # Tags v{version} and opens a draft GitHub release when the workspace version
@@ -22,18 +24,21 @@ jobs:
       contents: write
       pull-requests: read
     outputs:
-      tag: ${{ steps.tag.outputs.tag }}
+      tag: ${{ steps.released.outputs.tag || steps.requested.outputs.tag }}
     steps:
       - name: Checkout
+        if: github.event_name == 'push'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install toolchain from rust-toolchain.toml
+        if: github.event_name == 'push'
         run: rustup show
 
       - name: release-plz release
+        if: github.event_name == 'push'
         id: release-plz
         uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
         with:
@@ -43,22 +48,46 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Find the blink tag
-        id: tag
+        if: github.event_name == 'push'
+        id: released
         env:
           RELEASES: ${{ steps.release-plz.outputs.releases }}
         run: |
           tag="$(jq -r '.[] | select(.package_name == "blink-app") | .tag' <<< "${RELEASES:-[]}")"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
+      - name: Check the requested draft release
+        if: github.event_name == 'workflow_dispatch'
+        id: requested
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The tag input must look like v1.2.3."
+            exit 1
+          fi
+          if [[ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]]; then
+            echo "::error::${TAG} is not a draft release."
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
   # Opens or updates the release PR. Waits for `release` so it sees a new tag.
   release-pr:
     name: release-pr
     needs: release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write
       pull-requests: write
+    # Queues rather than cancels, so the newest push to main always gets a run.
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
