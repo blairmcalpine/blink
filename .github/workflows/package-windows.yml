@@ -1,0 +1,87 @@
+name: Package (Windows)
+
+on:
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - ".github/workflows/package-windows.yml"
+      - ".github/workflows/release.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "LICENSE-*"
+      - "THIRD-PARTY-NOTICES.txt"
+      - "crates/blink-app/**"
+      - "packaging/**"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-windows-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  WIX_VERSION: "5.0.2"
+
+jobs:
+  msi:
+    name: msi
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+
+      # Release builds start from a clean target directory.
+      - name: Cache cargo
+        if: github.event_name == 'pull_request'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: package-windows
+
+      - name: Install WiX Toolset
+        run: |
+          dotnet tool install --global wix --version $env:WIX_VERSION
+          $wix = Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe'
+          & $wix extension add --global "WixToolset.Util.wixext/$env:WIX_VERSION"
+          Split-Path $wix | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Build blink.exe
+        run: ./packaging/windows/build-exe.ps1
+
+      - name: Build the MSI
+        run: ./packaging/windows/build-msi.ps1
+
+      - name: Write the checksum
+        run: |
+          $msi = Get-Item dist/*.msi
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $msi.FullName).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$($msi.FullName).sha256", "$hash  $($msi.Name)`n")
+
+      - name: Upload the MSI
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: blink-msi
+          path: |
+            dist/*.msi
+            dist/*.sha256
+          if-no-files-found: error
