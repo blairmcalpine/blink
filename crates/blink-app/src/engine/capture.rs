@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use blink_capture::{CaptureDevice, CaptureError, CaptureEvent, CapturedFrame, DesktopDuplicator};
@@ -16,11 +16,11 @@ use blink_config::Config;
 use blink_encode::{EncodeError, Encoder};
 use blink_ring::PushOutcome;
 use blink_ring::media::{Timestamp, VideoFormat};
-use blink_sys::{Backoff, ErrorChain, SysError, ThreadPriority};
+use blink_sys::{ErrorChain, SysError, ThreadPriority};
 
 use super::EngineEvent;
 use super::signal::StopSignal;
-use crate::decide::{ModeAction, mode_change_action, next_pts, should_refresh};
+use crate::decide::{ModeAction, RetryPolicy, mode_change_action, next_pts, should_refresh};
 use crate::mapping::encoder_config;
 use crate::shared::{Producer, SharedRing};
 use crate::status::CaptureState;
@@ -94,8 +94,13 @@ struct Run<'a> {
     events: &'a Sender<EngineEvent>,
     /// The largest supported mode seen, which sizes new encoder sessions.
     largest: (u32, u32),
-    /// Whether this session has encoded a frame, which resets the backoff.
+    /// Whether this session has encoded a frame.
     encoded_any: bool,
+    /// When this session encoded its first frame; a failure long enough after
+    /// it resets the retry backoff.
+    encoding_since: Option<Instant>,
+    /// Frames this session encoded, for the failure log.
+    frames: u64,
     /// When encoding paused for an unsupported mode; kept across sessions
     /// and repeated mode changes until a frame is encoded again.
     paused_since: Option<Timestamp>,
@@ -122,12 +127,15 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
         events,
         largest: (0, 0),
         encoded_any: false,
+        encoding_since: None,
+        frames: 0,
         paused_since: None,
     };
-    let mut backoff = Backoff::new(FIRST_RETRY, MAX_RETRY);
-    let mut failures = 0_u32;
+    let mut retry = RetryPolicy::new(FIRST_RETRY, MAX_RETRY);
     while !stop.is_stopped() {
         run.encoded_any = false;
+        run.encoding_since = None;
+        run.frames = 0;
         match session(config, fps, ring, stop, &mut run) {
             Ok(()) => return,
             Err(Failure::Fatal(message)) => {
@@ -136,16 +144,14 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
                 return;
             }
             Err(Failure::Retry(error)) => {
-                if run.encoded_any {
-                    backoff.reset();
-                    failures = 0;
-                }
-                let delay = backoff.next_delay();
-                failures = failures.saturating_add(1);
+                let encoding_for = run.encoding_since.map(|since| since.elapsed());
+                let (failures, delay) = retry.on_failure(encoding_for);
                 let error = ErrorChain(error.as_ref()).to_string();
                 tracing::warn!(
                     error,
                     failures,
+                    frames = run.frames,
+                    encoding_ms = encoding_for.map(|elapsed| elapsed.as_millis()),
                     retry_in_ms = delay.as_millis(),
                     "capture stopped; rebuilding the device"
                 );
@@ -190,10 +196,14 @@ fn session(
                 state.mode_changed(&device, run, width, height)?;
             }
             CaptureEvent::Frame(frame) => {
-                if state.frame(frame)? && !run.encoded_any {
-                    run.encoded_any = true;
-                    run.paused_since = None;
-                    run.report(CaptureState::Recording);
+                if state.frame(frame)? {
+                    run.frames = run.frames.saturating_add(1);
+                    if !run.encoded_any {
+                        run.encoded_any = true;
+                        run.encoding_since = Some(Instant::now());
+                        run.paused_since = None;
+                        run.report(CaptureState::Recording);
+                    }
                 }
             }
             CaptureEvent::Unchanged { timestamp } => state.refresh_idr(timestamp)?,
@@ -247,6 +257,7 @@ impl State<'_> {
                 }
                 self.paused = true;
                 run.encoded_any = false;
+                run.encoding_since = None;
                 let since = match run.paused_since {
                     Some(since) => since,
                     None => blink_sys::qpc_now()?,
