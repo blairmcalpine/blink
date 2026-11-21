@@ -15,8 +15,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, IDXGIDevice,
-    IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
+    DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIDevice, IDXGIOutput1, IDXGIOutput6, IDXGIOutputDuplication, IDXGIResource,
 };
 use windows::core::Interface;
 
@@ -204,6 +204,8 @@ pub struct DesktopDuplicator {
     logged_protected: bool,
     last_timestamp: Option<Timestamp>,
     next_sequence: u64,
+    /// Sessions recreated to resync an idle desktop.
+    resyncs: u64,
 }
 
 impl DesktopDuplicator {
@@ -250,6 +252,7 @@ impl DesktopDuplicator {
             logged_protected: false,
             last_timestamp: None,
             next_sequence: 0,
+            resyncs: 0,
         };
         match duplicator.recreate() {
             Ok(event) => duplicator.pending = event,
@@ -296,25 +299,35 @@ impl DesktopDuplicator {
             let remaining = deadline.map_or(timeout, |deadline| {
                 deadline.saturating_duration_since(Instant::now())
             });
-            let Some(duplication) = self.duplication.clone() else {
+            // Moved out, not cloned: `DuplicateOutput` fails with
+            // `E_INVALIDARG` while any reference to this output's previous
+            // session is alive, so a session that ends here must be dropped
+            // before `recreate` runs.
+            let Some(duplication) = self.duplication.take() else {
                 if !self.wait_for_retry(remaining) {
                     return Ok(CaptureEvent::Timeout);
                 }
-                self.try_recover()?;
+                self.try_recover(Recovery::Lost)?;
                 continue;
             };
-            match self.acquire(&duplication, remaining)? {
+            let step = self.acquire(&duplication, remaining)?;
+            if matches!(step, Step::Lost | Step::Resync) {
+                drop(duplication);
+            } else {
+                self.duplication = Some(duplication);
+            }
+            match step {
                 Step::Event(event) => return Ok(event),
                 Step::Dropped if remaining.is_zero() => return Ok(CaptureEvent::Timeout),
                 Step::Dropped => {}
                 Step::Lost => {
-                    self.duplication = None;
                     self.lost_since = Some(Instant::now());
                     self.schedule_retry();
                 }
                 Step::Resync => {
                     tracing::trace!("desktop idle after a dropped change; resyncing session");
-                    self.try_recover()?;
+                    self.resyncs = self.resyncs.saturating_add(1);
+                    self.try_recover(Recovery::Resync)?;
                 }
             }
         }
@@ -464,7 +477,7 @@ impl DesktopDuplicator {
         true
     }
 
-    fn try_recover(&mut self) -> Result<(), CaptureError> {
+    fn try_recover(&mut self, cause: Recovery) -> Result<(), CaptureError> {
         match self.recreate() {
             Ok(event) => {
                 if let Some(since) = self.lost_since.take() {
@@ -490,7 +503,16 @@ impl DesktopDuplicator {
                 self.retry_at = Instant::now().checked_add(MAX_RETRY_DELAY);
                 Ok(())
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                tracing::warn!(
+                    error = %ErrorChain(&error),
+                    cause = cause.as_str(),
+                    frames = self.next_sequence,
+                    resyncs = self.resyncs,
+                    "could not recreate the desktop duplication session"
+                );
+                Err(error)
+            }
         }
     }
 
@@ -541,25 +563,71 @@ impl DesktopDuplicator {
             unsafe { output.DuplicateOutput(&self.device) }.context("duplicate the output")?;
         // SAFETY: `duplication` is live; GetDesc only writes the returned struct.
         let desc = unsafe { duplication.GetDesc() };
-        if desc.DesktopImageInSystemMemory.as_bool() {
-            tracing::warn!("desktop image is in system memory; GPU copy path is unverified here");
-        }
-        if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY
-            && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED
-        {
-            tracing::warn!(
-                rotation = desc.Rotation.0,
-                "rotated output is captured unrotated"
-            );
-        }
         let (width, height) = (desc.ModeDesc.Width, desc.ModeDesc.Height);
+        let first = !self.had_session;
         self.duplication = Some(duplication);
         self.had_session = true;
         self.scheduler.reset();
         self.retry_at = None;
         self.staleness = Staleness::NewSession;
         let (_, resized) = pool_for(&mut self.pool, &self.device, width, height)?;
+        if first || resized {
+            log_session(&output, &desc);
+        }
         Ok(resized.then_some(CaptureEvent::ModeChanged { width, height }))
+    }
+}
+
+/// Logs what a new duplication session delivers and the output's color
+/// setup, so a capture problem report shows HDR, refresh, and format.
+fn log_session(output: &IDXGIOutput1, desc: &DXGI_OUTDUPL_DESC) {
+    let mode = &desc.ModeDesc;
+    let output_desc = output.cast::<IDXGIOutput6>().ok().and_then(|output| {
+        // SAFETY: `output` is live; GetDesc1 only fills the returned struct.
+        unsafe { output.GetDesc1() }.ok()
+    });
+    let bits_per_color = output_desc.map(|desc| desc.BitsPerColor);
+    let color_space = output_desc.map(|desc| desc.ColorSpace.0);
+    tracing::info!(
+        width = mode.Width,
+        height = mode.Height,
+        format = mode.Format.0,
+        refresh_numerator = mode.RefreshRate.Numerator,
+        refresh_denominator = mode.RefreshRate.Denominator,
+        rotation = desc.Rotation.0,
+        in_system_memory = desc.DesktopImageInSystemMemory.as_bool(),
+        bits_per_color,
+        color_space,
+        "desktop duplication session"
+    );
+    if desc.DesktopImageInSystemMemory.as_bool() {
+        tracing::warn!("desktop image is in system memory; GPU copy path is unverified here");
+    }
+    if desc.Rotation != DXGI_MODE_ROTATION_IDENTITY
+        && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED
+    {
+        tracing::warn!(
+            rotation = desc.Rotation.0,
+            "rotated output is captured unrotated"
+        );
+    }
+}
+
+/// Why a session is being recreated, for diagnostics.
+#[derive(Clone, Copy)]
+enum Recovery {
+    /// The previous session ended or could not be created.
+    Lost,
+    /// The desktop went idle after a dropped change.
+    Resync,
+}
+
+impl Recovery {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lost => "session lost",
+            Self::Resync => "idle resync",
+        }
     }
 }
 
