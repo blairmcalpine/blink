@@ -2,7 +2,7 @@
 //!
 //! NVENC runs with an infinite GOP, so it never inserts keyframes on its own;
 //! this scheduler decides. Capture is variable-rate (unchanged frames are
-//! skipped and the rate is decimated), so a frame-count GOP would stretch to
+//! skipped, so frames are whole slots apart), so a frame-count GOP would stretch to
 //! tens of seconds on an idle desktop. The ring needs an IDR at least once per
 //! second of PTS, so the interval is measured in timestamps.
 

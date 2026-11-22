@@ -1,14 +1,10 @@
 //! What to do with each acquired duplication frame, as pure logic.
 //!
 //! The Windows duplicator gathers the facts (did content change, is there an
-//! image, when) and acts on the answer; everything in between lives here so it
-//! is tested on every host.
+//! image) and acts on the answer; everything in between lives here and in
+//! [`FramePacer`](crate::schedule::FramePacer), so it is tested on every host.
 
 use std::time::Duration;
-
-use blink_ring::media::Timestamp;
-
-use crate::schedule::FrameScheduler;
 
 /// `AcquireNextFrame` treats `u32::MAX` as INFINITE; longer waits are capped
 /// one below it and re-issued by the caller's loop.
@@ -17,14 +13,12 @@ pub(crate) const MAX_WAIT_MS: u32 = u32::MAX - 1;
 /// Whether the latest desktop image has been copied, and if not, why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Staleness {
-    /// The last copied frame is the current desktop.
+    /// The last copied frame holds every content update acquired so far.
     Fresh,
-    /// A content change was dropped (by the decimator, or because DXGI handed
-    /// over no image), so the desktop is ahead of the last copied frame.
-    DroppedChange,
-    /// The session is new and nothing has been copied from it yet. Its first
-    /// acquire returns the whole desktop, so that frame is copied even if it
-    /// reports no new content.
+    /// A content update was acquired without a desktop image, so the desktop
+    /// is ahead of the last copied frame.
+    Missed,
+    /// The session is new and nothing has been copied from it yet.
     NewSession,
 }
 
@@ -37,62 +31,86 @@ pub(crate) struct Acquired {
     pub(crate) content_changed: bool,
     /// DXGI returned a desktop resource with the frame.
     pub(crate) has_image: bool,
-    /// The frame's QPC time: the present time if content changed, otherwise
-    /// the pointer update time or the time it was observed.
-    pub(crate) qpc: i64,
 }
 
 /// What to do with an acquired frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameAction {
-    /// Copy the image into the pool and emit it.
+    /// Copy the image into the pool and emit it, stamped with its slot.
     Copy,
-    /// Release without copying and report `Unchanged`.
+    /// Release without copying and report `Unchanged`: only the pointer
+    /// moved.
     Unchanged,
-    /// Release without copying and keep waiting.
-    Drop,
-    /// Release without copying and recreate the session: a dropped change's
-    /// slot has gone a whole interval without a content update to deliver
-    /// it, and this frame has no image to deliver it with.
+    /// Release without copying and look again at the next slot: content
+    /// changed, but DXGI handed over no image to copy.
+    Missed,
+    /// Release without copying and recreate the session: a change came
+    /// without an image, and the slot after it brought no content update to
+    /// deliver it with.
     Resync,
 }
 
-/// Decides what to do with `frame`, consuming a decimation slot when it is
-/// copied, and updates `staleness`.
+/// Decides what to do with `frame` and updates `staleness`.
 ///
 /// Only frames with new content are copied. DXGI documents a pointer-only
 /// update as "the desktop image was not updated", and on the first acquire
 /// of a new session that surface has never been written: copying it encodes
-/// a black frame. A dropped change waiting for its slot is delivered by the
-/// next content update or, once the slot is a whole interval overdue (the
-/// desktop went idle), by a resync; a new session waits for its first content
-/// update.
+/// a black frame. A new session therefore waits for its first content update.
 ///
-/// The overdue margin matters: at 144 Hz into 60 fps the next update lands
-/// up to 6.9 ms after the slot opens, so resyncing as soon as the slot opened
-/// would recreate the session on most frames of continuous motion.
-pub(crate) fn decide(
-    frame: Acquired,
-    staleness: &mut Staleness,
-    scheduler: &mut FrameScheduler,
-) -> FrameAction {
+/// Acquires are paced (see [`FramePacer`](crate::schedule::FramePacer)), and
+/// DXGI accumulates updates while no frame is held, so a content update
+/// always carries the latest desktop and no change is ever dropped. The one
+/// exception is a content update without an image: the next slot then looks
+/// again without waiting, and if it finds no content (a timeout or a pointer
+/// move) the desktop has gone quiet and only a new session, whose first
+/// content update carries the whole desktop, can deliver the change.
+pub(crate) fn decide(frame: Acquired, staleness: &mut Staleness) -> FrameAction {
     if !frame.content_changed {
-        return if *staleness == Staleness::DroppedChange && scheduler.is_overdue(frame.qpc) {
+        return if *staleness == Staleness::Missed {
             FrameAction::Resync
         } else {
             FrameAction::Unchanged
         };
     }
-    if !scheduler.admit(frame.qpc) {
-        *staleness = Staleness::DroppedChange;
-        return FrameAction::Drop;
-    }
     if !frame.has_image {
-        *staleness = Staleness::DroppedChange;
-        return FrameAction::Drop;
+        *staleness = Staleness::Missed;
+        return FrameAction::Missed;
     }
     *staleness = Staleness::Fresh;
     FrameAction::Copy
+}
+
+/// What to do when `AcquireNextFrame` times out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimeoutAction {
+    /// Report `Timeout`.
+    Report,
+    /// A change came without an image and a whole slot passed without
+    /// another: recreate the session to deliver it.
+    Resync,
+}
+
+/// Decides what an acquire timeout means.
+pub(crate) fn on_timeout(staleness: Staleness) -> TimeoutAction {
+    if staleness == Staleness::Missed {
+        TimeoutAction::Resync
+    } else {
+        TimeoutAction::Report
+    }
+}
+
+/// The `AcquireNextFrame` timeout in milliseconds: the caller's `remaining`
+/// time, or zero after a change without an image (anything that would deliver
+/// it has accumulated by the slot this acquire runs at).
+/// Rounds up so a sub-millisecond wait does not become a busy poll, and
+/// never returns INFINITE.
+pub(crate) fn acquire_timeout_ms(remaining: Duration, staleness: Staleness) -> u32 {
+    if staleness == Staleness::Missed {
+        return 0;
+    }
+    u32::try_from(remaining.as_micros().div_ceil(1000))
+        .unwrap_or(MAX_WAIT_MS)
+        .min(MAX_WAIT_MS)
 }
 
 /// Frame counters for the duplicator's periodic summary log.
@@ -100,19 +118,25 @@ pub(crate) fn decide(
 pub(crate) struct CaptureStats {
     /// Frames copied into the pool and emitted.
     pub(crate) copied: u64,
-    /// Content updates dropped by the decimator.
-    pub(crate) dropped: u64,
-    /// Updates where only the pointer moved.
+    /// Desktop updates DXGI folded into the copied frames beyond one each
+    /// (`AccumulatedFrames - 1`): what pacing saved acquiring separately.
+    pub(crate) coalesced: u64,
+    /// Acquires that ended without new content: a timeout or a pointer move.
+    pub(crate) unchanged_slots: u64,
+    /// Of those, updates where only the pointer moved.
     pub(crate) pointer_only: u64,
     /// Pointer-only updates on a session with nothing copied yet; earlier
     /// versions copied these and encoded black frames.
     pub(crate) new_session_pointer_only: u64,
+    /// Slots that passed before the acquire meant for them started, because
+    /// the encode or the thread ran late.
+    pub(crate) late_slots: u64,
     /// Content updates that came without a desktop resource.
     pub(crate) no_image: u64,
     /// Sessions that ended (lost, or re-duplicated for having nothing to
     /// show) before their first content update.
     pub(crate) contentless_sessions: u64,
-    /// Sessions recreated to deliver a dropped change.
+    /// Sessions recreated to deliver a change that came without an image.
     pub(crate) resyncs: u64,
     /// The slowest of those recreations.
     pub(crate) slowest_resync: Duration,
@@ -124,22 +148,33 @@ pub(crate) struct CaptureStats {
 }
 
 impl CaptureStats {
-    /// Counts one acquired frame, given the staleness before [`decide`] ran
-    /// and its answer.
-    pub(crate) fn record(&mut self, frame: Acquired, before: Staleness, action: FrameAction) {
-        let counter = if !frame.content_changed {
+    /// Counts one acquired frame that folded `accumulated` desktop updates,
+    /// given the staleness before [`decide`] ran.
+    pub(crate) fn record(&mut self, frame: Acquired, before: Staleness, accumulated: u32) {
+        if !frame.content_changed {
             if before == Staleness::NewSession {
                 self.new_session_pointer_only = self.new_session_pointer_only.saturating_add(1);
             }
-            &mut self.pointer_only
+            self.pointer_only = self.pointer_only.saturating_add(1);
+            self.unchanged_slots = self.unchanged_slots.saturating_add(1);
         } else if !frame.has_image {
-            &mut self.no_image
-        } else if action == FrameAction::Copy {
-            &mut self.copied
+            self.no_image = self.no_image.saturating_add(1);
         } else {
-            &mut self.dropped
-        };
-        *counter = counter.saturating_add(1);
+            self.copied = self.copied.saturating_add(1);
+            self.coalesced = self
+                .coalesced
+                .saturating_add(u64::from(accumulated.saturating_sub(1)));
+        }
+    }
+
+    /// Counts an acquire that timed out.
+    pub(crate) const fn record_timeout(&mut self) {
+        self.unchanged_slots = self.unchanged_slots.saturating_add(1);
+    }
+
+    /// Counts slots skipped by a late acquire.
+    pub(crate) const fn record_late(&mut self, slots: u64) {
+        self.late_slots = self.late_slots.saturating_add(slots);
     }
 
     /// Records how long a new session waited for its first content update.
@@ -161,356 +196,102 @@ impl CaptureStats {
     }
 }
 
-/// What to do when `AcquireNextFrame` times out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TimeoutAction {
-    /// Report `Timeout`.
-    Report,
-    /// The desktop went idle after a dropped change and its slot is a whole
-    /// interval overdue: recreate the session, whose first content update
-    /// carries the full desktop, so the last change is not lost.
-    Resync,
-}
-
-/// Decides what an acquire timeout means. `overdue` is the decimator's
-/// [`is_overdue`](FrameScheduler::is_overdue) now.
-pub(crate) fn on_timeout(staleness: Staleness, overdue: bool) -> TimeoutAction {
-    if staleness == Staleness::DroppedChange && overdue {
-        TimeoutAction::Resync
-    } else {
-        TimeoutAction::Report
-    }
-}
-
-/// The QPC time at which an acquire that sees no update should stop waiting
-/// and report a timeout, so [`on_timeout`] can resync: while a dropped change
-/// is pending, the time its slot becomes overdue. `None` means wait for the
-/// caller's full timeout.
-pub(crate) fn resync_deadline_qpc(staleness: Staleness, scheduler: &FrameScheduler) -> Option<i64> {
-    if staleness == Staleness::DroppedChange {
-        scheduler.overdue_qpc()
-    } else {
-        None
-    }
-}
-
-/// The `AcquireNextFrame` timeout in milliseconds: the caller's `remaining`
-/// time, capped at `until_slot` (until the slot is overdue) while a dropped
-/// change waits.
-/// Rounds up so a sub-millisecond wait does not become a busy poll, and
-/// never returns INFINITE.
-pub(crate) fn acquire_timeout_ms(remaining: Duration, until_slot: Option<Duration>) -> u32 {
-    let wait = until_slot.map_or(remaining, |slot| slot.min(remaining));
-    u32::try_from(wait.as_micros().div_ceil(1000))
-        .unwrap_or(MAX_WAIT_MS)
-        .min(MAX_WAIT_MS)
-}
-
-/// Keeps emitted frame timestamps strictly increasing. A copy triggered by a
-/// pointer update carries the pointer time, which can trail the present time
-/// of the frame before it.
-pub(crate) fn monotonic(last: Option<Timestamp>, timestamp: Timestamp) -> Timestamp {
-    last.map_or(timestamp, |last| {
-        timestamp.max(last.saturating_add(Timestamp::from_ticks(1)))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU32;
 
+    use blink_ring::media::Timestamp;
+    use blink_sys::QpcClock;
+
     use super::*;
+    use crate::schedule::FramePacer;
 
     const QPC_HZ: i64 = 10_000_000;
-    const INTERVAL: i64 = QPC_HZ / 60;
+    const POLL: Duration = Duration::from_millis(100);
 
-    fn scheduler() -> FrameScheduler {
-        FrameScheduler::new(NonZeroU32::new(60).unwrap(), QPC_HZ)
-    }
-
-    const fn changed(qpc: i64) -> Acquired {
+    const fn changed() -> Acquired {
         Acquired {
             content_changed: true,
             has_image: true,
-            qpc,
         }
     }
 
-    const fn pointer(qpc: i64) -> Acquired {
+    const fn pointer() -> Acquired {
         Acquired {
             content_changed: false,
             has_image: true,
-            qpc,
+        }
+    }
+
+    const fn blank() -> Acquired {
+        Acquired {
+            content_changed: true,
+            has_image: false,
         }
     }
 
     #[test]
     fn new_session_waits_for_content_before_copying() {
-        let mut s = scheduler();
         let mut staleness = Staleness::NewSession;
-        assert_eq!(
-            decide(pointer(0), &mut staleness, &mut s),
-            FrameAction::Unchanged
-        );
+        assert_eq!(decide(pointer(), &mut staleness), FrameAction::Unchanged);
         assert_eq!(staleness, Staleness::NewSession);
-        // Nothing to resync for: the session never dropped a change.
-        assert_eq!(
-            decide(pointer(INTERVAL * 5), &mut staleness, &mut s),
-            FrameAction::Unchanged
-        );
-        assert_eq!(
-            on_timeout(staleness, s.is_due(INTERVAL * 5)),
-            TimeoutAction::Report
-        );
-        assert_eq!(
-            decide(changed(INTERVAL * 6), &mut staleness, &mut s),
-            FrameAction::Copy
-        );
+        assert_eq!(on_timeout(staleness), TimeoutAction::Report);
+        assert_eq!(decide(changed(), &mut staleness), FrameAction::Copy);
         assert_eq!(staleness, Staleness::Fresh);
     }
 
     #[test]
     fn pointer_only_frames_are_never_copied() {
-        for start in [
-            Staleness::Fresh,
-            Staleness::NewSession,
-            Staleness::DroppedChange,
-        ] {
-            for qpc in [0, INTERVAL / 2, INTERVAL, INTERVAL * 10] {
-                let mut s = scheduler();
-                let mut staleness = start;
-                assert_ne!(
-                    decide(pointer(qpc), &mut staleness, &mut s),
-                    FrameAction::Copy
-                );
-            }
+        for start in [Staleness::Fresh, Staleness::NewSession, Staleness::Missed] {
+            let mut staleness = start;
+            assert_ne!(decide(pointer(), &mut staleness), FrameAction::Copy);
         }
     }
 
     #[test]
-    fn pointer_moves_on_a_fresh_desktop_are_unchanged() {
-        let mut s = scheduler();
+    fn a_change_without_an_image_is_looked_for_again_then_resynced() {
         let mut staleness = Staleness::Fresh;
-        assert_eq!(
-            decide(pointer(0), &mut staleness, &mut s),
-            FrameAction::Unchanged
-        );
-        // No slot consumed: a change right after is still admitted.
-        assert_eq!(
-            decide(changed(1), &mut staleness, &mut s),
-            FrameAction::Copy
-        );
+        assert_eq!(decide(blank(), &mut staleness), FrameAction::Missed);
+        assert_eq!(staleness, Staleness::Missed);
+        assert_eq!(acquire_timeout_ms(POLL, staleness), 0);
+        assert_eq!(on_timeout(staleness), TimeoutAction::Resync);
+        assert_eq!(decide(pointer(), &mut staleness), FrameAction::Resync);
+        assert_eq!(decide(changed(), &mut staleness), FrameAction::Copy);
+        assert_eq!(on_timeout(staleness), TimeoutAction::Report);
     }
 
     #[test]
-    fn early_change_is_dropped_then_resynced_by_a_pointer_move_once_overdue() {
-        let mut s = scheduler();
-        let mut staleness = Staleness::Fresh;
-        assert_eq!(
-            decide(changed(0), &mut staleness, &mut s),
-            FrameAction::Copy
-        );
-        assert_eq!(
-            decide(changed(INTERVAL / 4), &mut staleness, &mut s),
-            FrameAction::Drop
-        );
-        assert_eq!(staleness, Staleness::DroppedChange);
-        let overdue = s.overdue_qpc().unwrap();
-        // Pointer moves before and after the slot opens, short of a whole
-        // interval past it, wait for a content update.
-        for qpc in [INTERVAL / 2, INTERVAL, overdue - 1] {
-            assert_eq!(
-                decide(pointer(qpc), &mut staleness, &mut s),
-                FrameAction::Unchanged
-            );
-            assert_eq!(staleness, Staleness::DroppedChange);
-        }
-        assert_eq!(
-            decide(pointer(overdue), &mut staleness, &mut s),
-            FrameAction::Resync
-        );
-        // A content update at the slot delivers it directly.
-        assert_eq!(
-            decide(changed(INTERVAL), &mut staleness, &mut s),
-            FrameAction::Copy
-        );
-        assert_eq!(staleness, Staleness::Fresh);
+    fn idle_without_a_missed_change_just_times_out() {
+        assert_eq!(on_timeout(Staleness::Fresh), TimeoutAction::Report);
+        assert_eq!(on_timeout(Staleness::NewSession), TimeoutAction::Report);
     }
 
     #[test]
-    fn early_change_then_idle_resyncs_once_the_slot_is_overdue() {
-        let mut s = scheduler();
-        let mut staleness = Staleness::Fresh;
-        decide(changed(0), &mut staleness, &mut s);
-        decide(changed(INTERVAL / 4), &mut staleness, &mut s);
-        let slot = s.next_admit_qpc().unwrap();
-        let overdue = s.overdue_qpc().unwrap();
-        for qpc in [slot, overdue - 1] {
-            assert_eq!(
-                on_timeout(staleness, s.is_overdue(qpc)),
-                TimeoutAction::Report
-            );
-        }
+    fn timeout_rounds_up_caps_and_handles_zero() {
+        let fresh = Staleness::Fresh;
+        assert_eq!(acquire_timeout_ms(Duration::ZERO, fresh), 0);
+        assert_eq!(acquire_timeout_ms(Duration::from_micros(1), fresh), 1);
+        assert_eq!(acquire_timeout_ms(Duration::from_micros(1500), fresh), 2);
+        assert_eq!(acquire_timeout_ms(Duration::from_millis(16), fresh), 16);
+        assert_eq!(acquire_timeout_ms(Duration::MAX, fresh), MAX_WAIT_MS);
         assert_eq!(
-            on_timeout(staleness, s.is_overdue(overdue)),
-            TimeoutAction::Resync
+            acquire_timeout_ms(Duration::MAX, Staleness::NewSession),
+            MAX_WAIT_MS
         );
-    }
-
-    /// An acquired update in [`simulate`].
-    #[derive(Clone, Copy)]
-    enum Update {
-        Content(i64),
-        Pointer(i64),
-    }
-
-    impl Update {
-        const fn qpc(self) -> i64 {
-            match self {
-                Self::Content(qpc) | Self::Pointer(qpc) => qpc,
-            }
-        }
-    }
-
-    /// Drives `decide` and `on_timeout` the way the duplicator does:
-    /// `AcquireNextFrame` times out at `resync_deadline_qpc` if no update
-    /// comes first. With `idle_after`, the desktop stays
-    /// idle after the last update. Returns `(copies, resyncs)`.
-    fn simulate(updates: &[Update], idle_after: bool) -> (usize, usize) {
-        let mut s = scheduler();
-        let mut staleness = Staleness::Fresh;
-        let (mut copies, mut resyncs) = (0, 0);
-        let mut resync = |s: &mut FrameScheduler, staleness: &mut Staleness| {
-            resyncs += 1;
-            s.reset();
-            *staleness = Staleness::NewSession;
-        };
-        let mut updates = updates.iter().copied().peekable();
-        loop {
-            let next = updates.peek().map(|update| update.qpc());
-            if next.is_none() && !idle_after {
-                break;
-            }
-            if let Some(cap) = resync_deadline_qpc(staleness, &s)
-                && next.is_none_or(|next| cap < next)
-            {
-                assert_eq!(
-                    on_timeout(staleness, s.is_overdue(cap)),
-                    TimeoutAction::Resync
-                );
-                resync(&mut s, &mut staleness);
-                continue;
-            }
-            let Some(update) = updates.next() else {
-                break;
-            };
-            let frame = match update {
-                Update::Content(qpc) => changed(qpc),
-                Update::Pointer(qpc) => pointer(qpc),
-            };
-            match decide(frame, &mut staleness, &mut s) {
-                FrameAction::Copy => copies += 1,
-                FrameAction::Resync => resync(&mut s, &mut staleness),
-                FrameAction::Unchanged | FrameAction::Drop => {}
-            }
-        }
-        (copies, resyncs)
-    }
-
-    const HZ_144: i64 = QPC_HZ / 144;
-
-    fn content_at_144_hz(frames: i64) -> Vec<Update> {
-        (0..frames).map(|i| Update::Content(i * HZ_144)).collect()
-    }
-
-    #[test]
-    fn continuous_motion_at_144_hz_never_resyncs() {
-        let (copies, resyncs) = simulate(&content_at_144_hz(1440), false);
-        assert_eq!(resyncs, 0);
-        assert!((590..=601).contains(&copies), "copied {copies}");
-
-        // Pointer moves between the content updates change nothing.
-        let mixed: Vec<Update> = (0..1440)
-            .flat_map(|i| {
-                [
-                    Update::Content(i * HZ_144),
-                    Update::Pointer(i * HZ_144 + HZ_144 / 2),
-                ]
-            })
-            .collect();
-        assert_eq!(simulate(&mixed, false).1, 0);
-    }
-
-    /// 144 Hz content up to and including the first dropped update after a
-    /// second of motion, so the desktop goes idle with a change pending.
-    fn motion_ending_in_a_dropped_change() -> Vec<Update> {
-        let mut s = scheduler();
-        let last = (0..=144).filter(|&i| !s.admit(i * HZ_144)).last().unwrap();
-        content_at_144_hz(last + 1)
-    }
-
-    #[test]
-    fn idle_after_a_dropped_change_resyncs_exactly_once() {
-        let updates = motion_ending_in_a_dropped_change();
-        assert_eq!(simulate(&updates, true).1, 1);
-
-        // Same with the pointer still moving through the idle period.
-        let end = updates.last().unwrap().qpc();
-        let mut with_pointer = updates;
-        with_pointer.extend((1..100).map(|i| Update::Pointer(end + i * HZ_144)));
-        assert_eq!(simulate(&with_pointer, true).1, 1);
-
-        // Idle after an admitted update leaves nothing to resync.
-        let mut admitted = motion_ending_in_a_dropped_change();
-        admitted.pop();
-        assert_eq!(simulate(&admitted, true).1, 0);
-    }
-
-    #[test]
-    fn acquire_waits_until_a_dropped_change_is_overdue() {
-        let mut s = scheduler();
-        let mut staleness = Staleness::Fresh;
-        assert_eq!(resync_deadline_qpc(staleness, &s), None);
-        decide(changed(0), &mut staleness, &mut s);
-        decide(changed(INTERVAL / 4), &mut staleness, &mut s);
-        assert_eq!(resync_deadline_qpc(staleness, &s), s.overdue_qpc());
-        assert_ne!(resync_deadline_qpc(staleness, &s), s.next_admit_qpc());
-        assert_eq!(resync_deadline_qpc(Staleness::NewSession, &s), None);
-    }
-
-    #[test]
-    fn idle_without_a_dropped_change_just_times_out() {
-        assert_eq!(on_timeout(Staleness::Fresh, true), TimeoutAction::Report);
-        assert_eq!(
-            on_timeout(Staleness::NewSession, true),
-            TimeoutAction::Report
-        );
-    }
-
-    #[test]
-    fn admitted_change_without_an_image_is_not_lost() {
-        let mut s = scheduler();
-        let mut staleness = Staleness::Fresh;
-        let missing = Acquired {
-            has_image: false,
-            ..changed(0)
-        };
-        assert_eq!(decide(missing, &mut staleness, &mut s), FrameAction::Drop);
-        assert_eq!(staleness, Staleness::DroppedChange);
+        assert_eq!(acquire_timeout_ms(Duration::MAX, Staleness::Missed), 0);
     }
 
     #[test]
     fn stats_count_each_kind_of_frame() {
         let mut stats = CaptureStats::default();
-        stats.record(changed(0), Staleness::Fresh, FrameAction::Copy);
-        stats.record(changed(1), Staleness::Fresh, FrameAction::Drop);
-        stats.record(pointer(2), Staleness::Fresh, FrameAction::Unchanged);
-        stats.record(pointer(3), Staleness::NewSession, FrameAction::Unchanged);
-        let missing = Acquired {
-            has_image: false,
-            ..changed(4)
-        };
-        stats.record(missing, Staleness::Fresh, FrameAction::Drop);
+        stats.record(changed(), Staleness::Fresh, 3);
+        stats.record(changed(), Staleness::NewSession, 1);
+        stats.record(pointer(), Staleness::Fresh, 1);
+        stats.record(pointer(), Staleness::NewSession, 2);
+        stats.record(blank(), Staleness::Fresh, 1);
+        stats.record_timeout();
+        stats.record_late(2);
+        stats.record_late(1);
         stats.record_resync(Duration::from_millis(3));
         stats.record_resync(Duration::from_millis(1));
         stats.record_first_content(Duration::from_millis(40));
@@ -519,10 +300,12 @@ mod tests {
         assert_eq!(
             stats,
             CaptureStats {
-                copied: 1,
-                dropped: 1,
+                copied: 2,
+                coalesced: 2,
+                unchanged_slots: 3,
                 pointer_only: 2,
                 new_session_pointer_only: 1,
+                late_slots: 3,
                 no_image: 1,
                 contentless_sessions: 1,
                 resyncs: 2,
@@ -533,26 +316,349 @@ mod tests {
         );
     }
 
+    /// A desktop update in [`Sim`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Kind {
+        Content,
+        Pointer,
+        /// A content update DXGI hands over without an image.
+        Blank,
+    }
+
+    /// Drives [`FramePacer`], [`decide`], and [`on_timeout`] the way the
+    /// duplicator does, against a model of DXGI: updates accumulate while no
+    /// frame is held, an acquire returns at once if any are pending and
+    /// otherwise blocks until the next one or its timeout, and a new
+    /// session's first acquire carries the whole desktop.
+    struct Sim {
+        fps: u32,
+        /// Desktop updates as (QPC time, kind), sorted by time.
+        updates: Vec<(i64, Kind)>,
+        /// Simulated QPC time to stop at.
+        end: i64,
+        /// How long encoding a copied frame keeps the thread busy.
+        encode: i64,
+        /// How late a sleep until a slot wakes up.
+        overshoot: i64,
+    }
+
+    #[derive(Debug, Default)]
+    struct Outcome {
+        /// Emitted frame timestamps.
+        stamps: Vec<Timestamp>,
+        /// QPC time each emitted frame was acquired at.
+        copied_at: Vec<i64>,
+        /// `AcquireNextFrame` calls, including timeouts.
+        acquires: usize,
+        resyncs: usize,
+        late: u64,
+    }
+
+    /// What DXGI has accumulated since the last acquire.
+    fn accumulate(pending: &mut Option<Acquired>, kind: Kind) {
+        let frame = pending.get_or_insert(pointer());
+        match kind {
+            Kind::Content => *frame = changed(),
+            Kind::Blank => *frame = blank(),
+            Kind::Pointer => {}
+        }
+    }
+
+    impl Sim {
+        fn new(fps: u32, updates: Vec<(i64, Kind)>, end: i64) -> Self {
+            let mut updates = updates;
+            updates.sort_by_key(|&(at, _)| at);
+            Self {
+                fps,
+                updates,
+                end,
+                encode: 0,
+                overshoot: 0,
+            }
+        }
+
+        fn run(&self) -> Outcome {
+            let mut pacer = FramePacer::new(NonZeroU32::new(self.fps).unwrap(), QPC_HZ);
+            let mut staleness = Staleness::NewSession;
+            let mut pending = Some(changed());
+            let mut next = 0;
+            let mut out = Outcome::default();
+            let mut now = 0;
+            let resync = |out: &mut Outcome, staleness: &mut Staleness, pending: &mut _| {
+                out.resyncs += 1;
+                *staleness = Staleness::NewSession;
+                *pending = Some(changed());
+            };
+            while now < self.end {
+                if let Some(slot) = pacer.wait_until(now) {
+                    now = slot + self.overshoot;
+                    continue;
+                }
+                out.late += pacer.late_slots(now);
+                while let Some(&(at, kind)) = self.updates.get(next)
+                    && at <= now
+                {
+                    accumulate(&mut pending, kind);
+                    next += 1;
+                }
+                out.acquires += 1;
+                if pending.is_none() {
+                    let wait = i64::from(acquire_timeout_ms(POLL, staleness)) * QPC_HZ / 1000;
+                    match self.updates.get(next) {
+                        Some(&(at, kind)) if at <= now + wait => {
+                            now = at;
+                            accumulate(&mut pending, kind);
+                            next += 1;
+                        }
+                        _ => {
+                            now += wait;
+                            match on_timeout(staleness) {
+                                TimeoutAction::Resync => {
+                                    resync(&mut out, &mut staleness, &mut pending);
+                                }
+                                TimeoutAction::Report => pacer.idle(now),
+                            }
+                            continue;
+                        }
+                    }
+                }
+                let Some(frame) = pending.take() else {
+                    continue;
+                };
+                match decide(frame, &mut staleness) {
+                    FrameAction::Copy => {
+                        out.stamps.push(pacer.claim(now));
+                        out.copied_at.push(now);
+                        now += self.encode;
+                    }
+                    FrameAction::Unchanged | FrameAction::Missed => pacer.defer(now),
+                    FrameAction::Resync => resync(&mut out, &mut staleness, &mut pending),
+                }
+            }
+            self.check_grid(&out);
+            out
+        }
+
+        /// Every stamp is the start of a slot, strictly after the previous
+        /// one, and no later than the moment its image was acquired.
+        fn check_grid(&self, out: &Outcome) {
+            let pacer = FramePacer::new(NonZeroU32::new(self.fps).unwrap(), QPC_HZ);
+            let clock = QpcClock::new(QPC_HZ).unwrap();
+            for (&stamp, &at) in out.stamps.iter().zip(&out.copied_at) {
+                assert_eq!(stamp, pacer.timestamp(self.slot(stamp)), "off the grid");
+                assert!(stamp <= clock.to_ticks(at), "stamped in the future");
+            }
+            assert!(
+                out.stamps.windows(2).all(|pair| pair[0] < pair[1]),
+                "timestamps must strictly increase"
+            );
+        }
+
+        /// The slot a timestamp from [`FramePacer::timestamp`] starts.
+        fn slot(&self, stamp: Timestamp) -> i64 {
+            (stamp.ticks() * i64::from(self.fps) + QPC_HZ - 1) / QPC_HZ
+        }
+
+        /// The gaps between consecutive frames, in slots.
+        fn gaps(&self, out: &Outcome) -> Vec<i64> {
+            out.stamps
+                .windows(2)
+                .map(|pair| self.slot(pair[1]) - self.slot(pair[0]))
+                .collect()
+        }
+    }
+
+    /// Updates of `kind` at `hz` from `from` (inclusive) to `to` (exclusive).
+    fn at_hz(hz: i64, from: i64, to: i64, kind: Kind) -> Vec<(i64, Kind)> {
+        (0..=(to - from) * hz / QPC_HZ)
+            .map(|i| from + i * QPC_HZ / hz)
+            .filter(|&at| at < to)
+            .map(|at| (at, kind))
+            .collect()
+    }
+
+    const SECOND: i64 = QPC_HZ;
+
     #[test]
-    fn timeout_rounds_up_caps_and_handles_zero() {
-        assert_eq!(acquire_timeout_ms(Duration::ZERO, None), 0);
-        assert_eq!(acquire_timeout_ms(Duration::from_micros(1), None), 1);
-        assert_eq!(acquire_timeout_ms(Duration::from_micros(1500), None), 2);
-        assert_eq!(acquire_timeout_ms(Duration::from_millis(16), None), 16);
-        assert_eq!(acquire_timeout_ms(Duration::MAX, None), MAX_WAIT_MS);
-        let slot = Some(Duration::from_millis(3));
-        assert_eq!(acquire_timeout_ms(Duration::from_millis(100), slot), 3);
-        assert_eq!(acquire_timeout_ms(Duration::from_millis(1), slot), 1);
-        assert_eq!(acquire_timeout_ms(Duration::MAX, Some(Duration::ZERO)), 0);
+    fn motion_faster_than_the_frame_rate_fills_every_slot() {
+        for (hz, fps) in [
+            (144, 60),
+            (240, 60),
+            (165, 60),
+            (120, 60),
+            (144, 30),
+            (240, 144),
+        ] {
+            for overshoot in [0, 300, 4_000] {
+                let mut sim = Sim::new(fps, at_hz(hz, 0, 2 * SECOND, Kind::Content), 2 * SECOND);
+                sim.overshoot = overshoot;
+                let out = sim.run();
+                assert_eq!(out.resyncs, 0, "{hz} Hz -> {fps} fps");
+                assert_eq!(out.late, 0, "{hz} Hz -> {fps} fps");
+                assert!(
+                    sim.gaps(&out).iter().all(|&gap| gap == 1),
+                    "{hz} Hz -> {fps} fps, overshoot {overshoot}: {:?}",
+                    sim.gaps(&out)
+                );
+                let expected = usize::try_from(2 * fps).unwrap();
+                assert!(
+                    out.stamps.len().abs_diff(expected) <= 1,
+                    "{hz} Hz -> {fps} fps copied {}",
+                    out.stamps.len()
+                );
+                // One acquire per slot: the updates in between accumulate.
+                assert!(out.acquires <= expected + 1, "{} acquires", out.acquires);
+            }
+        }
     }
 
     #[test]
-    fn timestamps_never_go_backwards() {
-        let t = Timestamp::from_ticks;
-        assert_eq!(monotonic(None, t(5)), t(5));
-        assert_eq!(monotonic(Some(t(5)), t(9)), t(9));
-        assert_eq!(monotonic(Some(t(5)), t(5)), t(6));
-        assert_eq!(monotonic(Some(t(5)), t(2)), t(6));
-        assert_eq!(monotonic(Some(t(i64::MAX)), t(0)), t(i64::MAX));
+    fn same_rate_desktop_fills_every_slot_at_any_phase_and_jitter() {
+        let interval = SECOND / 60;
+        for phase in [0, 1, interval / 4, interval / 2, interval - 1] {
+            for jitter in [0, interval / 20] {
+                let updates = (0..120)
+                    .map(|i| {
+                        let wobble = if i % 2 == 0 { jitter } else { -jitter };
+                        (i * SECOND / 60 + phase + wobble + interval, Kind::Content)
+                    })
+                    .collect();
+                let sim = Sim::new(60, updates, 2 * SECOND + interval);
+                let out = sim.run();
+                assert_eq!(out.resyncs, 0);
+                // After the session's initial frame, which takes slot 0.
+                assert!(
+                    sim.gaps(&out).iter().skip(1).all(|&gap| gap == 1),
+                    "phase {phase}, jitter {jitter}: {:?}",
+                    sim.gaps(&out)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slower_desktop_keeps_every_update_on_the_grid() {
+        // Phases away from a slot boundary: updates that straddle one by a
+        // count of jitter alternate between the slots either side of it.
+        for (hz, gap) in [(30, 2), (20, 3)] {
+            for phase in [1_000, SECOND / 120, SECOND / 61] {
+                let updates = at_hz(hz, SECOND / 2 + phase, 3 * SECOND, Kind::Content);
+                let count = updates.len();
+                let sim = Sim::new(60, updates, 3 * SECOND);
+                let out = sim.run();
+                // Every update, after the session's initial frame.
+                assert_eq!(out.stamps.len(), count + 1, "{hz} Hz phase {phase}");
+                assert!(
+                    sim.gaps(&out).iter().skip(1).all(|&g| g == gap),
+                    "{hz} Hz phase {phase}: {:?}",
+                    sim.gaps(&out)
+                );
+                assert_eq!(out.resyncs, 0);
+            }
+        }
+        // 24 Hz into 60 fps alternates two and three slots.
+        let sim = Sim::new(60, at_hz(24, 0, 2 * SECOND, Kind::Content), 2 * SECOND);
+        let out = sim.run();
+        assert_eq!(out.stamps.len(), 48);
+        assert!(sim.gaps(&out).iter().all(|&g| g == 2 || g == 3));
+    }
+
+    #[test]
+    fn a_change_right_before_the_desktop_goes_idle_lands_at_the_next_slot() {
+        let interval = SECOND / 60;
+        // Sweep the last change across a whole slot.
+        for offset in (0..interval).step_by(997) {
+            let last = SECOND + offset;
+            let mut updates = at_hz(144, 0, SECOND, Kind::Content);
+            updates.push((last, Kind::Content));
+            let sim = Sim::new(60, updates, 3 * SECOND);
+            let out = sim.run();
+            assert_eq!(out.resyncs, 0, "offset {offset}");
+            let &copied = out.copied_at.last().unwrap();
+            assert!(
+                copied >= last,
+                "offset {offset}: the change was never copied"
+            );
+            assert!(copied <= last + interval, "offset {offset}: copied late");
+        }
+    }
+
+    #[test]
+    fn a_static_screen_copies_nothing() {
+        let sim = Sim::new(60, Vec::new(), 5 * SECOND);
+        let out = sim.run();
+        assert_eq!(out.stamps.len(), 1, "only the session's first frame");
+        assert_eq!(out.resyncs, 0);
+        // One acquire per poll timeout, not one per slot.
+        assert!(out.acquires <= 52, "{} acquires", out.acquires);
+    }
+
+    #[test]
+    fn pointer_motion_copies_nothing_and_does_not_outpace_the_slots() {
+        let sim = Sim::new(60, at_hz(1000, 0, 2 * SECOND, Kind::Pointer), 2 * SECOND);
+        let out = sim.run();
+        assert_eq!(out.stamps.len(), 1);
+        assert!(out.acquires <= 121, "{} acquires", out.acquires);
+    }
+
+    #[test]
+    fn pointer_motion_does_not_hold_back_a_content_change() {
+        let interval = SECOND / 60;
+        for offset in (0..interval).step_by(1_231) {
+            let change = SECOND + offset;
+            let mut updates = at_hz(1000, 0, 2 * SECOND, Kind::Pointer);
+            updates.push((change, Kind::Content));
+            let sim = Sim::new(60, updates, 2 * SECOND);
+            let out = sim.run();
+            assert_eq!(out.stamps.len(), 2, "offset {offset}");
+            let copied = out.copied_at[1];
+            assert!(
+                copied >= change && copied <= change + interval,
+                "offset {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overrun_skips_slots_instead_of_bursting() {
+        let interval = SECOND / 60;
+        for encode in [interval * 3 / 2, interval * 5 / 2, interval * 4] {
+            let mut sim = Sim::new(60, at_hz(144, 0, 2 * SECOND, Kind::Content), 2 * SECOND);
+            sim.encode = encode;
+            let out = sim.run();
+            assert!(out.late > 0, "encode {encode}");
+            let pacer = FramePacer::new(NonZeroU32::new(60).unwrap(), QPC_HZ);
+            for (&stamp, &at) in out.stamps.iter().zip(&out.copied_at) {
+                // Each frame takes the slot it was acquired in: no catching
+                // up on slots that already passed.
+                assert_eq!(stamp, pacer.timestamp(pacer.slot_at(at)), "encode {encode}");
+            }
+            for pair in out.copied_at.windows(2) {
+                assert!(pair[1] - pair[0] >= encode, "encode {encode}: burst");
+            }
+            let max_gap = (encode + interval - 1) / interval + 1;
+            assert!(sim.gaps(&out).iter().all(|&gap| gap >= 1 && gap <= max_gap));
+        }
+    }
+
+    #[test]
+    fn a_change_without_an_image_then_idle_resyncs_once() {
+        let mut updates = at_hz(144, 0, SECOND, Kind::Content);
+        updates.push((SECOND, Kind::Blank));
+        let sim = Sim::new(60, updates.clone(), 3 * SECOND);
+        let out = sim.run();
+        assert_eq!(out.resyncs, 1);
+        let &copied = out.copied_at.last().unwrap();
+        assert!(copied > SECOND && copied <= SECOND + SECOND / 30);
+
+        // With the pointer moving through the idle period.
+        let mut with_pointer = updates.clone();
+        with_pointer.extend(at_hz(500, SECOND + 1, 3 * SECOND, Kind::Pointer));
+        assert_eq!(Sim::new(60, with_pointer, 3 * SECOND).run().resyncs, 1);
+
+        // Motion right after it delivers the change without a resync.
+        let mut motion = updates;
+        motion.extend(at_hz(144, SECOND + 1, 2 * SECOND, Kind::Content));
+        assert_eq!(Sim::new(60, motion, 3 * SECOND).run().resyncs, 0);
     }
 }
