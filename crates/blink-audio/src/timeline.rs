@@ -218,13 +218,13 @@ impl Timeline {
     }
 
     /// A second source's timeline on this one's chunk grid: the same anchor,
-    /// starting empty at the chunk this one is filling, so chunk `n` of both
-    /// carries the same timestamp. Silence fill stops `fill_lag` behind the
-    /// wall clock.
-    pub(crate) const fn aligned(&self, fill_lag: i64) -> Self {
+    /// starting empty `behind` chunks before the one this one is filling
+    /// (but not before the segment start), so chunk `n` of both carries the
+    /// same timestamp. Silence fill stops `fill_lag` behind the wall clock.
+    pub(crate) const fn aligned(&self, fill_lag: i64, behind: u64) -> Self {
         Self {
             anchor: self.anchor,
-            chunks: self.chunks,
+            chunks: self.chunks.saturating_sub(behind),
             filled: 0,
             onset: true,
             slewing: false,
