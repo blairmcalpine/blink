@@ -14,6 +14,15 @@ window opens only on demand in a separate process.
 A short chime confirms each saved clip, and a lower tone means the save
 failed. Turn it off with **Play a sound when a clip is saved** in Settings.
 
+Clips include your default recording device, mixed with the system audio.
+Turn it off with **Record microphone** in Settings. A Bluetooth headset's
+microphone is skipped on purpose: opening it switches the headset to its
+hands-free mode, which makes everything it plays, the game included,
+low-quality mono. The tray tooltip says when this happens. To record your
+voice, make a wired or USB microphone, or the PC's built-in one, the default
+recording device in Windows Sound settings; blink picks up the change within
+a second.
+
 ## Status
 
 Pre-alpha. The whole pipeline is implemented: desktop capture, NVENC encode,

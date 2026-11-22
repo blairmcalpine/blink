@@ -158,6 +158,18 @@ microphone on upgrade.
   ducking (lowering other audio, the game included, during a call): that is
   documented to key on a stream opened on whichever endpoint is the default
   communications device, and on most PCs one microphone is both defaults.
+- **Bluetooth headsets.** A Bluetooth headset's microphone exists only on
+  its Hands-Free Profile endpoint, and opening that switches the headset
+  from A2DP to HFP: all its playback, game audio included, turns into
+  low-quality mono for as long as the stream runs. With the microphone on by
+  default that would degrade every Bluetooth user's game audio, so a default
+  recording endpoint whose `PKEY_Device_EnumeratorName` is `BTHHFENUM` (the
+  Windows Bluetooth hands-free audio enumerator) is never activated. The
+  property is read from the endpoint's property store, which opens nothing.
+  blink records desktop audio only, warns once, shows it in the tooltip, and
+  rechecks every second, so making a wired microphone the default picks it
+  up and switching back closes it again. It never falls back to a
+  microphone that is not the default.
 - **Format.** Shared mode with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, the same
   as loopback, so WASAPI converts a mono or 44.1 kHz microphone to the 48 kHz
   stereo the encoder takes.
@@ -196,7 +208,11 @@ microphone on upgrade.
 
 **Needs hardware verification**: whether opening the microphone ducks game
 audio through Windows' communications ducking (Sound > Communications
-settings) when it is also the default communications device; that a privacy
+settings) when it is also the default communications device; that an
+endpoint's `PKEY_Device_EnumeratorName` reports `BTHHFENUM` for a Bluetooth
+headset microphone (and `USB`, `HDAUDIO`, and so on otherwise; the open log
+records it), that reading it does not switch the headset's profile, and how
+Bluetooth LE Audio headsets and vendor Bluetooth stacks show up; that a privacy
 denial surfaces as `E_ACCESSDENIED`; the conversion of a mono 44.1 kHz
 microphone; Bluetooth headsets, which switch to their lower-quality
 hands-free profile while the microphone is open; and that the microphone's

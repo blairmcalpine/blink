@@ -98,6 +98,9 @@ const fn mic_line(state: MicState) -> Option<&'static str> {
         MicState::NotFound => Some("No microphone found; recording desktop audio only"),
         MicState::Denied => Some("Microphone blocked by Windows privacy settings"),
         MicState::Unavailable => Some("Microphone unavailable; retrying"),
+        MicState::BluetoothSkipped => {
+            Some("Bluetooth headset mic skipped (it would lower headset audio quality)")
+        }
     }
 }
 
@@ -202,6 +205,19 @@ mod tests {
         assert!(lines[3].contains("privacy"));
         assert!(mic_line(MicState::NotFound).is_some());
         assert!(mic_line(MicState::Unavailable).is_some());
+    }
+
+    #[test]
+    fn a_skipped_bluetooth_mic_fits_next_to_the_hotkey_line() {
+        let text = tooltip(&Status {
+            microphone: MicState::BluetoothSkipped,
+            ..status()
+        });
+        assert!(text.encode_utf16().count() < TOOLTIP_UNITS, "{text}");
+        assert!(!text.ends_with('…'), "{text}");
+        assert!(
+            text.ends_with("Bluetooth headset mic skipped (it would lower headset audio quality)")
+        );
     }
 
     #[test]

@@ -9,6 +9,20 @@
 //! defaults. So the role does not avoid ducking; whether opening the
 //! microphone ducks anything needs checking on hardware.
 //!
+//! A Bluetooth headset's microphone is only reachable through its
+//! Hands-Free Profile endpoint, and opening that switches the whole headset
+//! from A2DP to HFP: every sound it plays, the game included, becomes
+//! low-quality mono for as long as the stream runs. So a default recording
+//! endpoint whose device was enumerated by `BTHHFENUM`, the Windows
+//! Bluetooth hands-free audio enumerator, is skipped before it is activated.
+//! The check reads `PKEY_Device_EnumeratorName` from the endpoint's property
+//! store, which is device metadata and opens nothing. It is believed to
+//! report the enumerator of the device behind the endpoint (`USB`,
+//! `HDAUDIO`, `BTHHFENUM`) but needs confirming on hardware, as does whether
+//! vendor stacks or Bluetooth LE Audio headsets (a different enumerator,
+//! not skipped) behave the same. An unreadable name opens the endpoint as
+//! usual.
+//!
 //! Loopback adds `AUDCLNT_STREAMFLAGS_LOOPBACK`; everything else is shared.
 //! Format negotiation, in order:
 //!
@@ -34,6 +48,7 @@ use std::time::Duration;
 
 use blink_sys::ErrorChain;
 use tracing::debug;
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_EnumeratorName;
 use windows::Win32::Foundation::{E_ACCESSDENIED, ERROR_NOT_FOUND, HANDLE, WAIT_FAILED};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
@@ -47,12 +62,14 @@ use windows::Win32::Media::KernelStreaming::{
     KSDATAFORMAT_SUBTYPE_PCM, SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT, WAVE_FORMAT_EXTENSIBLE,
 };
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
-use windows::Win32::System::Com::CLSCTX_ALL;
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToBSTR};
+use windows::Win32::System::Com::{CLSCTX_ALL, STGM_READ};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{GUID, HRESULT, Owned, PCWSTR};
 
 use super::com::CoTaskMem;
 use super::{Context, Fault, has_flag};
+use crate::mic::is_hands_free_enumerator;
 use crate::pcm::SampleFormat;
 use crate::timeline::Packet;
 use crate::{AudioError, CHANNELS, SAMPLE_RATE};
@@ -121,18 +138,32 @@ pub(super) struct CaptureStream {
     format: SampleFormat,
     frame_bytes: usize,
     device_id: CoTaskMem<u16>,
+    /// The endpoint's bus enumerator, read for microphones only.
+    enumerator_name: Option<String>,
     // Declared last so the handle is closed after the client is released.
     event: Option<Owned<HANDLE>>,
 }
 
 impl CaptureStream {
     /// Opens and starts capture of `source` on its current default console
-    /// endpoint.
+    /// endpoint. Returns `None`, without activating the endpoint, when the
+    /// default recording endpoint is a Bluetooth hands-free microphone:
+    /// opening it would switch the headset to its hands-free profile.
     pub(super) fn open(
         enumerator: &IMMDeviceEnumerator,
         source: Source,
-    ) -> Result<Self, AudioError> {
+    ) -> Result<Option<Self>, AudioError> {
         let device = default_device(enumerator, source)?;
+        let enumerator_name = match source {
+            Source::Desktop => None,
+            Source::Microphone => enumerator_name(&device),
+        };
+        if enumerator_name
+            .as_deref()
+            .is_some_and(is_hands_free_enumerator)
+        {
+            return Ok(None);
+        }
         let device_id = device_id(&device)?;
         let (client, format, event) = initialize(&device, source)?;
         // SAFETY: `client` was successfully initialized, which `GetService`
@@ -142,20 +173,26 @@ impl CaptureStream {
         // SAFETY: the client is initialized and, if event-driven, its event
         // handle is set, as `Start` requires.
         unsafe { client.Start() }.context("start the capture stream")?;
-        Ok(Self {
+        Ok(Some(Self {
             source,
             client,
             capture,
             format,
             frame_bytes: format.bytes_per_sample() * usize::from(CHANNELS),
             device_id,
+            enumerator_name,
             event,
-        })
+        }))
     }
 
     /// Sample format the engine delivers.
     pub(super) const fn format(&self) -> SampleFormat {
         self.format
+    }
+
+    /// The endpoint's bus enumerator (`USB`, `HDAUDIO`, ...), if read.
+    pub(super) fn enumerator_name(&self) -> Option<&str> {
+        self.enumerator_name.as_deref()
     }
 
     /// Whether the stream signals an event per period (otherwise it is polled).
@@ -279,6 +316,40 @@ fn default_device(
     // SAFETY: plain COM call on a live enumerator with enum arguments.
     unsafe { enumerator.GetDefaultAudioEndpoint(source.data_flow(), eConsole) }
         .context(source.find_default())
+}
+
+/// The bus enumerator of the device behind `device` (`USB`, `HDAUDIO`,
+/// `BTHHFENUM`, ...), from the endpoint's property store, which reading does
+/// not activate the endpoint. `None`, logged at debug, if it cannot be read;
+/// the endpoint is then opened as usual.
+fn enumerator_name(device: &IMMDevice) -> Option<String> {
+    match read_enumerator_name(device) {
+        Ok(name) => Some(name),
+        Err(error) => {
+            debug!(error = %ErrorChain(&error), "cannot read the endpoint's enumerator name");
+            None
+        }
+    }
+}
+
+fn read_enumerator_name(device: &IMMDevice) -> Result<String, AudioError> {
+    // SAFETY: plain COM call on a live device, asking for read-only access.
+    let store = unsafe { device.OpenPropertyStore(STGM_READ) }
+        .context("open the endpoint property store")?;
+    // SAFETY: the key is a reference to a constant that outlives the call;
+    // the returned PROPVARIANT is owned by this function.
+    let mut value = unsafe { store.GetValue(&PKEY_Device_EnumeratorName) }
+        .context("read the endpoint enumerator name")?;
+    // SAFETY: `value` is a PROPVARIANT initialized by `GetValue`, which the
+    // call only reads; the returned BSTR is owned and freed on drop.
+    let name = unsafe { PropVariantToBSTR(&raw const value) }
+        .context("convert the endpoint enumerator name");
+    // SAFETY: `value` was initialized by `GetValue` and is not used after
+    // being cleared, which frees any string it holds.
+    if let Err(error) = unsafe { PropVariantClear(&raw mut value) } {
+        debug!(error = %ErrorChain(&error), "PropVariantClear failed");
+    }
+    Ok(name?.to_string())
 }
 
 fn device_id(device: &IMMDevice) -> Result<CoTaskMem<u16>, AudioError> {

@@ -18,7 +18,10 @@
 //! with backoff while the timeline keeps emitting silence, so the AAC stream
 //! stays continuous through device switches, unplugs, and audio-service
 //! restarts. A microphone that is missing, denied by the privacy settings, or
-//! lost only drops out of the mix; the desktop audio carries on.
+//! lost only drops out of the mix; the desktop audio carries on. A default
+//! microphone that is a Bluetooth headset's hands-free endpoint is never
+//! opened (see [`wasapi`]) and is rechecked once a second, so switching the
+//! default to another microphone picks that one up.
 
 mod com;
 mod encoder;
@@ -490,11 +493,27 @@ impl Endpoint {
             return false;
         }
         match CaptureStream::open(&self.enumerator, self.source) {
-            Ok(stream) => {
+            Ok(None) => {
+                if self.failure != Some(OpenFailure::BluetoothHandsFree) {
+                    warn!(
+                        "the default microphone is a Bluetooth headset's hands-free microphone; not \
+                         recording it, because opening it would switch the headset to low-quality \
+                         mono audio. Recording desktop audio only"
+                    );
+                }
+                self.failure = Some(OpenFailure::BluetoothHandsFree);
+                // Not a failure to back off from: recheck as often as a
+                // default change is checked for.
+                self.backoff.reset();
+                self.next_open = after(DEVICE_CHECK_INTERVAL);
+                false
+            }
+            Ok(Some(stream)) => {
                 info!(
                     source = ?self.source,
                     format = ?stream.format(),
                     event_driven = stream.is_event_driven(),
+                    enumerator = stream.enumerator_name(),
                     "audio capture stream started"
                 );
                 self.failure = None;
@@ -538,7 +557,9 @@ impl Endpoint {
                 "microphone access is denied in the Windows privacy settings; recording desktop \
                  audio only"
             ),
-            (Source::Microphone, OpenFailure::Other) => {
+            // A hands-free endpoint is not an open error; it has its own
+            // message in `ensure_open`.
+            (Source::Microphone, OpenFailure::Other | OpenFailure::BluetoothHandsFree) => {
                 warn!(%error, "cannot open the microphone; recording desktop audio only, retrying");
             }
         }
