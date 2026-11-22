@@ -44,6 +44,10 @@ pub struct Config {
     pub audio_enabled: bool,
     /// Audio bitrate in kbit/s. One of [`AUDIO_BITRATES_KBPS`].
     pub audio_bitrate_kbps: u32,
+    /// Whether the default microphone is mixed into the audio. Only applies
+    /// while [`Config::audio_enabled`] is on, so turning audio off never
+    /// records the microphone.
+    pub mic_enabled: bool,
     /// Display size that players stretch frames to, via the sample aspect
     /// ratio. `None` keeps square pixels. See [`STRETCH_TO_DIMENSION_RANGE`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +149,7 @@ impl Default for Config {
             video_bitrate_kbps: 20_000,
             audio_enabled: true,
             audio_bitrate_kbps: 160,
+            mic_enabled: true,
             stretch_to: None,
             save_sound: true,
         }
@@ -320,6 +325,7 @@ mod tests {
             video_bitrate_kbps: 50_000,
             audio_enabled: false,
             audio_bitrate_kbps: 192,
+            mic_enabled: false,
             stretch_to: Some("1920x1080".parse().unwrap()),
             save_sound: false,
         }
@@ -341,6 +347,7 @@ mod tests {
         assert_eq!(config.video_bitrate_kbps, 20_000);
         assert!(config.audio_enabled);
         assert_eq!(config.audio_bitrate_kbps, 160);
+        assert!(config.mic_enabled);
         assert_eq!(config.stretch_to, None);
         assert!(config.save_sound);
         assert_eq!(config.output_dir, default_output_dir().unwrap_or_default());
@@ -518,11 +525,18 @@ fps = 144
 video_bitrate_kbps = 50000
 audio_enabled = false
 audio_bitrate_kbps = 192
+mic_enabled = false
 stretch_to = "1920x1080"
 save_sound = false
 "#;
         assert_eq!(toml::to_string_pretty(&sample()).unwrap(), expected);
         assert_eq!(toml::from_str::<Config>(expected).unwrap(), sample());
+    }
+
+    #[test]
+    fn configs_from_before_the_microphone_setting_record_it() {
+        let config: Config = toml::from_str("audio_enabled = true\n").unwrap();
+        assert!(config.mic_enabled);
     }
 
     #[test]
