@@ -172,6 +172,10 @@ impl<'a> SettingsApp<'a> {
             });
         });
 
+        row(ui, "Sound", None, |ui| {
+            ui.checkbox(&mut draft.save_sound, "Play a sound when a clip is saved");
+        });
+
         browse
     }
 
@@ -418,6 +422,7 @@ mod tests {
         let mut app = SettingsApp::new(config(&dir), sample(), &outcome);
         app.draft.fps = 60;
         app.draft.stretch_enabled = false;
+        app.draft.save_sound = true;
         let output = save(&mut app);
         assert!(closed(&output));
 
@@ -427,6 +432,7 @@ mod tests {
             Config {
                 fps: 60,
                 stretch_to: None,
+                save_sound: true,
                 ..sample()
             }
         );

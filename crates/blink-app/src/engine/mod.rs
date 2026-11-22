@@ -3,7 +3,8 @@
 //! - **Tray thread** (the main thread, below-normal priority): owns the tray
 //!   icon and the global hotkey, pumps their window messages, and supervises
 //!   everything else: it sends save requests, restarts audio after failures,
-//!   spawns the settings process, and applies the reloaded config.
+//!   spawns the settings process, applies the reloaded config, and plays
+//!   the save sound ([`sound`]) when a save finishes.
 //! - **Capture thread** (below normal, [`capture`]): Desktop Duplication into
 //!   NVENC into the ring. Never waits on I/O or on a save.
 //! - **Audio thread** (below normal, owned by `blink-audio`): WASAPI loopback
@@ -22,6 +23,7 @@ mod audio;
 mod capture;
 mod save;
 mod signal;
+mod sound;
 mod tray;
 
 use std::path::{Path, PathBuf};
@@ -177,6 +179,7 @@ struct Engine {
 
 impl Engine {
     fn start(config_path: PathBuf, config: Config) -> anyhow::Result<Self> {
+        sound::prepare();
         let ring = Arc::new(SharedRing::new(RingSize::for_config(&config)));
         let (events, received) = mpsc::channel();
         let saver = Saver::spawn(Arc::clone(&ring), events.clone(), config.output_dir.clone())?;
@@ -235,6 +238,9 @@ impl Engine {
                     }
                     EngineEvent::Capture(state) => self.capture_changed(state),
                     EngineEvent::Saved(result) => {
+                        if self.config.save_sound {
+                            sound::play(&result);
+                        }
                         self.last_save = Some(result);
                         self.update_tooltip();
                     }

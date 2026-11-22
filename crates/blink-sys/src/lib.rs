@@ -4,8 +4,9 @@
 //! that have nothing to do with capture or audio themselves: the shared QPC
 //! clock ([`QpcClock`], `qpc_now`), thread priority
 //! (`set_current_thread_priority`, `BackgroundMode`), a single-instance mutex
-//! (`SingleInstance`), and a message pump for the tray thread
-//! (`pump_messages`). They live here once, as safe wrappers, so `blink-app`
+//! (`SingleInstance`), a message pump for the tray thread
+//! (`pump_messages`), and asynchronous playback of short in-memory sounds
+//! (`play_wav`). They live here once, as safe wrappers, so `blink-app`
 //! (which forbids `unsafe`) can use them and the FFI crates do not duplicate
 //! them.
 //!
@@ -37,6 +38,8 @@ mod fs;
 mod instance;
 #[cfg(windows)]
 mod messages;
+#[cfg(any(windows, test))]
+mod sound;
 #[cfg(windows)]
 mod thread;
 
@@ -51,5 +54,7 @@ pub use fs::{rename_no_replace, rename_replacing};
 pub use instance::SingleInstance;
 #[cfg(windows)]
 pub use messages::pump_messages;
+#[cfg(windows)]
+pub use sound::play_wav;
 #[cfg(windows)]
 pub use thread::{BackgroundMode, ThreadPriority, set_current_thread_priority};

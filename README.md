@@ -10,6 +10,9 @@ memory. Saving a clip cuts the ring buffer at a keyframe and remuxes it, so the
 clip is never re-encoded. blink lives in the system tray, and a minimal settings
 window opens only on demand in a separate process.
 
+A short chime confirms each saved clip, and a lower tone means the save
+failed. Turn it off with **Play a sound when a clip is saved** in Settings.
+
 ## Status
 
 Pre-alpha. The whole pipeline is implemented: desktop capture, NVENC encode,
@@ -76,6 +79,8 @@ and the toolchain bump procedure.
 - Consumer NVENC session limits apply.
 - A machine without an NVIDIA GPU gets a clear error rather than a silent
   fallback to CPU encoding.
+- The save chime plays through your speakers, so system-audio capture records
+  it, and the next clip that covers that moment includes it.
 
 ## Documentation
 
