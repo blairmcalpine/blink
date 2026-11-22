@@ -32,6 +32,7 @@ pub(crate) struct Draft {
     pub(crate) stretch_enabled: bool,
     /// Kept while stretching is off, so toggling it back restores the size.
     pub(crate) stretch: Resolution,
+    pub(crate) save_sound: bool,
 }
 
 impl Draft {
@@ -49,6 +50,7 @@ impl Draft {
             ),
             stretch_enabled: config.stretch_to.is_some(),
             stretch: config.stretch_to.unwrap_or(DEFAULT_STRETCH),
+            save_sound: config.save_sound,
         }
     }
 
@@ -64,6 +66,7 @@ impl Draft {
             audio_enabled: self.audio_enabled,
             audio_bitrate_kbps: audio_bitrate_to_save(self.audio_enabled, self.audio_bitrate_kbps),
             stretch_to: self.stretch_enabled.then_some(self.stretch),
+            save_sound: self.save_sound,
         }
     }
 }
@@ -215,6 +218,7 @@ pub(crate) mod tests {
             audio_enabled: false,
             audio_bitrate_kbps: 192,
             stretch_to: Some("1280x960".parse().unwrap()),
+            save_sound: false,
         }
     }
 
@@ -235,6 +239,7 @@ pub(crate) mod tests {
                     width: 1280,
                     height: 960
                 },
+                save_sound: false,
             }
         );
     }
@@ -418,6 +423,7 @@ pub(crate) mod tests {
                 width: 0,
                 height: 0,
             },
+            save_sound: true,
         };
         let names: Vec<_> = failing(&errors_for(&draft))
             .into_iter()

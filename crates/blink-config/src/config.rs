@@ -48,6 +48,9 @@ pub struct Config {
     /// ratio. `None` keeps square pixels. See [`STRETCH_TO_DIMENSION_RANGE`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stretch_to: Option<Resolution>,
+    /// Whether a short sound plays when a save finishes: a chime when the
+    /// clip is written, a lower tone when the save fails.
+    pub save_sound: bool,
 }
 
 /// A config value outside its allowed range.
@@ -143,6 +146,7 @@ impl Default for Config {
             audio_enabled: true,
             audio_bitrate_kbps: 160,
             stretch_to: None,
+            save_sound: true,
         }
     }
 }
@@ -317,6 +321,7 @@ mod tests {
             audio_enabled: false,
             audio_bitrate_kbps: 192,
             stretch_to: Some("1920x1080".parse().unwrap()),
+            save_sound: false,
         }
     }
 
@@ -337,6 +342,7 @@ mod tests {
         assert!(config.audio_enabled);
         assert_eq!(config.audio_bitrate_kbps, 160);
         assert_eq!(config.stretch_to, None);
+        assert!(config.save_sound);
         assert_eq!(config.output_dir, default_output_dir().unwrap_or_default());
     }
 
@@ -513,6 +519,7 @@ video_bitrate_kbps = 50000
 audio_enabled = false
 audio_bitrate_kbps = 192
 stretch_to = "1920x1080"
+save_sound = false
 "#;
         assert_eq!(toml::to_string_pretty(&sample()).unwrap(), expected);
         assert_eq!(toml::from_str::<Config>(expected).unwrap(), sample());
@@ -530,6 +537,10 @@ stretch_to = "1920x1080"
         assert_eq!(config.fps, 120);
         assert_eq!(config.hotkey.to_string(), "Ctrl+F9");
         assert_eq!(config.clip_seconds, 30);
+        assert!(
+            config.save_sound,
+            "files from before the setting keep the sound on"
+        );
     }
 
     #[test]

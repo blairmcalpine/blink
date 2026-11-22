@@ -22,6 +22,12 @@
     clippy::redundant_pub_crate,
     reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
+mod chime;
+#[cfg(any(windows, test))]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
+)]
 mod clip;
 #[cfg(any(windows, test))]
 #[expect(

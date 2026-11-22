@@ -22,6 +22,10 @@ pub(crate) struct ReloadPlan {
     /// Later saves go to a new folder. Saves read the folder from the config,
     /// so this needs no work beyond storing the new config.
     pub(crate) output_dir_changed: bool,
+    /// The save sound was turned on or off. The tray thread reads it from
+    /// the config when a save finishes, so this needs no work beyond storing
+    /// the new config.
+    pub(crate) save_sound_changed: bool,
 }
 
 impl ReloadPlan {
@@ -37,6 +41,7 @@ impl ReloadPlan {
             audio_enabled,
             audio_bitrate_kbps,
             stretch_to,
+            save_sound,
         } = new;
         let restart_pipeline = *fps != old.fps
             || *video_bitrate_kbps != old.video_bitrate_kbps
@@ -49,6 +54,7 @@ impl ReloadPlan {
             replace_ring: !restart_pipeline
                 && RingSize::for_config(new) != RingSize::for_config(old),
             output_dir_changed: *output_dir != old.output_dir,
+            save_sound_changed: *save_sound != old.save_sound,
         }
     }
 
@@ -76,6 +82,7 @@ mod tests {
         restart_pipeline: true,
         replace_ring: false,
         output_dir_changed: false,
+        save_sound_changed: false,
     };
 
     #[test]
@@ -128,6 +135,17 @@ mod tests {
             plan(|c| c.output_dir = PathBuf::from("/elsewhere")),
             ReloadPlan {
                 output_dir_changed: true,
+                ..ReloadPlan::default()
+            }
+        );
+    }
+
+    #[test]
+    fn save_sound_toggle_applies_live() {
+        assert_eq!(
+            plan(|c| c.save_sound = !c.save_sound),
+            ReloadPlan {
+                save_sound_changed: true,
                 ..ReloadPlan::default()
             }
         );

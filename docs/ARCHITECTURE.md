@@ -51,7 +51,7 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-audio` | WASAPI loopback capture and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-encode` | NVENC session management, resource registration, encode calls. | `unsafe` allowed; every block needs `// SAFETY:` |
-| `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex, and the tray thread's message pump. Also the portable helpers they share: `Backoff`, `ErrorChain`, and the replacing and no-replace file renames. | `unsafe` allowed; every block needs `// SAFETY:` |
+| `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex, the tray thread's message pump, and asynchronous playback of in-memory WAV sounds. Also the portable helpers they share: `Backoff`, `ErrorChain`, and the replacing and no-replace file renames. | `unsafe` allowed; every block needs `// SAFETY:` |
 
 The four FFI crates are the only place `unsafe` is permitted. They are also
 where bugs are most expensive, so they carry the strictest review bar.
@@ -321,6 +321,36 @@ that is renamed when complete; leftovers from a crash are deleted at startup.
 A second press while a clip is being written is cut right away into a second
 buffer, which is freed once both are back; more presses are ignored.
 
+### Save sound
+
+When the writer reports a result, the tray thread plays a short chime: a
+rising two-note one (250 ms) when the clip was written, a lower falling pair
+(300 ms) when the save failed. The `save_sound` setting, on by default,
+turns it off; the tray thread reads it from the current config each time, so
+a change applies to the next save.
+
+The sounds are synthesized in code (`blink-app`'s `chime` module, integer
+sine and envelope arithmetic) rather than shipped as audio files, so there is
+no asset to license and nothing in the binary but the generator. Each is
+rendered once at startup into a 16-bit mono 24 kHz WAV image (about 12 KB and
+14 KB) that lives until the process exits. `blink_sys::play_wav` hands that
+image to winmm's `PlaySoundW` with `SND_MEMORY | SND_ASYNC`: the call returns
+once winmm's own thread has the sound, and that thread keeps reading the
+image during playback, which is why the wrapper takes a `'static` slice and
+checks the RIFF length against it. A save therefore costs no allocation and
+no work on the capture, encode, or save threads; a second result while a
+sound plays cuts it off. An `IAudioClient` render stream would add a thread
+and device handling for no benefit at this length.
+
+The chime plays through the default output device, so WASAPI loopback
+records it into the ring, and the next clip covering that moment has it in
+its audio. That is accepted, as it is in other clip recorders; turning the
+sound off is the remedy.
+
+**Needs hardware verification**: that the first `PlaySoundW` call (which
+loads winmm's audio stack) does not stall the tray thread noticeably, and
+that the chime's volume sits comfortably under typical game audio.
+
 ## Settings UI
 
 The main `blink` process contains only the capture engine and a system tray icon
@@ -340,7 +370,8 @@ Win32 would be marginally lighter, but needs extensive `unsafe` code and is
 Windows-only.
 
 Settings exposed: output folder, clip length (seconds), hotkey, FPS,
-quality/bitrate, audio on/off, and the optional `stretch_to`.
+quality/bitrate, audio on/off, the optional `stretch_to`, and the save sound
+on/off.
 
 IPC: there is none beyond the file and the process exit. The settings process
 writes `%APPDATA%\blink\config.toml` atomically (write a temp file, then rename)
@@ -350,7 +381,7 @@ audio on/off, or `stretch_to` restart the pipeline cleanly (capture, encoder,
 audio, and a fresh ring). The save hotkey is suspended while the window is open and registered again
 when it closes, so a new hotkey applies live; a new clip length
 swaps in a resized ring live (the buffered clip is lost), and a new output
-folder applies to the next save. An invalid file is logged and ignored; the
+folder or save sound setting applies to the next save. An invalid file is logged and ignored; the
 engine keeps its previous config. Hand edits to the file are picked up the next
 time the settings window closes.
 

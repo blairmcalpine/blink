@@ -17,6 +17,14 @@ pub enum SysError {
     /// `QueryPerformanceFrequency` returned a non-positive frequency.
     #[error("invalid QPC frequency {0}")]
     InvalidQpcFrequency(i64),
+    /// A sound to play is not a well-formed WAV file image.
+    #[cfg(windows)]
+    #[error("the sound is not a well-formed WAV image")]
+    InvalidWav,
+    /// `PlaySoundW` could not play a sound.
+    #[cfg(windows)]
+    #[error("Windows could not play the sound")]
+    PlaySound,
 }
 
 /// Attaches context to a `windows` result.
