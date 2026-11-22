@@ -134,13 +134,14 @@ pub(crate) fn tooltip(status: &Status) -> String {
             lines.push(format!("Paused: {width}x{height} is too large for H.264"));
         }
     }
-    if let Some(line) = mic_line(status.microphone) {
-        lines.push(line.to_owned());
-    }
     match &status.last_save {
         None => {}
         Some(SaveResult::Saved(duration)) => lines.push(format!("Last clip saved ({duration})")),
         Some(SaveResult::Failed(error)) => lines.push(format!("Last save failed: {error}")),
+    }
+    // Last, so a long tooltip loses it before a save failure.
+    if let Some(line) = mic_line(status.microphone) {
+        lines.push(line.to_owned());
     }
     truncate(&lines.join("\n"))
 }
@@ -197,7 +198,8 @@ mod tests {
         });
         let lines: Vec<_> = denied.lines().collect();
         assert_eq!(lines.len(), 4, "{denied}");
-        assert!(lines[2].contains("privacy"));
+        assert_eq!(lines[2], "Last save failed: disk full");
+        assert!(lines[3].contains("privacy"));
         assert!(mic_line(MicState::NotFound).is_some());
         assert!(mic_line(MicState::Unavailable).is_some());
     }
