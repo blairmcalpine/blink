@@ -36,17 +36,32 @@ loaded from the installed driver at runtime.
 Download `blink-<version>-x86_64.msi` from the
 [latest release](https://github.com/blairmcalpine/blink/releases/latest) and
 run it. It installs blink for your user only, into
-`%LOCALAPPDATA%\Programs\blink`, without asking for administrator rights, and
-adds blink to the Start menu. Each release also has a `.sha256` file with the
-installer's checksum.
+`%LOCALAPPDATA%\Programs\blink`, without asking for administrator rights. Its
+one options screen adds a Start menu shortcut and starts blink when you sign
+in to Windows; both are on by default. The last screen can launch blink right
+away. Each release also has a `.sha256` file with the installer's checksum.
+
+To change whether blink starts when you sign in later, use **Start blink when
+I sign in** in blink's settings. Turning blink off under **Settings > Apps >
+Startup** in Windows also works, and blink's settings show it as off.
+
+For a quiet install, pass `0` to skip either option:
+
+```powershell
+msiexec /i blink-<version>-x86_64.msi /qn STARTMENUSHORTCUT=0 AUTOSTART=0
+```
+
+A quiet install never launches blink.
 
 The installer is not code-signed yet, so Microsoft Defender SmartScreen may
 warn that it is from an unknown publisher. Select **More info**, then
 **Run anyway**.
 
-Installing a newer release upgrades blink in place. To remove it, uninstall
-blink from **Settings > Apps > Installed apps**. Uninstalling keeps your
-settings (`%APPDATA%\blink`), logs (`%LOCALAPPDATA%\blink\logs`), and saved
+Installing a newer release upgrades blink in place and keeps your choices: the
+Start menu shortcut if you had it, and starting at sign-in as blink's
+settings last left it. To remove blink, uninstall it from **Settings > Apps >
+Installed apps**; that also stops it starting at sign-in. Uninstalling keeps
+your settings (`%APPDATA%\blink`), logs (`%LOCALAPPDATA%\blink\logs`), and saved
 clips.
 
 ## Building

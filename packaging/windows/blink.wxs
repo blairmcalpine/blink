@@ -7,6 +7,11 @@
   elevation. Windows Installer requires every component under the user profile
   to use an HKCU registry value as its key path (ICE38) and to remove the
   folders it creates (ICE64).
+
+  One dialog offers a Start menu shortcut and starting blink at sign-in, both
+  on by default; the last one offers to launch blink. A quiet install takes
+  the same choices from the public properties STARTMENUSHORTCUT and AUTOSTART
+  (1 or 0). CONTRIBUTING.md describes how upgrades and uninstall treat them.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
@@ -44,6 +49,131 @@
       <Custom Action="override Wix4CloseApplications_$(sys.BUILDARCHSHORT)" After="InstallInitialize" />
     </InstallExecuteSequence>
 
+    <!--
+      The install options. STARTMENUSHORTCUT and AUTOSTART are "1" to install
+      that part and anything else to skip it. A value given on the command
+      line wins. Otherwise a first install, or an upgrade from a version that
+      had no options, turns both on, and a later install (an upgrade or a
+      repair) keeps what is there now: the shortcut if the last install
+      added it, and starting at sign-in if blink's Run value exists, since
+      blink's settings window may have turned that on or off since.
+    -->
+    <Property Id="STARTMENUSHORTCUT" Secure="yes" />
+    <Property Id="AUTOSTART" Secure="yes" />
+    <Property Id="BLINKOPTIONSRECORDED" Secure="yes">
+      <RegistrySearch Id="OptionsRecordedSearch" Root="HKCU" Key="Software\blink\Installer" Name="Options" Type="raw" />
+    </Property>
+    <Property Id="BLINKSHORTCUTINSTALLED" Secure="yes">
+      <RegistrySearch Id="ShortcutInstalledSearch" Root="HKCU" Key="Software\blink\Installer" Name="StartMenuShortcut" Type="raw" />
+    </Property>
+    <Property Id="BLINKRUNVALUE" Secure="yes">
+      <RegistrySearch Id="RunValueSearch" Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="blink" Type="raw" />
+    </Property>
+    <!--
+      "first" runs these in the UI sequence, or in the execute sequence when
+      there is no UI sequence, as in a quiet install, so they never override
+      the dialog's choices.
+    -->
+    <SetProperty Id="STARTMENUSHORTCUT" Action="SetStartMenuShortcutOn" Value="1" After="AppSearch" Sequence="first"
+                 Condition="NOT STARTMENUSHORTCUT AND (NOT BLINKOPTIONSRECORDED OR BLINKSHORTCUTINSTALLED)" />
+    <SetProperty Id="STARTMENUSHORTCUT" Action="SetStartMenuShortcutOff" Value="0" After="SetStartMenuShortcutOn" Sequence="first"
+                 Condition="NOT STARTMENUSHORTCUT" />
+    <SetProperty Id="AUTOSTART" Action="SetAutostartOn" Value="1" After="SetStartMenuShortcutOff" Sequence="first"
+                 Condition="NOT AUTOSTART AND (NOT BLINKOPTIONSRECORDED OR BLINKRUNVALUE)" />
+    <SetProperty Id="AUTOSTART" Action="SetAutostartOff" Value="0" After="SetAutostartOn" Sequence="first"
+                 Condition="NOT AUTOSTART" />
+
+    <!--
+      blink's settings window can create the Run value after the install
+      skipped it, and Windows' startup apps can add a disabled entry for it,
+      so neither is always the MSI's own. A full uninstall deletes both; an
+      upgrade leaves them for the new version. Return="ignore" because
+      reg.exe exits 1 when a value is already gone. These deletes have no
+      rollback: if the uninstall fails after them, blink stays installed but
+      no longer starts at sign-in until it is turned on again.
+    -->
+    <SetProperty Id="RemoveRunValue" Value="&quot;[System64Folder]reg.exe&quot; delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v blink /f"
+                 Before="RemoveRunValue" Sequence="execute" />
+    <CustomAction Id="RemoveRunValue" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <SetProperty Id="RemoveStartupApprovedValue" Value="&quot;[System64Folder]reg.exe&quot; delete HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run /v blink /f"
+                 Before="RemoveStartupApprovedValue" Sequence="execute" />
+    <CustomAction Id="RemoveStartupApprovedValue" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixQuietExec"
+                  Execute="deferred" Impersonate="yes" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RemoveRunValue" Before="RemoveRegistryValues" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="RemoveStartupApprovedValue" After="RemoveRunValue" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <!-- Launch blink from the last dialog. Quiet installs never launch it. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch blink" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#blink.exe]" />
+    <CustomAction Id="LaunchBlink" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixShellExec" Impersonate="yes" />
+
+    <!--
+      WixUI_Minimal with its license dialog replaced by OptionsDlg. The
+      checkboxes edit private copies of the options, so a "0" from the
+      command line shows as unchecked, and Install writes them back as 1 or 0.
+    -->
+    <SetProperty Id="BlinkShortcutChoice" Value="1" After="SetAutostartOff" Sequence="ui" Condition="STARTMENUSHORTCUT = &quot;1&quot;" />
+    <SetProperty Id="BlinkAutostartChoice" Value="1" After="SetBlinkShortcutChoice" Sequence="ui" Condition="AUTOSTART = &quot;1&quot;" />
+    <UI Id="BlinkUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Dialog Id="OptionsDlg" Width="370" Height="270" Title="!(loc.WelcomeDlg_Title)">
+        <Control Id="Install" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WelcomeEulaDlgInstall)">
+          <Publish Property="STARTMENUSHORTCUT" Value="1" Order="1" Condition="BlinkShortcutChoice" />
+          <Publish Property="STARTMENUSHORTCUT" Value="0" Order="1" Condition="NOT BlinkShortcutChoice" />
+          <Publish Property="AUTOSTART" Value="1" Order="1" Condition="BlinkAutostartChoice" />
+          <Publish Property="AUTOSTART" Value="0" Order="1" Condition="NOT BlinkAutostartChoice" />
+          <Publish Event="SpawnWaitDialog" Value="WaitForCostingDlg" Order="2" Condition="!(wix.WixUICostingPopupOptOut) OR CostingComplete = 1" />
+          <Publish Event="EndDialog" Value="Return" Order="3" Condition="OutOfDiskSpace &lt;&gt; 1" />
+          <Publish Event="SpawnDialog" Value="OutOfRbDiskDlg" Order="3" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND (PROMPTROLLBACKCOST=&quot;P&quot; OR NOT PROMPTROLLBACKCOST)" />
+          <Publish Event="EndDialog" Value="Return" Order="3" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" />
+          <Publish Event="EnableRollback" Value="False" Order="3" Condition="OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 0 AND PROMPTROLLBACKCOST=&quot;D&quot;" />
+          <Publish Event="SpawnDialog" Value="OutOfDiskDlg" Order="3" Condition="(OutOfDiskSpace = 1 AND OutOfNoRbDiskSpace = 1) OR (OutOfDiskSpace = 1 AND PROMPTROLLBACKCOST=&quot;F&quot;)" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="ShortcutCheckBox" Type="CheckBox" X="135" Y="140" Width="220" Height="17" Property="BlinkShortcutChoice" CheckBoxValue="1" Text="Add a &amp;Start menu shortcut" />
+        <Control Id="AutostartCheckBox" Type="CheckBox" X="135" Y="162" Width="220" Height="17" Property="BlinkAutostartChoice" CheckBoxValue="1" Text="Start blink &amp;when I sign in" />
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="!(loc.WelcomeDlgBitmap)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="135" Y="20" Width="220" Height="60" Transparent="yes" NoPrefix="yes" Text="!(loc.WelcomeDlgTitle)" />
+        <Control Id="Description" Type="Text" X="135" Y="80" Width="220" Height="50" Transparent="yes" NoPrefix="yes"
+                 Text="[ProductName] installs for your Windows account only, without administrator rights. You can change when it starts later in blink's settings." />
+      </Dialog>
+
+      <InstallUISequence>
+        <Show Dialog="OptionsDlg" Before="ProgressDlg" Condition="NOT Installed" />
+      </InstallUISequence>
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchBlink" Order="1" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+    </UI>
+    <UIRef Id="WixUI_Common" />
+
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="LocalProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="blink">
@@ -59,12 +189,25 @@
             <File Id="THIRD_PARTY_NOTICES" Source="$(var.RepoRoot)\THIRD-PARTY-NOTICES.txt" Name="THIRD-PARTY-NOTICES.txt" />
             <RegistryValue Root="HKCU" Key="Software\blink\Installer" Name="Notices" Type="integer" Value="1" KeyPath="yes" />
           </Component>
+          <!-- Marks an install that recorded its options, for later upgrades. -->
+          <Component Id="InstallOptions" Guid="1C687BEF-88E1-41F7-A5D4-6B009F290B9C">
+            <RegistryValue Root="HKCU" Key="Software\blink\Installer" Name="Options" Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+          <!--
+            The same Run value blink's settings window reads and writes.
+            Transitive, so a repair re-checks AUTOSTART and follows a change
+            made in blink's settings instead of undoing it.
+          -->
+          <Component Id="Autostart" Guid="EA12F9E4-42A5-4B65-97BA-64B63376B016" Condition="AUTOSTART = &quot;1&quot;" Transitive="yes">
+            <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="blink" Type="string" Value="&quot;[INSTALLFOLDER]blink.exe&quot;" />
+            <RegistryValue Root="HKCU" Key="Software\blink\Installer" Name="Autostart" Type="integer" Value="1" KeyPath="yes" />
+          </Component>
         </Directory>
       </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Component Id="StartMenuShortcut" Guid="A8DEDF48-268F-4798-A202-6207DCDF9D39">
+      <Component Id="StartMenuShortcut" Guid="A8DEDF48-268F-4798-A202-6207DCDF9D39" Condition="STARTMENUSHORTCUT = &quot;1&quot;">
         <Shortcut Id="StartMenuShortcut"
                   Name="blink"
                   Description="Save the last seconds of your screen as a clip"
@@ -77,6 +220,8 @@
     <Feature Id="Main">
       <ComponentRef Id="Executable" />
       <ComponentRef Id="Notices" />
+      <ComponentRef Id="InstallOptions" />
+      <ComponentRef Id="Autostart" />
       <ComponentRef Id="StartMenuShortcut" />
     </Feature>
   </Package>

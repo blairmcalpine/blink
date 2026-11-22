@@ -63,6 +63,7 @@ jobs:
           dotnet tool install --global wix --version $env:WIX_VERSION
           $wix = Join-Path $env:USERPROFILE '.dotnet\tools\wix.exe'
           & $wix extension add --global "WixToolset.Util.wixext/$env:WIX_VERSION"
+          & $wix extension add --global "WixToolset.UI.wixext/$env:WIX_VERSION"
           Split-Path $wix | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       - name: Build blink.exe

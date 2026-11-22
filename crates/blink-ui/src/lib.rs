@@ -4,7 +4,9 @@
 //! separate short-lived child process, so the engine process links eframe but
 //! never initializes it. The window edits the config file and exits; the
 //! engine reloads the config when that child process exits. There is no
-//! other IPC.
+//! other IPC. Whether blink starts at sign-in is not in the config: the
+//! window reads and writes it through an [`AutostartSetting`] from the
+//! caller.
 //!
 //! The window is a small egui form on eframe's OpenGL (glow) renderer. It
 //! repaints only on input, never continuously; the text cursor does not
@@ -25,6 +27,11 @@ mod app;
     clippy::redundant_pub_crate,
     reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
+mod autostart;
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
+)]
 mod draft;
 #[expect(
     clippy::redundant_pub_crate,
@@ -35,6 +42,7 @@ mod keys;
 use std::cell::Cell;
 use std::path::Path;
 
+pub use autostart::AutostartSetting;
 use blink_config::{Config, ConfigError};
 use eframe::egui;
 use thiserror::Error;
@@ -45,7 +53,8 @@ pub enum Outcome {
     /// The user saved a changed, valid config to the file.
     Saved,
     /// The window closed without writing the file: the user cancelled,
-    /// closed the window, or saved without changing anything.
+    /// closed the window, or saved without changing the config (a changed
+    /// [`AutostartSetting`] alone does not write the file).
     Cancelled,
 }
 
@@ -67,6 +76,9 @@ pub enum UiError {
 /// until it closes. A missing file opens with the defaults and is created on
 /// save. This is `blink.exe --settings`.
 ///
+/// With `autostart`, the window also has a "Start blink when I sign in"
+/// checkbox, written on Save before the config.
+///
 /// Call this at most once per process, from the main thread: it starts the
 /// windowing event loop, which macOS requires on the main thread and winit
 /// allows only once.
@@ -77,7 +89,10 @@ pub enum UiError {
 /// showing a native error dialog where one is available (Windows, macOS).
 /// Returns [`UiError::Window`] when the window cannot be shown. A failed
 /// save is not an error: the window stays open and shows it.
-pub fn run(config_path: &Path) -> Result<Outcome, UiError> {
+pub fn run(
+    config_path: &Path,
+    autostart: Option<&dyn AutostartSetting>,
+) -> Result<Outcome, UiError> {
     let config = match Config::load_unvalidated(config_path) {
         Ok(config) => config,
         Err(err) => {
@@ -96,7 +111,10 @@ pub fn run(config_path: &Path) -> Result<Outcome, UiError> {
         centered: true,
         ..eframe::NativeOptions::default()
     };
-    let app = app::SettingsApp::new(config_path.to_owned(), config, &outcome);
+    let mut app = app::SettingsApp::new(config_path.to_owned(), config, &outcome);
+    if let Some(setting) = autostart {
+        app = app.with_autostart(setting);
+    }
     let create: eframe::AppCreator<'_> = Box::new(|cc| {
         configure(&cc.egui_ctx);
         Ok(Box::new(app))
