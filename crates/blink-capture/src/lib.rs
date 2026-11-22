@@ -2,9 +2,9 @@
 //!
 //! `create_device` makes the hardware D3D11 device that capture and the
 //! encoder share, and `DesktopDuplicator` turns one output into a stream of
-//! `CaptureEvent`s: BGRA textures on that device, decimated to the target
-//! frame rate and stamped with a `blink_ring` `Timestamp` on the shared QPC
-//! timeline. Frames never leave
+//! `CaptureEvent`s: BGRA textures on that device, acquired at most once per
+//! slot of the target frame rate and stamped with the slot's `blink_ring`
+//! `Timestamp` on the shared QPC timeline. Frames never leave
 //! the GPU. The duplicator recovers from `DXGI_ERROR_ACCESS_LOST` on display
 //! mode changes and reports size changes.
 //!

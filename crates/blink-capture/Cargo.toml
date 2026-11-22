@@ -16,9 +16,10 @@ blink-ring = { path = "../blink-ring" }
 blink-sys = { path = "../blink-sys" }
 tracing.workspace = true
 
-# `decision` is unit tested on every host.
+# `decision` and `schedule` are unit tested on every host.
 [dev-dependencies]
 blink-ring = { path = "../blink-ring" }
+blink-sys = { path = "../blink-sys" }
 
 [target.'cfg(windows)'.dependencies.windows]
 workspace = true
