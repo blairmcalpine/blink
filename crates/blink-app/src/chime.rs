@@ -4,7 +4,7 @@
 //! The engine renders each sound once at startup into a WAV image that lives
 //! for the rest of the process, which is what asynchronous playback from
 //! memory needs. Everything is integer arithmetic, so the output is exact on
-//! every host and the tests can check it byte for byte.
+//! every host, and a test pins a checksum of each image.
 
 /// Sample rate of the rendered sounds: half the 48 kHz rate Windows usually
 /// mixes at, and plenty for tones under 1 kHz.
@@ -20,6 +20,14 @@ const NOTE_GAIN: i64 = ONE / 4;
 /// How long each note takes to reach full volume, in milliseconds. Long
 /// enough to avoid a click, short enough to sound struck.
 const ATTACK_MS: u32 = 6;
+
+/// Silence before the first note, in milliseconds. A Bluetooth (A2DP)
+/// output that has gone idle can drop the first moments of audio while its
+/// stream wakes, which would otherwise clip the first note.
+const LEAD_IN_MS: u32 = 40;
+
+/// Length of the silent warm-up sound, in milliseconds.
+const WARM_UP_MS: u32 = 10;
 
 /// Bytes in the RIFF, `fmt `, and `data` headers of a PCM WAV image.
 const WAV_HEADER_LEN: usize = 44;
@@ -46,7 +54,7 @@ impl Chime {
     /// faded, so they ring together like a struck chime.
     const fn notes(self) -> &'static [Note] {
         match self {
-            // E5 then A5, a rising fourth: 250 ms.
+            // E5 then A5, a rising fourth: 250 ms after the lead-in.
             Self::Saved => &[
                 Note {
                     start_ms: 0,
@@ -59,7 +67,8 @@ impl Chime {
                     hz: 880,
                 },
             ],
-            // A4 then E4, the same interval falling an octave lower: 300 ms.
+            // A4 then E4, the same interval falling an octave lower: 300 ms
+            // after the lead-in.
             Self::Failed => &[
                 Note {
                     start_ms: 0,
@@ -78,7 +87,17 @@ impl Chime {
 
 /// The sound for `chime` as a complete 16-bit mono PCM WAV file image.
 pub(crate) fn wav(chime: Chime) -> Vec<u8> {
-    let samples = samples(chime);
+    wav_image(&samples(chime))
+}
+
+/// A WAV image of [`WARM_UP_MS`] of silence, played once so the first real
+/// sound does not pay for opening the output device.
+pub(crate) fn warm_up_wav() -> Vec<u8> {
+    wav_image(&vec![0; samples_in(WARM_UP_MS)])
+}
+
+/// `samples` as a complete 16-bit mono PCM WAV file image.
+fn wav_image(samples: &[i16]) -> Vec<u8> {
     let data_len = u32::try_from(samples.len() * 2).unwrap_or(0);
     let mut out = Vec::with_capacity(WAV_HEADER_LEN + samples.len() * 2);
     out.extend_from_slice(b"RIFF");
@@ -105,7 +124,7 @@ fn samples(chime: Chime) -> Vec<i16> {
     let notes = chime.notes();
     let len = notes
         .iter()
-        .map(|note| samples_in(note.start_ms + note.length_ms))
+        .map(|note| samples_in(LEAD_IN_MS + note.start_ms + note.length_ms))
         .max()
         .unwrap_or(0);
     let mut mix = vec![0_i64; len];
@@ -113,7 +132,8 @@ fn samples(chime: Chime) -> Vec<i16> {
         let length = samples_in(note.length_ms);
         let step = phase_step(note.hz);
         let mut phase = 0_u32;
-        let span = mix.iter_mut().skip(samples_in(note.start_ms)).take(length);
+        let start = samples_in(LEAD_IN_MS + note.start_ms);
+        let span = mix.iter_mut().skip(start).take(length);
         for (index, out) in span.enumerate() {
             *out += sine(phase) * envelope(index, length) / ONE * NOTE_GAIN / ONE;
             phase = phase.wrapping_add(step);
@@ -220,9 +240,12 @@ mod tests {
 
     #[test]
     fn sounds_are_short_and_modest() {
-        for (chime, ms) in [(Chime::Saved, 250), (Chime::Failed, 300)] {
+        for (chime, ms) in [(Chime::Saved, 290), (Chime::Failed, 340)] {
             let samples = samples(chime);
             assert_eq!(millis(&samples), ms, "{chime:?}");
+            let lead_in = samples_in(LEAD_IN_MS);
+            assert!(samples[..lead_in].iter().all(|&s| s == 0), "{chime:?}");
+            assert_ne!(samples[lead_in + 24], 0, "{chime:?}");
             let peak = samples.iter().map(|s| s.unsigned_abs()).max().unwrap();
             assert!((6_000..=16_384).contains(&peak), "{chime:?} peak {peak}");
         }
@@ -254,13 +277,51 @@ mod tests {
         let saved = samples(Chime::Saved);
         let failed = samples(Chime::Failed);
         let rate = usize::try_from(SAMPLE_RATE).unwrap();
-        let first = |s: &[i16]| crossings_per_second(&s[..rate * 60 / 1000]);
+        let lead_in = samples_in(LEAD_IN_MS);
+        let first = |s: &[i16]| crossings_per_second(&s[lead_in..lead_in + rate * 60 / 1000]);
         let last = |s: &[i16]| crossings_per_second(&s[s.len() - rate * 60 / 1000..]);
         let near = |measured: usize, hz: usize| measured.abs_diff(2 * hz) < 2 * hz / 10;
         assert!(near(first(&saved), 659), "{}", first(&saved));
         assert!(near(last(&saved), 880), "{}", last(&saved));
         assert!(near(first(&failed), 440), "{}", first(&failed));
         assert!(near(last(&failed), 330), "{}", last(&failed));
+    }
+
+    #[test]
+    fn warm_up_is_a_short_silent_wav() {
+        let wav = warm_up_wav();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(u32_at(&wav, 4), u32::try_from(wav.len() - 8).unwrap());
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32_at(&wav, 40), 480, "10 ms at 24 kHz");
+        assert!(wav[WAV_HEADER_LEN..].iter().all(|&b| b == 0));
+    }
+
+    /// 64-bit FNV-1a, a stable checksum for the golden test.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+
+    /// Any change to the synthesis changes these; update them only after
+    /// listening to the new sound.
+    #[test]
+    fn images_match_their_golden_checksums() {
+        let checksums = [
+            fnv1a(&wav(Chime::Saved)),
+            fnv1a(&wav(Chime::Failed)),
+            fnv1a(&warm_up_wav()),
+        ];
+        assert_eq!(
+            checksums,
+            [
+                0x703d_4259_0e39_5b8e,
+                0xb20a_2883_7dfc_460e,
+                0x39af_38e3_a334_cbdd
+            ],
+            "{checksums:#018x?}"
+        );
     }
 
     #[test]

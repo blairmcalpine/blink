@@ -23,8 +23,8 @@ pub(crate) struct ReloadPlan {
     /// so this needs no work beyond storing the new config.
     pub(crate) output_dir_changed: bool,
     /// The save sound was turned on or off. The tray thread reads it from
-    /// the config when a save finishes, so this needs no work beyond storing
-    /// the new config.
+    /// the config when a save finishes; turning it on also warms up
+    /// playback.
     pub(crate) save_sound_changed: bool,
 }
 

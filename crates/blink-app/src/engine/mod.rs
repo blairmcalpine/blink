@@ -180,6 +180,9 @@ struct Engine {
 impl Engine {
     fn start(config_path: PathBuf, config: Config) -> anyhow::Result<Self> {
         sound::prepare();
+        if config.save_sound {
+            sound::warm_up();
+        }
         let ring = Arc::new(SharedRing::new(RingSize::for_config(&config)));
         let (events, received) = mpsc::channel();
         let saver = Saver::spawn(Arc::clone(&ring), events.clone(), config.output_dir.clone())?;
@@ -426,6 +429,9 @@ impl Engine {
             }
         } else if plan.replace_ring {
             self.ring.replace(RingSize::for_config(&self.config));
+        }
+        if plan.save_sound_changed && self.config.save_sound {
+            sound::warm_up();
         }
         self.update_tooltip();
     }
