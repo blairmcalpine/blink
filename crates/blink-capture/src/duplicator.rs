@@ -22,7 +22,7 @@ use windows::core::Interface;
 
 use crate::decision::{
     Acquired, CaptureStats, FrameAction, Staleness, TimeoutAction, acquire_timeout_ms, decide,
-    monotonic, on_timeout,
+    monotonic, on_timeout, resync_deadline_qpc,
 };
 use crate::error::{CaptureError, Context, is_session_lost};
 use crate::rotation::RoundRobin;
@@ -351,6 +351,8 @@ impl DesktopDuplicator {
                 Step::Event(event) => {
                     if self.empty_session_overdue() {
                         self.stats.empty_resyncs = self.stats.empty_resyncs.saturating_add(1);
+                        self.stats
+                            .record_contentless_session(self.session_started.elapsed());
                         tracing::debug!(
                             waited = ?self.session_started.elapsed(),
                             "no desktop content on a session with nothing to show; re-duplicating"
@@ -367,6 +369,10 @@ impl DesktopDuplicator {
                 Step::Dropped if remaining.is_zero() => return Ok(CaptureEvent::Timeout),
                 Step::Dropped => {}
                 Step::Lost => {
+                    if self.staleness == Staleness::NewSession {
+                        self.stats
+                            .record_contentless_session(self.session_started.elapsed());
+                    }
                     self.lost_since = Some(Instant::now());
                     self.schedule_retry();
                 }
@@ -393,12 +399,14 @@ impl DesktopDuplicator {
         duplication: &IDXGIOutputDuplication,
         remaining: Duration,
     ) -> Result<Step, CaptureError> {
-        let until_slot = if self.staleness == Staleness::DroppedChange {
-            self.time_until_overdue()?
-        } else {
-            None
+        let until_resync = match resync_deadline_qpc(self.staleness, &self.scheduler) {
+            Some(deadline) => {
+                let now = qpc_counter()?;
+                Some(self.clock.to_duration(deadline.saturating_sub(now)))
+            }
+            None => None,
         };
-        let timeout_ms = acquire_timeout_ms(remaining, until_slot);
+        let timeout_ms = acquire_timeout_ms(remaining, until_resync);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         // SAFETY: `duplication` is live, no frame is currently held (every
@@ -464,15 +472,6 @@ impl DesktopDuplicator {
         }
     }
 
-    /// Time from now until the decimator's pending slot is overdue.
-    fn time_until_overdue(&self) -> Result<Option<Duration>, CaptureError> {
-        let Some(slot) = self.scheduler.overdue_qpc() else {
-            return Ok(None);
-        };
-        let now = qpc_counter()?;
-        Ok(Some(self.clock.to_duration(slot.saturating_sub(now))))
-    }
-
     /// Copies the acquired desktop image into the next pool texture.
     fn copy_frame(
         &mut self,
@@ -525,7 +524,9 @@ impl DesktopDuplicator {
     /// that would give it something to show: it is new, and nothing of the
     /// current size has been copied yet (startup, or after a resize). A
     /// pointer-only frame is never copied instead, since its surface can be
-    /// black; re-duplicating is the documented way to get the full desktop.
+    /// black. Re-duplicating is not documented to produce content, but the
+    /// first acquire of a fresh duplication is expected to carry the full
+    /// desktop, as it usually does in practice.
     fn empty_session_overdue(&self) -> bool {
         self.staleness == Staleness::NewSession
             && !self.pool.as_ref().is_some_and(|pool| pool.filled)
@@ -536,6 +537,9 @@ impl DesktopDuplicator {
     /// Logs and restarts the periodic frame counters.
     fn log_stats(&mut self, now: Instant) {
         let stats = std::mem::take(&mut self.stats);
+        let pending_first_content = (self.staleness == Staleness::NewSession
+            && self.duplication.is_some())
+        .then(|| now.saturating_duration_since(self.session_started));
         tracing::info!(
             copied = stats.copied,
             dropped = stats.dropped,
@@ -546,6 +550,8 @@ impl DesktopDuplicator {
             slowest_resync = ?stats.slowest_resync,
             slowest_first_content = ?stats.slowest_first_content,
             empty_resyncs = stats.empty_resyncs,
+            contentless_sessions = stats.contentless_sessions,
+            pending_first_content = ?pending_first_content,
             elapsed_s = now.saturating_duration_since(self.stats_since).as_secs(),
             "capture stats"
         );

@@ -109,6 +109,9 @@ pub(crate) struct CaptureStats {
     pub(crate) new_session_pointer_only: u64,
     /// Content updates that came without a desktop resource.
     pub(crate) no_image: u64,
+    /// Sessions that ended (lost, or re-duplicated for having nothing to
+    /// show) before their first content update.
+    pub(crate) contentless_sessions: u64,
     /// Sessions recreated to deliver a dropped change.
     pub(crate) resyncs: u64,
     /// The slowest of those recreations.
@@ -144,6 +147,13 @@ impl CaptureStats {
         self.slowest_first_content = self.slowest_first_content.max(waited);
     }
 
+    /// Records a session that ended after waiting `waited` without a
+    /// content update.
+    pub(crate) fn record_contentless_session(&mut self, waited: Duration) {
+        self.contentless_sessions = self.contentless_sessions.saturating_add(1);
+        self.slowest_first_content = self.slowest_first_content.max(waited);
+    }
+
     /// Counts one resync that took `elapsed`.
     pub(crate) fn record_resync(&mut self, elapsed: Duration) {
         self.resyncs = self.resyncs.saturating_add(1);
@@ -169,6 +179,18 @@ pub(crate) fn on_timeout(staleness: Staleness, overdue: bool) -> TimeoutAction {
         TimeoutAction::Resync
     } else {
         TimeoutAction::Report
+    }
+}
+
+/// The QPC time at which an acquire that sees no update should stop waiting
+/// and report a timeout, so [`on_timeout`] can resync: while a dropped change
+/// is pending, the time its slot becomes overdue. `None` means wait for the
+/// caller's full timeout.
+pub(crate) fn resync_deadline_qpc(staleness: Staleness, scheduler: &FrameScheduler) -> Option<i64> {
+    if staleness == Staleness::DroppedChange {
+        scheduler.overdue_qpc()
+    } else {
+        None
     }
 }
 
@@ -350,9 +372,9 @@ mod tests {
         }
     }
 
-    /// Drives `decide` and `on_timeout` the way the duplicator does: while a
-    /// dropped change is pending, `AcquireNextFrame` times out at the overdue
-    /// time if no update comes first. With `idle_after`, the desktop stays
+    /// Drives `decide` and `on_timeout` the way the duplicator does:
+    /// `AcquireNextFrame` times out at `resync_deadline_qpc` if no update
+    /// comes first. With `idle_after`, the desktop stays
     /// idle after the last update. Returns `(copies, resyncs)`.
     fn simulate(updates: &[Update], idle_after: bool) -> (usize, usize) {
         let mut s = scheduler();
@@ -369,8 +391,7 @@ mod tests {
             if next.is_none() && !idle_after {
                 break;
             }
-            if staleness == Staleness::DroppedChange
-                && let Some(cap) = s.overdue_qpc()
+            if let Some(cap) = resync_deadline_qpc(staleness, &s)
                 && next.is_none_or(|next| cap < next)
             {
                 assert_eq!(
@@ -446,6 +467,18 @@ mod tests {
     }
 
     #[test]
+    fn acquire_waits_until_a_dropped_change_is_overdue() {
+        let mut s = scheduler();
+        let mut staleness = Staleness::Fresh;
+        assert_eq!(resync_deadline_qpc(staleness, &s), None);
+        decide(changed(0), &mut staleness, &mut s);
+        decide(changed(INTERVAL / 4), &mut staleness, &mut s);
+        assert_eq!(resync_deadline_qpc(staleness, &s), s.overdue_qpc());
+        assert_ne!(resync_deadline_qpc(staleness, &s), s.next_admit_qpc());
+        assert_eq!(resync_deadline_qpc(Staleness::NewSession, &s), None);
+    }
+
+    #[test]
     fn idle_without_a_dropped_change_just_times_out() {
         assert_eq!(on_timeout(Staleness::Fresh, true), TimeoutAction::Report);
         assert_eq!(
@@ -482,6 +515,7 @@ mod tests {
         stats.record_resync(Duration::from_millis(1));
         stats.record_first_content(Duration::from_millis(40));
         stats.record_first_content(Duration::from_millis(20));
+        stats.record_contentless_session(Duration::from_millis(30));
         assert_eq!(
             stats,
             CaptureStats {
@@ -490,6 +524,7 @@ mod tests {
                 pointer_only: 2,
                 new_session_pointer_only: 1,
                 no_image: 1,
+                contentless_sessions: 1,
                 resyncs: 2,
                 slowest_resync: Duration::from_millis(3),
                 slowest_first_content: Duration::from_millis(40),
