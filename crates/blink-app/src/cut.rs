@@ -24,8 +24,10 @@ const EXTRA_PACKETS: usize = 256;
 /// Why no clip could be cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CutError {
-    /// No keyframe is stored before the save time.
-    #[error("nothing to save yet: no keyframe has been captured before the save time")]
+    /// No keyframe is stored before the save time: no video has been
+    /// captured yet, for example on a screen that has not changed since
+    /// recording started.
+    #[error("nothing to save yet: no video has been captured yet")]
     NothingYet,
     /// The ring kept evicting packets the copy still needed.
     #[error("the clip buffer overwrote the clip faster than it could be copied")]

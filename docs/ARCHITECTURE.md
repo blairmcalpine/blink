@@ -243,6 +243,32 @@ session with `DXGI_ERROR_ACCESS_LOST`. Recreate the session with a short retry
 backoff, because several of these can arrive in a row as the mode settles. The
 recording gap lasts a fraction of a second.
 
+Recovery has two tiers. The duplicator recreates a lost session itself, on the
+same D3D11 device, so the NVENC session and its texture registrations survive
+(a size change goes through encoder reconfiguration below). Only errors that
+recreating the session cannot fix, such as device removal, end the capture
+session: the capture thread then rebuilds the device, duplicator, and encoder.
+Its backoff resets only after a session has encoded for 10 seconds, so a fault
+that recurs every few seconds escalates the delay instead of rebuilding at the
+shortest one.
+
+A process can hold one duplication per output, and `DuplicateOutput` returns
+`E_INVALIDARG` while any reference to the previous session is alive. The
+duplicator drops its session before recreating it, including on the idle
+resync after a dropped change.
+
+Only frames with new desktop content (`LastPresentTime != 0`) are copied. A
+pointer-only update's surface is not guaranteed to hold the desktop, and on
+a new session it is black, so copying one encodes a black frame. A new
+session therefore waits for its first content update. A change the decimator
+dropped is delivered by the next content update, or by a resync once its slot
+has gone a whole frame interval without one: at 144 Hz into 60 fps the next
+update can land up to 6.9 ms after the slot opens, so resyncing as soon as it
+opens would recreate the session on most frames of continuous motion. A new
+session with nothing to show (startup, or after a resize) that gets no content
+update within a second is re-duplicated, backing off to every 8 s, rather than
+copying a pointer-only frame.
+
 ### Encoder reconfiguration
 
 Create the NVENC session once, with its maximum width and height set to the

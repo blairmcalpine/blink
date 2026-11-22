@@ -8,7 +8,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use blink_capture::{CaptureDevice, CaptureError, CaptureEvent, CapturedFrame, DesktopDuplicator};
@@ -16,11 +16,11 @@ use blink_config::Config;
 use blink_encode::{EncodeError, Encoder};
 use blink_ring::PushOutcome;
 use blink_ring::media::{Timestamp, VideoFormat};
-use blink_sys::{Backoff, ErrorChain, SysError, ThreadPriority};
+use blink_sys::{ErrorChain, SysError, ThreadPriority};
 
 use super::EngineEvent;
 use super::signal::StopSignal;
-use crate::decide::{ModeAction, mode_change_action, next_pts, should_refresh};
+use crate::decide::{ModeAction, RetryPolicy, mode_change_action, next_pts, should_refresh};
 use crate::mapping::encoder_config;
 use crate::shared::{Producer, SharedRing};
 use crate::status::CaptureState;
@@ -28,6 +28,9 @@ use crate::status::CaptureState;
 /// Longest wait in `next_frame`. Bounds how late a stop request or a
 /// static-screen IDR refresh is noticed.
 const POLL: Duration = Duration::from_millis(100);
+
+/// How often the encode counters are logged.
+const STATS_PERIOD: Duration = Duration::from_secs(60);
 
 const _: () = assert!(
     blink_capture::TEXTURE_POOL_SIZE <= blink_encode::MAX_REGISTERED_TEXTURES,
@@ -94,14 +97,41 @@ struct Run<'a> {
     events: &'a Sender<EngineEvent>,
     /// The largest supported mode seen, which sizes new encoder sessions.
     largest: (u32, u32),
-    /// Whether this session has encoded a frame, which resets the backoff.
-    encoded_any: bool,
+    /// When this session encoded its first frame (`None` until it has, or
+    /// while paused); a failure long enough after it resets the retry backoff.
+    encoding_since: Option<Instant>,
+    /// Frames this session encoded, for the failure log.
+    frames: u64,
     /// When encoding paused for an unsupported mode; kept across sessions
     /// and repeated mode changes until a frame is encoded again.
     paused_since: Option<Timestamp>,
+    /// Periodic encode counters, kept across sessions.
+    stats: EncodeStats,
+    stats_since: Instant,
 }
 
 impl Run<'_> {
+    const fn count_refresh(&mut self, refreshed: bool) {
+        if refreshed {
+            self.stats.refreshed = self.stats.refreshed.saturating_add(1);
+        }
+    }
+
+    fn log_stats(&mut self) {
+        let elapsed = self.stats_since.elapsed();
+        if elapsed < STATS_PERIOD {
+            return;
+        }
+        let stats = std::mem::take(&mut self.stats);
+        tracing::info!(
+            encoded = stats.encoded,
+            refreshed = stats.refreshed,
+            elapsed_s = elapsed.as_secs(),
+            "encode stats"
+        );
+        self.stats_since = Instant::now();
+    }
+
     fn report(&self, state: CaptureState) {
         let _ = self.events.send(EngineEvent::Capture(state));
     }
@@ -121,13 +151,16 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
     let mut run = Run {
         events,
         largest: (0, 0),
-        encoded_any: false,
+        encoding_since: None,
+        frames: 0,
         paused_since: None,
+        stats: EncodeStats::default(),
+        stats_since: Instant::now(),
     };
-    let mut backoff = Backoff::new(FIRST_RETRY, MAX_RETRY);
-    let mut failures = 0_u32;
+    let mut retry = RetryPolicy::new(FIRST_RETRY, MAX_RETRY);
     while !stop.is_stopped() {
-        run.encoded_any = false;
+        run.encoding_since = None;
+        run.frames = 0;
         match session(config, fps, ring, stop, &mut run) {
             Ok(()) => return,
             Err(Failure::Fatal(message)) => {
@@ -136,16 +169,14 @@ fn run(config: &Config, ring: &SharedRing, stop: &StopSignal, events: &Sender<En
                 return;
             }
             Err(Failure::Retry(error)) => {
-                if run.encoded_any {
-                    backoff.reset();
-                    failures = 0;
-                }
-                let delay = backoff.next_delay();
-                failures = failures.saturating_add(1);
+                let encoding_for = run.encoding_since.map(|since| since.elapsed());
+                let (failures, delay) = retry.on_failure(encoding_for);
                 let error = ErrorChain(error.as_ref()).to_string();
                 tracing::warn!(
                     error,
                     failures,
+                    frames = run.frames,
+                    encoding_ms = encoding_for.map(|elapsed| elapsed.as_millis()),
                     retry_in_ms = delay.as_millis(),
                     "capture stopped; rebuilding the device"
                 );
@@ -185,19 +216,30 @@ fn session(
         last_pts: None,
     };
     while !stop.is_stopped() {
+        run.log_stats();
         match duplicator.next_frame(POLL)? {
             CaptureEvent::ModeChanged { width, height } => {
                 state.mode_changed(&device, run, width, height)?;
             }
             CaptureEvent::Frame(frame) => {
-                if state.frame(frame)? && !run.encoded_any {
-                    run.encoded_any = true;
-                    run.paused_since = None;
-                    run.report(CaptureState::Recording);
+                if state.frame(frame)? {
+                    run.frames = run.frames.saturating_add(1);
+                    run.stats.encoded = run.stats.encoded.saturating_add(1);
+                    if run.encoding_since.is_none() {
+                        run.encoding_since = Some(Instant::now());
+                        run.paused_since = None;
+                        run.report(CaptureState::Recording);
+                    }
                 }
             }
-            CaptureEvent::Unchanged { timestamp } => state.refresh_idr(timestamp)?,
-            CaptureEvent::Timeout => state.refresh_idr(blink_sys::qpc_now()?)?,
+            CaptureEvent::Unchanged { timestamp } => {
+                let refreshed = state.refresh_idr(timestamp)?;
+                run.count_refresh(refreshed);
+            }
+            CaptureEvent::Timeout => {
+                let refreshed = state.refresh_idr(blink_sys::qpc_now()?)?;
+                run.count_refresh(refreshed);
+            }
         }
     }
     Ok(())
@@ -220,6 +262,15 @@ struct State<'a> {
     last_frame: Option<CapturedFrame>,
     /// Timestamp of the last encoded frame; encode timestamps must increase.
     last_pts: Option<Timestamp>,
+}
+
+/// Counters for the periodic encode summary.
+#[derive(Default)]
+struct EncodeStats {
+    /// Captured frames encoded.
+    encoded: u64,
+    /// Static-screen IDR refreshes that re-encoded the last frame.
+    refreshed: u64,
 }
 
 impl State<'_> {
@@ -246,7 +297,7 @@ impl State<'_> {
                     encoder.release_textures();
                 }
                 self.paused = true;
-                run.encoded_any = false;
+                run.encoding_since = None;
                 let since = match run.paused_since {
                     Some(since) => since,
                     None => blink_sys::qpc_now()?,
@@ -299,21 +350,21 @@ impl State<'_> {
 
     /// On a static screen nothing is encoded, so re-encode the last frame
     /// when the encoder wants an IDR: once a second, or right after the ring
-    /// dropped packets waiting for a keyframe.
-    fn refresh_idr(&mut self, now: Timestamp) -> Result<(), Failure> {
+    /// dropped packets waiting for a keyframe. Returns whether it did.
+    fn refresh_idr(&mut self, now: Timestamp) -> Result<bool, Failure> {
         let due = self
             .encoder
             .as_ref()
             .is_some_and(|encoder| encoder.idr_due(now));
         if !should_refresh(due, self.last_pts, now, self.last_frame.is_some()) {
-            return Ok(());
+            return Ok(false);
         }
         let Some(frame) = self.last_frame.take() else {
-            return Ok(());
+            return Ok(false);
         };
         let result = self.encode(&frame, now);
         self.last_frame = Some(frame);
-        result.map(drop)
+        result
     }
 
     fn encode(&mut self, frame: &CapturedFrame, pts: Timestamp) -> Result<bool, Failure> {

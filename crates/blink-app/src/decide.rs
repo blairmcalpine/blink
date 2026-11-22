@@ -1,7 +1,46 @@
 //! The capture thread's decisions, kept free of Windows types so they can be
 //! tested on any host.
 
+use std::time::Duration;
+
 use blink_ring::media::Timestamp;
+use blink_sys::Backoff;
+
+/// How long a session must have been encoding before its failure counts as a
+/// new problem rather than a repeat of the last one.
+pub(crate) const HEALTHY_AFTER: Duration = Duration::from_secs(10);
+
+/// Backoff and failure count for rebuilding the capture session.
+///
+/// A session that fails soon after it started encoding does not reset them,
+/// so a fault that recurs every few seconds escalates the delay instead of
+/// rebuilding at the shortest one forever.
+#[derive(Debug)]
+pub(crate) struct RetryPolicy {
+    backoff: Backoff,
+    failures: u32,
+}
+
+impl RetryPolicy {
+    pub(crate) const fn new(first: Duration, max: Duration) -> Self {
+        Self {
+            backoff: Backoff::new(first, max),
+            failures: 0,
+        }
+    }
+
+    /// Records a failed session that had been encoding for `encoding_for`
+    /// (`None` if it never encoded). Returns the consecutive failure count and
+    /// the delay before the next attempt.
+    pub(crate) fn on_failure(&mut self, encoding_for: Option<Duration>) -> (u32, Duration) {
+        if encoding_for.is_some_and(|healthy| healthy >= HEALTHY_AFTER) {
+            self.backoff.reset();
+            self.failures = 0;
+        }
+        self.failures = self.failures.saturating_add(1);
+        (self.failures, self.backoff.next_delay())
+    }
+}
 
 /// The largest width or height NVENC's H.264 encoder accepts.
 pub(crate) const H264_MAX_DIMENSION: u32 = 4096;
@@ -146,6 +185,31 @@ mod tests {
             true
         ));
         assert!(!should_refresh(true, last, Timestamp::from_ticks(99), true));
+    }
+
+    const fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    #[test]
+    fn short_lived_sessions_escalate_the_backoff() {
+        let mut policy = RetryPolicy::new(ms(250), ms(10_000));
+        assert_eq!(policy.on_failure(None), (1, ms(250)));
+        assert_eq!(policy.on_failure(Some(ms(30))), (2, ms(500)));
+        assert_eq!(policy.on_failure(Some(ms(9_999))), (3, ms(1_000)));
+        for _ in 0..10 {
+            policy.on_failure(Some(ms(100)));
+        }
+        assert_eq!(policy.on_failure(Some(ms(100))), (14, ms(10_000)));
+    }
+
+    #[test]
+    fn a_healthy_session_resets_the_backoff() {
+        let mut policy = RetryPolicy::new(ms(250), ms(10_000));
+        policy.on_failure(None);
+        policy.on_failure(None);
+        assert_eq!(policy.on_failure(Some(HEALTHY_AFTER)), (1, ms(250)));
+        assert_eq!(policy.on_failure(None), (2, ms(500)));
     }
 
     #[test]

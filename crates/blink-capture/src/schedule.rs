@@ -60,6 +60,7 @@ impl FrameScheduler {
 
     /// Whether [`admit`](Self::admit) would keep a frame at `qpc`, without
     /// consuming a slot.
+    #[cfg(test)]
     pub(crate) fn is_due(&self, qpc: i64) -> bool {
         let now = i128::from(qpc) * self.fps;
         self.live_due(now)
@@ -68,11 +69,31 @@ impl FrameScheduler {
 
     /// The earliest QPC time [`admit`](Self::admit) would keep a frame at, or
     /// `None` if it would keep one at any time.
+    #[cfg(test)]
     pub(crate) fn next_admit_qpc(&self) -> Option<i64> {
-        let earliest = self.next_due? - self.tolerance;
-        // Ceiling division: the first whole QPC count at or after the slot.
-        let qpc = -(-earliest).div_euclid(self.fps);
-        Some(i64::try_from(qpc).unwrap_or(if qpc < 0 { i64::MIN } else { i64::MAX }))
+        Some(self.qpc_at(self.next_due? - self.tolerance))
+    }
+
+    /// Whether a frame at `qpc` is a whole interval past the earliest time
+    /// [`admit`](Self::admit) would keep one, so the slot has gone unused by
+    /// any content update for a full frame. A change dropped before the slot
+    /// is then known to be the last one before the desktop went idle.
+    pub(crate) fn is_overdue(&self, qpc: i64) -> bool {
+        let now = i128::from(qpc) * self.fps;
+        self.live_due(now)
+            .is_none_or(|due| now >= due - self.tolerance + self.interval)
+    }
+
+    /// The earliest QPC time [`is_overdue`](Self::is_overdue) holds, or
+    /// `None` if it holds at any time.
+    pub(crate) fn overdue_qpc(&self) -> Option<i64> {
+        Some(self.qpc_at(self.next_due? - self.tolerance + self.interval))
+    }
+
+    /// Converts a scaled time to the first whole QPC count at or after it.
+    fn qpc_at(&self, scaled: i128) -> i64 {
+        let qpc = -(-scaled).div_euclid(self.fps);
+        i64::try_from(qpc).unwrap_or(if qpc < 0 { i64::MIN } else { i64::MAX })
     }
 
     /// The pending slot, unless it is implausibly far ahead of `now` (scaled).
@@ -198,6 +219,20 @@ mod tests {
         assert!(s.is_due(earliest));
         assert!(!s.admit(earliest - 1));
         assert!(s.admit(earliest));
+    }
+
+    #[test]
+    fn overdue_is_one_interval_after_the_slot_opens() {
+        let mut s = scheduler(60);
+        assert_eq!(s.overdue_qpc(), None);
+        assert!(s.is_overdue(0));
+        assert!(s.admit(0));
+        let earliest = s.next_admit_qpc().unwrap();
+        let overdue = s.overdue_qpc().unwrap();
+        assert_eq!(overdue, 145_834 + QPC_HZ / 60);
+        assert!(!s.is_overdue(earliest));
+        assert!(!s.is_overdue(overdue - 1));
+        assert!(s.is_overdue(overdue));
     }
 
     #[test]
