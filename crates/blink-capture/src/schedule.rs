@@ -15,14 +15,14 @@ use blink_ring::media::Timestamp;
 /// decides when the next acquire may start and which slot a frame takes.
 ///
 /// Slots tile the timeline from QPC zero: slot `n` starts at
-/// `n / target_fps` seconds. A copied frame takes the slot containing the
-/// time it was acquired, and is stamped with that slot's start, so frames
-/// during continuous motion are exactly one interval apart and a stamp is
-/// never later than the moment its image was taken. After a frame takes a
-/// slot, the next acquire waits for the following slot to start; if it starts
-/// later than that (the encode overran, or the thread was preempted), it takes
-/// the slot it lands in, skipping the ones that passed rather than catching up
-/// with a burst.
+/// `n / target_fps` seconds. A copied frame takes the slot whose start is
+/// nearest the time it was acquired (or the pending slot, if later), and is
+/// stamped with that slot's start, so frames during continuous motion are
+/// exactly one interval apart and a stamp is within half an interval of the
+/// moment its image was taken. After a frame takes a slot, the next acquire
+/// waits for the following slot to start; if it starts later than that (the
+/// encode overran, or the thread was preempted), it takes the nearest slot,
+/// skipping the ones that passed rather than catching up with a burst.
 ///
 /// Arithmetic is in `i128` on QPC counts scaled by `target_fps`, so slot
 /// boundaries are exact and rounding never accumulates.
@@ -63,49 +63,53 @@ impl FramePacer {
         Timestamp::from_ticks(saturate(ticks.div_euclid(self.fps)))
     }
 
+    /// The slot whose start is nearest QPC time `qpc`.
+    fn nearest_slot(&self, qpc: i64) -> i64 {
+        let scaled = i128::from(qpc) * self.fps + self.frequency / 2;
+        saturate(scaled.div_euclid(self.frequency))
+    }
+
     /// When the next acquire may start, if that is after `now`. Never more
-    /// than one slot boundary away, so a pending slot implausibly far ahead
-    /// (the clock went backwards, which QPC should never do) cannot stall
-    /// capture.
+    /// than two slot boundaries away (a frame can claim the slot after the
+    /// one it was taken in), so a pending slot implausibly far ahead (the
+    /// clock went backwards, which QPC should never do) cannot stall capture.
     pub(crate) fn wait_until(&self, now: i64) -> Option<i64> {
         let start = self.slot_start(self.next?);
-        let cap = self.slot_start(self.slot_at(now).saturating_add(1));
+        let cap = self.slot_start(self.slot_at(now).saturating_add(2));
         (start > now).then(|| start.min(cap))
     }
 
-    /// How many slots ended before an acquire starting at `now` could use
-    /// them: the encode or the thread ran late.
+    /// How many slots an acquire starting at `now` skips because the encode
+    /// or the thread ran late: it is nearer a later slot than the pending one.
     pub(crate) fn late_slots(&self, now: i64) -> u64 {
         self.next.map_or(0, |next| {
-            u64::try_from(self.slot_at(now).saturating_sub(next)).unwrap_or(0)
+            u64::try_from(self.nearest_slot(now).saturating_sub(next)).unwrap_or(0)
         })
     }
 
     /// Takes the slot for a frame acquired at `qpc` and returns its
-    /// timestamp: the slot containing `qpc`, or the next unclaimed one if
-    /// that is later, so timestamps strictly increase.
+    /// timestamp: the slot whose start is nearest `qpc`, so the stamp is
+    /// within half an interval of the moment the image was taken. That is the
+    /// slot containing `qpc`, or the next one if `qpc` is in the second half
+    /// of its slot (an update that arrived mid-slot while the acquire waited,
+    /// or a late acquire); then the following acquire waits for the slot
+    /// after it, so frames stay at least half an interval apart in real time.
+    /// Never earlier than the pending slot, so timestamps strictly increase.
     pub(crate) fn claim(&mut self, qpc: i64) -> Timestamp {
-        let at = self.slot_at(qpc);
-        let slot = self.next.map_or(at, |next| next.max(at));
+        let nearest = self.nearest_slot(qpc);
+        let slot = self.next.map_or(nearest, |next| next.max(nearest));
         self.next = Some(slot.saturating_add(1));
         self.timestamp(slot)
     }
 
     /// Holds the next acquire until the slot after the one containing `qpc`,
-    /// without emitting a frame: the update acquired at `qpc` had nothing to
-    /// copy, and whatever changes next accumulates until then.
+    /// without emitting a frame. Called when an acquire at `qpc` had nothing
+    /// to copy (a timeout, a pointer move, a change without an image) and when
+    /// a session is recreated. Whatever changes next accumulates until then,
+    /// and no frame can be stamped at or before a keyframe refresh the engine
+    /// stamps with the current time in reply.
     pub(crate) fn defer(&mut self, qpc: i64) {
-        self.raise(self.slot_at(qpc).saturating_add(1));
-    }
-
-    /// Records that an acquire waited until `qpc` without an update. The slot
-    /// containing `qpc` is still open, and the ones before it were not missed
-    /// by running late.
-    pub(crate) fn idle(&mut self, qpc: i64) {
-        self.raise(self.slot_at(qpc));
-    }
-
-    fn raise(&mut self, slot: i64) {
+        let slot = self.slot_at(qpc).saturating_add(1);
         self.next = Some(self.next.map_or(slot, |next| next.max(slot)));
     }
 }
@@ -192,18 +196,34 @@ mod tests {
         assert_eq!(p.claim(p.slot_start(4)), p.timestamp(4));
         // Deferring to an earlier slot never moves the next one back.
         p.defer(0);
-        assert_eq!(p.wait_until(0), Some(p.slot_start(1)));
+        assert_eq!(p.wait_until(p.slot_start(4)), Some(p.slot_start(5)));
     }
 
     #[test]
-    fn idle_waits_are_not_late() {
+    fn a_wait_ending_mid_slot_is_not_late_and_reserves_the_slot() {
         let mut p = pacer(60, QPC_HZ);
         p.claim(0);
-        let woke = p.slot_start(30) + 7;
-        p.idle(woke);
-        assert_eq!(p.late_slots(woke), 0);
-        assert_eq!(p.wait_until(woke), None);
-        assert_eq!(p.claim(woke + 1), p.timestamp(30));
+        let timed_out = p.slot_start(30) + 7;
+        p.defer(timed_out);
+        // A keyframe refresh stamped `timed_out` now precedes any frame.
+        assert_eq!(p.wait_until(timed_out), Some(p.slot_start(31)));
+        assert_eq!(p.late_slots(p.slot_start(31)), 0);
+        assert_eq!(p.claim(p.slot_start(31)), p.timestamp(31));
+    }
+
+    #[test]
+    fn a_take_in_the_second_half_of_a_slot_claims_the_next() {
+        let mut p = pacer(60, QPC_HZ);
+        p.claim(0);
+        let middle = i64::midpoint(p.slot_start(5), p.slot_start(6));
+        assert_eq!(p.claim(middle - 1), p.timestamp(5));
+        let mut p = pacer(60, QPC_HZ);
+        p.claim(0);
+        assert_eq!(p.claim(middle + 1), p.timestamp(6));
+        // The next acquire waits for the slot after the claimed one.
+        assert_eq!(p.wait_until(middle + 2), Some(p.slot_start(7)));
+        // Still never earlier than the pending slot.
+        assert_eq!(p.claim(p.slot_start(7)), p.timestamp(7));
     }
 
     #[test]
@@ -211,7 +231,7 @@ mod tests {
         let mut p = pacer(60, QPC_HZ);
         let ahead = p.claim(QPC_HZ * 100);
         let now = QPC_HZ;
-        assert_eq!(p.wait_until(now), Some(p.slot_start(p.slot_at(now) + 1)));
+        assert_eq!(p.wait_until(now), Some(p.slot_start(p.slot_at(now) + 2)));
         assert!(p.claim(now) > ahead);
     }
 }

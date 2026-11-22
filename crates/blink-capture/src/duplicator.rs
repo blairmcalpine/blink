@@ -21,12 +21,10 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::Interface;
 
 use crate::decision::{
-    Acquired, CaptureStats, FrameAction, Staleness, TimeoutAction, acquire_timeout_ms, decide,
-    on_timeout,
+    Acquire, Acquired, EMPTY_SESSION_WAIT, Outcome, Pacing, Staleness, next_empty_wait,
 };
 use crate::error::{CaptureError, Context, is_session_lost};
 use crate::rotation::RoundRobin;
-use crate::schedule::FramePacer;
 
 /// Number of textures the duplicator copies frames into, round robin.
 ///
@@ -55,11 +53,6 @@ const LONG_OUTAGE: Duration = Duration::from_secs(3);
 
 /// How often the frame counters are logged.
 const STATS_PERIOD: Duration = Duration::from_secs(60);
-
-/// How long a session with nothing to show waits for a content update before
-/// it is re-duplicated, doubling up to [`MAX_EMPTY_SESSION_WAIT`].
-const EMPTY_SESSION_WAIT: Duration = Duration::from_secs(1);
-const MAX_EMPTY_SESSION_WAIT: Duration = Duration::from_secs(8);
 
 /// A desktop image copied into one of the duplicator's pooled textures.
 ///
@@ -100,9 +93,9 @@ impl CapturedFrame {
     }
 
     /// Presentation time on the shared QPC timeline: the start of the pacing
-    /// slot the image was acquired in, so frames are a whole number of target
-    /// frame intervals apart. Strictly increasing across the frames of one
-    /// duplicator, and never after the moment the image was acquired.
+    /// slot nearest the moment the image was acquired (within half a target
+    /// frame interval of it), so frames are a whole number of intervals
+    /// apart. Strictly increasing across the frames of one duplicator.
     #[must_use]
     pub const fn timestamp(&self) -> Timestamp {
         self.timestamp
@@ -158,10 +151,12 @@ pub enum CaptureEvent {
 /// just before the desktop goes quiet is still captured, and a 144 Hz desktop
 /// costs one acquire per slot rather than one per refresh. When a slot finds
 /// nothing new, the acquire blocks until the desktop changes and takes that
-/// update straight away. Each frame is stamped with the start of the slot it
-/// was acquired in, so frames during motion are exactly one interval apart;
-/// a frame that starts late (a slow encode, a preempted thread) takes the
-/// slot it lands in, skipping the ones that passed rather than bursting.
+/// update straight away. Each frame is stamped with the start of the slot
+/// nearest the acquire, so frames during motion are exactly one interval
+/// apart; a frame that starts late (a slow encode, a preempted thread) takes
+/// the slot it lands nearest, skipping the ones that passed rather than
+/// bursting. After a timeout or a new session the current slot is not
+/// stamped, since the encoder may have refreshed a keyframe in it.
 ///
 /// Each emitted frame is copied with one GPU `CopyResource` into a small pool
 /// of textures this duplicator owns, and the duplication frame is released
@@ -209,11 +204,10 @@ pub struct DesktopDuplicator {
     duplication: Option<IDXGIOutputDuplication>,
     pool: Option<TexturePool>,
     clock: QpcClock,
-    pacer: FramePacer,
+    pacing: Pacing,
     backoff: Backoff,
     /// When to next try recreating a lost session; `None` means now.
     retry_at: Option<Instant>,
-    staleness: Staleness,
     /// An event to return before acquiring again.
     pending: Option<CaptureEvent>,
     /// A session has existed at some point, so errors that are fatal on first
@@ -228,7 +222,6 @@ pub struct DesktopDuplicator {
     next_sequence: u64,
     /// Sessions recreated to deliver a change that came without an image.
     resyncs: u64,
-    stats: CaptureStats,
     stats_since: Instant,
     /// When the current session was created.
     session_started: Instant,
@@ -269,10 +262,9 @@ impl DesktopDuplicator {
             duplication: None,
             pool: None,
             clock,
-            pacer: FramePacer::new(target_fps, clock.frequency()),
+            pacing: Pacing::new(target_fps, clock.frequency()),
             backoff: Backoff::new(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY),
             retry_at: None,
-            staleness: Staleness::NewSession,
             pending: None,
             had_session: false,
             lost_since: None,
@@ -280,7 +272,6 @@ impl DesktopDuplicator {
             logged_protected: false,
             next_sequence: 0,
             resyncs: 0,
-            stats: CaptureStats::default(),
             stats_since: Instant::now(),
             session_started: Instant::now(),
             empty_wait: EMPTY_SESSION_WAIT,
@@ -339,7 +330,7 @@ impl DesktopDuplicator {
             });
             if self.duplication.is_some() {
                 let now = qpc_counter()?;
-                if let Some(slot) = self.pacer.wait_until(now) {
+                if let Some(slot) = self.pacing.before_acquire(now) {
                     let wait = self.clock.to_duration(slot.saturating_sub(now));
                     if wait > remaining {
                         thread::sleep(remaining);
@@ -348,7 +339,6 @@ impl DesktopDuplicator {
                     thread::sleep(wait);
                     continue;
                 }
-                self.stats.record_late(self.pacer.late_slots(now));
             }
             // Moved out, not cloned: `DuplicateOutput` fails with
             // `E_INVALIDARG` while any reference to this output's previous
@@ -370,17 +360,14 @@ impl DesktopDuplicator {
             match step {
                 Step::Event(event) => {
                     if self.empty_session_overdue() {
-                        self.stats.empty_resyncs = self.stats.empty_resyncs.saturating_add(1);
-                        self.stats
-                            .record_contentless_session(self.session_started.elapsed());
+                        let stats = &mut self.pacing.stats;
+                        stats.empty_resyncs = stats.empty_resyncs.saturating_add(1);
+                        stats.record_contentless_session(self.session_started.elapsed());
                         tracing::debug!(
                             waited = ?self.session_started.elapsed(),
                             "no desktop content on a session with nothing to show; re-duplicating"
                         );
-                        self.empty_wait = self
-                            .empty_wait
-                            .saturating_mul(2)
-                            .min(MAX_EMPTY_SESSION_WAIT);
+                        self.empty_wait = next_empty_wait(self.empty_wait);
                         self.duplication = None;
                         self.try_recover(Recovery::Empty)?;
                     }
@@ -389,8 +376,9 @@ impl DesktopDuplicator {
                 Step::Missed if remaining.is_zero() => return Ok(CaptureEvent::Timeout),
                 Step::Missed => {}
                 Step::Lost => {
-                    if self.staleness == Staleness::NewSession {
-                        self.stats
+                    if self.pacing.staleness == Staleness::NewSession {
+                        self.pacing
+                            .stats
                             .record_contentless_session(self.session_started.elapsed());
                     }
                     self.lost_since = Some(Instant::now());
@@ -401,7 +389,7 @@ impl DesktopDuplicator {
                     let started = Instant::now();
                     self.try_recover(Recovery::Resync)?;
                     let elapsed = started.elapsed();
-                    self.stats.record_resync(elapsed);
+                    self.pacing.stats.record_resync(elapsed);
                     tracing::debug!(
                         ?elapsed,
                         resyncs = self.resyncs,
@@ -419,7 +407,7 @@ impl DesktopDuplicator {
         duplication: &IDXGIOutputDuplication,
         remaining: Duration,
     ) -> Result<Step, CaptureError> {
-        let timeout_ms = acquire_timeout_ms(remaining, self.staleness);
+        let timeout_ms = self.pacing.acquire_timeout_ms(remaining);
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
         // SAFETY: `duplication` is live, no frame is currently held (every
@@ -431,13 +419,10 @@ impl DesktopDuplicator {
         match acquired {
             Ok(()) => {}
             Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                self.stats.record_timeout();
-                return Ok(match on_timeout(self.staleness) {
-                    TimeoutAction::Resync => Step::Resync,
-                    TimeoutAction::Report => {
-                        self.pacer.idle(qpc_counter()?);
-                        Step::Event(CaptureEvent::Timeout)
-                    }
+                let outcome = self.pacing.after_acquire(Acquire::Timeout, qpc_counter()?);
+                return Ok(match outcome {
+                    Outcome::Resync => Step::Resync,
+                    _ => Step::Event(CaptureEvent::Timeout),
                 });
             }
             Err(error) if is_session_lost(error.code()) => {
@@ -461,37 +446,40 @@ impl DesktopDuplicator {
             content_changed: info.LastPresentTime != 0,
             has_image: resource.is_some(),
         };
-        let before = self.staleness;
-        let action = decide(facts, &mut self.staleness);
-        self.stats.record(facts, before, info.AccumulatedFrames);
-        match (action, resource) {
-            (FrameAction::Copy, Some(resource)) => {
-                if before == Staleness::NewSession {
-                    self.stats
+        let acquired = Acquire::Frame {
+            facts,
+            accumulated: info.AccumulatedFrames,
+        };
+        match self.pacing.after_acquire(acquired, qpc) {
+            Outcome::Copy {
+                timestamp,
+                first_of_session,
+            } => {
+                if first_of_session {
+                    self.pacing
+                        .stats
                         .record_first_content(self.session_started.elapsed());
                 }
-                self.copy_frame(&resource, qpc).map(Step::Event)
+                let Some(resource) = resource else {
+                    return Err(CaptureError::Invariant("copying a frame without an image"));
+                };
+                self.copy_frame(&resource, timestamp).map(Step::Event)
             }
-            (FrameAction::Unchanged, _) => {
-                self.pacer.defer(qpc);
-                Ok(Step::Event(CaptureEvent::Unchanged {
-                    timestamp: self.clock.to_ticks(qpc),
-                }))
-            }
-            (FrameAction::Missed | FrameAction::Copy, _) => {
-                self.pacer.defer(qpc);
-                Ok(Step::Missed)
-            }
-            (FrameAction::Resync, _) => Ok(Step::Resync),
+            Outcome::Unchanged => Ok(Step::Event(CaptureEvent::Unchanged {
+                timestamp: self.clock.to_ticks(qpc),
+            })),
+            Outcome::Timeout => Ok(Step::Event(CaptureEvent::Timeout)),
+            Outcome::Missed => Ok(Step::Missed),
+            Outcome::Resync => Ok(Step::Resync),
         }
     }
 
-    /// Copies the desktop image acquired at QPC time `qpc` into the next pool
-    /// texture, stamped with its pacing slot.
+    /// Copies the desktop image into the next pool texture, stamped with
+    /// `timestamp`.
     fn copy_frame(
         &mut self,
         resource: &IDXGIResource,
-        qpc: i64,
+        timestamp: Timestamp,
     ) -> Result<CaptureEvent, CaptureError> {
         let source: ID3D11Texture2D = resource.cast().context("query the desktop texture")?;
         let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -513,7 +501,6 @@ impl DesktopDuplicator {
         // a no-op, not undefined behavior. The source stays alive until the
         // frame is released, after this call is queued.
         unsafe { self.context.CopyResource(&texture, &source) };
-        let timestamp = self.pacer.claim(qpc);
         let sequence = self.next_sequence;
         self.next_sequence = sequence.saturating_add(1);
         self.empty_wait = EMPTY_SESSION_WAIT;
@@ -535,23 +522,25 @@ impl DesktopDuplicator {
     }
 
     /// Whether the session has gone `empty_wait` without the content update
-    /// that would give it something to show: it is new, and nothing of the
-    /// current size has been copied yet (startup, or after a resize). A
-    /// pointer-only frame is never copied instead, since its surface can be
-    /// black. Re-duplicating is not documented to produce content, but the
-    /// first acquire of a fresh duplication is expected to carry the full
-    /// desktop, as it usually does in practice.
+    /// that would give it something to show (see
+    /// [`Pacing::empty_session_overdue`]); nothing of the current size has
+    /// been copied yet on startup or after a resize. Re-duplicating is not
+    /// documented to produce content, but the first acquire of a fresh
+    /// duplication is expected to carry the full desktop, as it usually does
+    /// in practice.
     fn empty_session_overdue(&self) -> bool {
-        self.staleness == Staleness::NewSession
-            && !self.pool.as_ref().is_some_and(|pool| pool.filled)
-            && self.duplication.is_some()
-            && self.session_started.elapsed() >= self.empty_wait
+        self.duplication.is_some()
+            && self.pacing.empty_session_overdue(
+                self.pool.as_ref().is_some_and(|pool| pool.filled),
+                self.session_started.elapsed(),
+                self.empty_wait,
+            )
     }
 
     /// Logs and restarts the periodic frame counters.
     fn log_stats(&mut self, now: Instant) {
-        let stats = std::mem::take(&mut self.stats);
-        let pending_first_content = (self.staleness == Staleness::NewSession
+        let stats = std::mem::take(&mut self.pacing.stats);
+        let pending_first_content = (self.pacing.staleness == Staleness::NewSession
             && self.duplication.is_some())
         .then(|| now.saturating_duration_since(self.session_started));
         tracing::info!(
@@ -680,9 +669,8 @@ impl DesktopDuplicator {
         self.duplication = Some(duplication);
         self.had_session = true;
         // Time spent without a session was not a slot missed by running late.
-        self.pacer.idle(qpc_counter()?);
+        self.pacing.new_session(qpc_counter()?);
         self.retry_at = None;
-        self.staleness = Staleness::NewSession;
         self.session_started = Instant::now();
         let (_, resized) = pool_for(&mut self.pool, &self.device, width, height)?;
         if first || resized {

@@ -1,10 +1,21 @@
 //! What to do with each acquired duplication frame, as pure logic.
 //!
 //! The Windows duplicator gathers the facts (did content change, is there an
-//! image) and acts on the answer; everything in between lives here and in
-//! [`FramePacer`](crate::schedule::FramePacer), so it is tested on every host.
+//! image) and acts on the answer; everything in between lives here, in
+//! [`Pacing`], and in [`FramePacer`], so it is tested on every host by
+//! driving the same calls the duplicator makes.
 
+use std::num::NonZeroU32;
 use std::time::Duration;
+
+use blink_ring::media::Timestamp;
+
+use crate::schedule::FramePacer;
+
+/// How long a session with nothing to show waits for a content update before
+/// it is re-duplicated, doubling up to [`MAX_EMPTY_SESSION_WAIT`].
+pub(crate) const EMPTY_SESSION_WAIT: Duration = Duration::from_secs(1);
+pub(crate) const MAX_EMPTY_SESSION_WAIT: Duration = Duration::from_secs(8);
 
 /// `AcquireNextFrame` treats `u32::MAX` as INFINITE; longer waits are capped
 /// one below it and re-issued by the caller's loop.
@@ -111,6 +122,135 @@ pub(crate) fn acquire_timeout_ms(remaining: Duration, staleness: Staleness) -> u
     u32::try_from(remaining.as_micros().div_ceil(1000))
         .unwrap_or(MAX_WAIT_MS)
         .min(MAX_WAIT_MS)
+}
+
+/// What one `AcquireNextFrame` call produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Acquire {
+    /// `DXGI_ERROR_WAIT_TIMEOUT`.
+    Timeout,
+    /// A frame, which folded `accumulated` desktop updates.
+    Frame { facts: Acquired, accumulated: u32 },
+}
+
+/// What the duplicator does after an acquire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// Copy the image and emit it with `timestamp`. `first_of_session` when
+    /// it is the session's first copied frame.
+    Copy {
+        timestamp: Timestamp,
+        first_of_session: bool,
+    },
+    /// Report `CaptureEvent::Unchanged`.
+    Unchanged,
+    /// Report `CaptureEvent::Timeout`.
+    Timeout,
+    /// Keep waiting; the next slot looks again.
+    Missed,
+    /// Recreate the session.
+    Resync,
+}
+
+/// The duplicator's pure state: pacing, staleness, and counters. The Windows
+/// duplicator and the tests' simulation make the same calls in the same
+/// order: [`before_acquire`](Self::before_acquire), then
+/// [`acquire_timeout_ms`](Self::acquire_timeout_ms) and
+/// [`after_acquire`](Self::after_acquire) around `AcquireNextFrame`, and
+/// [`new_session`](Self::new_session) whenever a session is created.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Pacing {
+    pub(crate) pacer: FramePacer,
+    pub(crate) staleness: Staleness,
+    pub(crate) stats: CaptureStats,
+}
+
+impl Pacing {
+    /// Pacing for `target_fps` on a QPC clock at `qpc_frequency`.
+    pub(crate) fn new(target_fps: NonZeroU32, qpc_frequency: i64) -> Self {
+        Self {
+            pacer: FramePacer::new(target_fps, qpc_frequency),
+            staleness: Staleness::NewSession,
+            stats: CaptureStats::default(),
+        }
+    }
+
+    /// Called before acquiring at QPC time `now`: the QPC time to sleep until
+    /// first, or `None` to acquire now (counting any slots that passed).
+    pub(crate) fn before_acquire(&mut self, now: i64) -> Option<i64> {
+        let wait = self.pacer.wait_until(now);
+        if wait.is_none() {
+            self.stats.record_late(self.pacer.late_slots(now));
+        }
+        wait
+    }
+
+    /// The `AcquireNextFrame` timeout; see [`acquire_timeout_ms`].
+    pub(crate) fn acquire_timeout_ms(&self, remaining: Duration) -> u32 {
+        acquire_timeout_ms(remaining, self.staleness)
+    }
+
+    /// Decides what an acquire that returned at QPC time `now` becomes.
+    pub(crate) fn after_acquire(&mut self, acquired: Acquire, now: i64) -> Outcome {
+        let (facts, accumulated) = match acquired {
+            Acquire::Timeout => {
+                self.stats.record_timeout();
+                return match on_timeout(self.staleness) {
+                    TimeoutAction::Resync => Outcome::Resync,
+                    TimeoutAction::Report => {
+                        self.pacer.defer(now);
+                        Outcome::Timeout
+                    }
+                };
+            }
+            Acquire::Frame { facts, accumulated } => (facts, accumulated),
+        };
+        let before = self.staleness;
+        let action = decide(facts, &mut self.staleness);
+        self.stats.record(facts, before, accumulated);
+        match action {
+            FrameAction::Copy => Outcome::Copy {
+                timestamp: self.pacer.claim(now),
+                first_of_session: before == Staleness::NewSession,
+            },
+            FrameAction::Unchanged => {
+                self.pacer.defer(now);
+                Outcome::Unchanged
+            }
+            FrameAction::Missed => {
+                self.pacer.defer(now);
+                Outcome::Missed
+            }
+            FrameAction::Resync => Outcome::Resync,
+        }
+    }
+
+    /// Records a session created at QPC time `now`. The engine may have
+    /// refreshed a keyframe at the current time while there was no session,
+    /// so the slot containing `now` is not used.
+    pub(crate) fn new_session(&mut self, now: i64) {
+        self.staleness = Staleness::NewSession;
+        self.pacer.defer(now);
+    }
+
+    /// Whether a session with nothing to show (`has_frame` is false: nothing
+    /// of the current size has been copied) has waited `waited`, at least
+    /// `limit`, without a content update and should be re-duplicated. A
+    /// pointer-only frame is never copied instead, since its surface can be
+    /// black.
+    pub(crate) fn empty_session_overdue(
+        &self,
+        has_frame: bool,
+        waited: Duration,
+        limit: Duration,
+    ) -> bool {
+        self.staleness == Staleness::NewSession && !has_frame && waited >= limit
+    }
+}
+
+/// The wait for the next empty session after one ran out of `wait`.
+pub(crate) fn next_empty_wait(wait: Duration) -> Duration {
+    wait.saturating_mul(2).min(MAX_EMPTY_SESSION_WAIT)
 }
 
 /// Frame counters for the duplicator's periodic summary log.
@@ -325,11 +465,15 @@ mod tests {
         Blank,
     }
 
-    /// Drives [`FramePacer`], [`decide`], and [`on_timeout`] the way the
-    /// duplicator does, against a model of DXGI: updates accumulate while no
-    /// frame is held, an acquire returns at once if any are pending and
-    /// otherwise blocks until the next one or its timeout, and a new
-    /// session's first acquire carries the whole desktop.
+    /// Drives [`Pacing`] with the calls the duplicator makes, in the same
+    /// order, against a model of DXGI: updates accumulate while no frame is
+    /// held, an acquire returns at once if any are pending and otherwise
+    /// blocks until the next one or its timeout, and each new session's first
+    /// acquire returns `first_frames[n]` (the whole desktop past the end of
+    /// the list). It also models the engine, which on every `Timeout` and
+    /// `Unchanged` re-encodes its last frame stamped with the current time,
+    /// as a static-screen keyframe refresh does. Lost sessions, their retry
+    /// backoff, and resizes are not modelled.
     struct Sim {
         fps: u32,
         /// Desktop updates as (QPC time, kind), sorted by time.
@@ -340,17 +484,26 @@ mod tests {
         encode: i64,
         /// How late a sleep until a slot wakes up.
         overshoot: i64,
+        /// What each new session's first acquire holds, by session number;
+        /// `None` is nothing.
+        first_frames: Vec<Option<Kind>>,
     }
 
     #[derive(Debug, Default)]
-    struct Outcome {
+    struct Run {
         /// Emitted frame timestamps.
         stamps: Vec<Timestamp>,
         /// QPC time each emitted frame was acquired at.
         copied_at: Vec<i64>,
+        /// Every PTS the engine encoded: frames and keyframe refreshes.
+        encoded: Vec<Timestamp>,
+        /// QPC time of each acquire timeout.
+        timeouts: Vec<i64>,
         /// `AcquireNextFrame` calls, including timeouts.
         acquires: usize,
         resyncs: usize,
+        empty_resyncs: usize,
+        sessions: usize,
         late: u64,
     }
 
@@ -374,27 +527,49 @@ mod tests {
                 end,
                 encode: 0,
                 overshoot: 0,
+                first_frames: Vec::new(),
             }
         }
 
-        fn run(&self) -> Outcome {
-            let mut pacer = FramePacer::new(NonZeroU32::new(self.fps).unwrap(), QPC_HZ);
-            let mut staleness = Staleness::NewSession;
-            let mut pending = Some(changed());
-            let mut next = 0;
-            let mut out = Outcome::default();
+        /// Creates a session at `now`, as `recreate` does.
+        fn new_session(&self, p: &mut Pacing, out: &mut Run, now: i64) -> Option<Acquired> {
+            p.new_session(now);
+            let first = self
+                .first_frames
+                .get(out.sessions)
+                .copied()
+                .unwrap_or(Some(Kind::Content));
+            out.sessions += 1;
+            let mut pending = None;
+            if let Some(kind) = first {
+                accumulate(&mut pending, kind);
+            }
+            pending
+        }
+
+        fn run(&self) -> Run {
+            let mut p = Pacing::new(NonZeroU32::new(self.fps).unwrap(), QPC_HZ);
+            let clock = QpcClock::new(QPC_HZ).unwrap();
+            let mut out = Run::default();
             let mut now = 0;
-            let resync = |out: &mut Outcome, staleness: &mut Staleness, pending: &mut _| {
-                out.resyncs += 1;
-                *staleness = Staleness::NewSession;
-                *pending = Some(changed());
-            };
+            let mut next = 0;
+            let mut pending = self.new_session(&mut p, &mut out, now);
+            let mut session_started = now;
+            let mut has_frame = false;
+            let mut empty_wait = EMPTY_SESSION_WAIT;
             while now < self.end {
-                if let Some(slot) = pacer.wait_until(now) {
+                if let Some(slot) = p.before_acquire(now) {
                     now = slot + self.overshoot;
                     continue;
                 }
-                out.late += pacer.late_slots(now);
+                let wait = i64::from(p.acquire_timeout_ms(POLL)) * QPC_HZ / 1000;
+                if pending.is_none()
+                    && let Some(&(at, _)) = self.updates.get(next)
+                    && at > now
+                    && at <= now + wait
+                {
+                    now = at;
+                }
                 while let Some(&(at, kind)) = self.updates.get(next)
                     && at <= now
                 {
@@ -402,55 +577,68 @@ mod tests {
                     next += 1;
                 }
                 out.acquires += 1;
-                if pending.is_none() {
-                    let wait = i64::from(acquire_timeout_ms(POLL, staleness)) * QPC_HZ / 1000;
-                    match self.updates.get(next) {
-                        Some(&(at, kind)) if at <= now + wait => {
-                            now = at;
-                            accumulate(&mut pending, kind);
-                            next += 1;
-                        }
-                        _ => {
-                            now += wait;
-                            match on_timeout(staleness) {
-                                TimeoutAction::Resync => {
-                                    resync(&mut out, &mut staleness, &mut pending);
-                                }
-                                TimeoutAction::Report => pacer.idle(now),
-                            }
-                            continue;
-                        }
+                let acquired = if let Some(facts) = pending.take() {
+                    Acquire::Frame {
+                        facts,
+                        accumulated: 1,
                     }
-                }
-                let Some(frame) = pending.take() else {
-                    continue;
+                } else {
+                    now += wait;
+                    out.timeouts.push(now);
+                    Acquire::Timeout
                 };
-                match decide(frame, &mut staleness) {
-                    FrameAction::Copy => {
-                        out.stamps.push(pacer.claim(now));
+                match p.after_acquire(acquired, now) {
+                    Outcome::Copy { timestamp, .. } => {
+                        out.stamps.push(timestamp);
                         out.copied_at.push(now);
+                        out.encoded.push(timestamp);
+                        has_frame = true;
+                        empty_wait = EMPTY_SESSION_WAIT;
                         now += self.encode;
                     }
-                    FrameAction::Unchanged | FrameAction::Missed => pacer.defer(now),
-                    FrameAction::Resync => resync(&mut out, &mut staleness, &mut pending),
+                    Outcome::Unchanged | Outcome::Timeout => {
+                        let refresh = clock.to_ticks(now);
+                        if has_frame && out.encoded.last().is_none_or(|&last| refresh > last) {
+                            out.encoded.push(refresh);
+                        }
+                        let waited = clock.to_duration(now - session_started);
+                        if p.empty_session_overdue(has_frame, waited, empty_wait) {
+                            out.empty_resyncs += 1;
+                            empty_wait = next_empty_wait(empty_wait);
+                            pending = self.new_session(&mut p, &mut out, now);
+                            session_started = now;
+                        }
+                    }
+                    Outcome::Missed => {}
+                    Outcome::Resync => {
+                        out.resyncs += 1;
+                        pending = self.new_session(&mut p, &mut out, now);
+                        session_started = now;
+                    }
                 }
             }
+            out.late = p.stats.late_slots;
             self.check_grid(&out);
             out
         }
 
-        /// Every stamp is the start of a slot, strictly after the previous
-        /// one, and no later than the moment its image was acquired.
-        fn check_grid(&self, out: &Outcome) {
+        /// Every stamp is the start of a slot, within half an interval of the
+        /// moment its image was acquired, and strictly after everything the
+        /// engine encoded before it, keyframe refreshes included, so the
+        /// engine never has to nudge a frame off the grid.
+        fn check_grid(&self, out: &Run) {
             let pacer = FramePacer::new(NonZeroU32::new(self.fps).unwrap(), QPC_HZ);
             let clock = QpcClock::new(QPC_HZ).unwrap();
+            let half = Timestamp::TICKS_PER_SECOND / i64::from(self.fps) / 2 + 1;
             for (&stamp, &at) in out.stamps.iter().zip(&out.copied_at) {
                 assert_eq!(stamp, pacer.timestamp(self.slot(stamp)), "off the grid");
-                assert!(stamp <= clock.to_ticks(at), "stamped in the future");
+                let error = stamp.ticks() - clock.to_ticks(at).ticks();
+                assert!(error.abs() <= half, "stamped {error} ticks from capture");
             }
             assert!(
-                out.stamps.windows(2).all(|pair| pair[0] < pair[1]),
-                "timestamps must strictly increase"
+                out.encoded.windows(2).all(|pair| pair[0] < pair[1]),
+                "encoded timestamps must strictly increase: {:?}",
+                out.encoded
             );
         }
 
@@ -460,7 +648,7 @@ mod tests {
         }
 
         /// The gaps between consecutive frames, in slots.
-        fn gaps(&self, out: &Outcome) -> Vec<i64> {
+        fn gaps(&self, out: &Run) -> Vec<i64> {
             out.stamps
                 .windows(2)
                 .map(|pair| self.slot(pair[1]) - self.slot(pair[0]))
@@ -560,7 +748,11 @@ mod tests {
         let sim = Sim::new(60, at_hz(24, 0, 2 * SECOND, Kind::Content), 2 * SECOND);
         let out = sim.run();
         assert_eq!(out.stamps.len(), 48);
-        assert!(sim.gaps(&out).iter().all(|&g| g == 2 || g == 3));
+        assert!(
+            sim.gaps(&out).iter().skip(1).all(|&g| g == 2 || g == 3),
+            "{:?}",
+            sim.gaps(&out)
+        );
     }
 
     #[test]
@@ -627,18 +819,71 @@ mod tests {
             sim.encode = encode;
             let out = sim.run();
             assert!(out.late > 0, "encode {encode}");
-            let pacer = FramePacer::new(NonZeroU32::new(60).unwrap(), QPC_HZ);
-            for (&stamp, &at) in out.stamps.iter().zip(&out.copied_at) {
-                // Each frame takes the slot it was acquired in: no catching
-                // up on slots that already passed.
-                assert_eq!(stamp, pacer.timestamp(pacer.slot_at(at)), "encode {encode}");
-            }
+            // `check_grid` holds each stamp within half an interval of its
+            // capture: no catching up on slots that already passed.
             for pair in out.copied_at.windows(2) {
                 assert!(pair[1] - pair[0] >= encode, "encode {encode}: burst");
             }
             let max_gap = (encode + interval - 1) / interval + 1;
             assert!(sim.gaps(&out).iter().all(|&gap| gap >= 1 && gap <= max_gap));
         }
+    }
+
+    #[test]
+    fn a_change_after_a_timeout_lands_after_the_keyframe_refresh() {
+        let interval = SECOND / 60;
+        let idle = Sim::new(60, Vec::new(), 2 * SECOND).run();
+        // The engine refreshes a keyframe at each timeout, mid-slot.
+        for &timeout in idle.timeouts.iter().take(5) {
+            for after in [
+                1,
+                100,
+                interval / 4,
+                interval / 2 - 1,
+                interval / 2 + 1,
+                interval - 1,
+            ] {
+                let change = timeout + after;
+                let sim = Sim::new(60, vec![(change, Kind::Content)], 2 * SECOND);
+                // `check_grid` fails if the frame is stamped at or before
+                // the refresh.
+                let out = sim.run();
+                assert_eq!(out.stamps.len(), 2);
+                let copied = out.copied_at[1];
+                assert!(copied >= change && copied <= change + interval);
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_session_whose_first_frame_is_pointer_only_is_reduplicated() {
+        // PR #6 hardware logs: fresh sessions often start with a
+        // pointer-only frame, whose surface can be black.
+        let mut sim = Sim::new(60, Vec::new(), 10 * SECOND);
+        sim.first_frames = vec![Some(Kind::Pointer), None, Some(Kind::Content)];
+        let out = sim.run();
+        assert_eq!(out.empty_resyncs, 2);
+        assert_eq!(out.stamps.len(), 1, "pointer-only frames are never copied");
+        // Waits of one then two seconds, at poll granularity.
+        let copied = out.copied_at[0];
+        assert!(
+            (3 * SECOND..=3 * SECOND + SECOND / 2).contains(&copied),
+            "{copied}"
+        );
+
+        // A session that never gets content backs off to every 8 s.
+        let mut sim = Sim::new(60, Vec::new(), 30 * SECOND);
+        sim.first_frames = vec![Some(Kind::Pointer); 100];
+        let out = sim.run();
+        assert_eq!(out.stamps.len(), 0);
+        assert_eq!(out.empty_resyncs, 5, "1 + 2 + 4 + 8 + 8 s");
+
+        // Content before the wait runs out needs no re-duplication.
+        let mut sim = Sim::new(60, vec![(SECOND / 2, Kind::Content)], 3 * SECOND);
+        sim.first_frames = vec![Some(Kind::Pointer)];
+        let out = sim.run();
+        assert_eq!(out.empty_resyncs, 0);
+        assert_eq!(out.stamps.len(), 1);
     }
 
     #[test]
@@ -649,7 +894,8 @@ mod tests {
         let out = sim.run();
         assert_eq!(out.resyncs, 1);
         let &copied = out.copied_at.last().unwrap();
-        assert!(copied > SECOND && copied <= SECOND + SECOND / 30);
+        // The next slot looks again, then the new session skips one slot.
+        assert!(copied > SECOND && copied <= SECOND + SECOND / 20);
 
         // With the pointer moving through the idle period.
         let mut with_pointer = updates.clone();
