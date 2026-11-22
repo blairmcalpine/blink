@@ -112,6 +112,15 @@ encoded while the screen is static except the periodic IDR refresh that keeps
 a clip start available. Repeating frames would cost encoder work per held
 frame, which the no-extra-work goal rules out.
 
+Capture timestamps sit on a fixed grid: the QPC timeline is divided into slots
+of one target frame interval, and a frame is stamped with the start of the
+slot it was acquired in (see [Paced capture](#paced-capture)). During motion
+frames are therefore exactly one interval apart, and the only variable part
+is the gaps, in whole intervals, while the screen is static or the desktop
+updates slower than the target rate. A stamp is never later than the moment
+its image was taken, so video trails the desktop by at most one interval and
+never runs ahead of the audio clock.
+
 **Needs verification**: confirm, with hardware and the players people actually
 use (editors and share targets included), that the timestamps are handled
 correctly.
@@ -215,10 +224,15 @@ code elegance, and convenience. Every one of them is a review criterion.
 2. **No CUDA-core NVENC features.** Use a fast preset (P1 to P3), no lookahead,
    single pass, and no adaptive-quality modes that run on the CUDA cores. Use CBR
    or VBR at a sensible bitrate.
-3. **Capture at the clip FPS, not the refresh rate.** On a 240 Hz monitor
-   recording at 60 fps, encode every fourth frame.
-4. **Skip unchanged frames.** When duplication reports no new content, reuse the
-   previous frame's timing without copying or re-encoding.
+3. **Capture at the clip FPS, not the refresh rate.** Acquisition is paced to
+   the clip frame rate: the capture thread sleeps until the next slot and
+   acquires once, and DXGI folds the updates in between into that one frame.
+   On a 240 Hz monitor recording at 60 fps, that is one acquire, copy, and
+   encode per four refreshes, and the other three are never acquired.
+4. **Skip unchanged frames.** When duplication reports no new content (a
+   timeout, or an update that only moved the pointer), nothing is copied or
+   encoded; the previous frame stands until the next change. On a static
+   screen the only encoder work is the once-a-second IDR refresh.
 5. **CPU discipline.** A fixed set of threads, no per-frame allocation
    (preallocated buffers and a preallocated ring), below-normal priority on
    blink's threads, and saving and muxing on a low-priority thread that the
@@ -254,20 +268,75 @@ shortest one.
 
 A process can hold one duplication per output, and `DuplicateOutput` returns
 `E_INVALIDARG` while any reference to the previous session is alive. The
-duplicator drops its session before recreating it, including on the idle
-resync after a dropped change.
+duplicator drops its session before recreating it, on every path.
 
 Only frames with new desktop content (`LastPresentTime != 0`) are copied. A
 pointer-only update's surface is not guaranteed to hold the desktop, and on
 a new session it is black, so copying one encodes a black frame. A new
-session therefore waits for its first content update. A change the decimator
-dropped is delivered by the next content update, or by a resync once its slot
-has gone a whole frame interval without one: at 144 Hz into 60 fps the next
-update can land up to 6.9 ms after the slot opens, so resyncing as soon as it
-opens would recreate the session on most frames of continuous motion. A new
-session with nothing to show (startup, or after a resize) that gets no content
-update within a second is re-duplicated, backing off to every 8 s, rather than
+session therefore waits for its first content update. A new session with
+nothing to show (startup, or after a resize) that gets no content update
+within a second is re-duplicated, backing off to every 8 s, rather than
 copying a pointer-only frame.
+
+### Paced capture
+
+The capture thread acquires at most one frame per slot of the clip frame rate
+(`FramePacer` in `blink-capture`). Slots tile the QPC timeline from zero, one
+per `1 / fps` seconds. After emitting a frame the thread sleeps until the
+next slot starts, without calling `AcquireNextFrame`. DXGI accumulates
+desktop updates while the application holds no frame
+(`DXGI_OUTDUPL_FRAME_INFO::AccumulatedFrames`), so the acquire at the slot
+returns at once with the latest desktop image, including a change made just
+before the desktop went quiet. No update is dropped, so nothing ever needs
+re-delivering, and a 144 Hz desktop costs one acquire per slot instead of 144
+a second.
+
+- **Nothing new at the slot.** The acquire blocks until the desktop changes
+  (or the caller's 100 ms poll ends, for the static-screen IDR refresh) and
+  takes that update straight away, stamped with the slot it lands in. This
+  adds no latency and stays on the grid. Holding the update for the next slot
+  would add up to an interval of latency for the same regularity.
+- **Timestamps.** A frame is stamped with the start of the slot it was
+  acquired in, on the same QPC timeline as audio, and each frame takes a
+  later slot than the one before, so timestamps strictly increase and frames
+  during motion are exactly `1 / fps` apart. The stamp is never after the
+  moment the image was taken: video trails the desktop by under one interval
+  and never leads it. The encoder's one-IDR-per-second rule counts PTS, so it
+  lands on every `fps`-th frame during motion.
+- **Pointer-only updates.** These are never copied. They also hold the next
+  acquire until the following slot, so a moving mouse costs at most one
+  acquire per slot. A content change made meanwhile accumulates into the same
+  frame, and `LastPresentTime` is set whenever any content accumulated, so the
+  mouse cannot hide or delay content beyond the slot.
+- **Overruns.** If an encode or a preempted thread makes the acquire start
+  after its slot has ended, the frame takes the slot it lands in. The slots
+  that passed are skipped (counted as `late_slots`), never caught up with a
+  burst.
+- **Resync fallback.** A content update that comes without a desktop image
+  (no resource) is looked for again at the next slot without waiting. If that
+  slot brings no content, the desktop went quiet with the change undelivered,
+  and the session is recreated, because the first content update of a new
+  session carries the whole desktop. This is the only resync left, and it is
+  not expected in normal operation.
+
+The sleep is `std::thread::sleep`. On the pinned toolchain (Rust 1.100) it
+uses a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` waitable timer on Windows 10
+1803 and later, and falls back to `Sleep` (timer-tick resolution) only on
+older systems, where pacing would be coarse. The duplicator logs its counters
+every 60 s: `copied`, `coalesced` (updates folded into copied frames),
+`unchanged_slots`, `pointer_only`, `late_slots`, `no_image`, `resyncs`, and
+the new-session diagnostics.
+
+A desktop that updates at a whole fraction of the frame rate (30 Hz into
+60 fps), with its updates phase-locked within jitter of a slot boundary,
+alternates between the slots either side of it (gaps of one and three
+intervals instead of two). Any fixed-grid sampler has this. It lasts only
+while the phases stay aligned.
+
+**Needs hardware verification**: that an acquire at the slot returns the
+accumulated update immediately with the latest image, and that `late_slots`
+stays near zero under a CPU-bound game, given that the capture thread runs at
+below-normal priority.
 
 ### Encoder reconfiguration
 
