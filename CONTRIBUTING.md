@@ -210,4 +210,41 @@ the .NET SDK, and WiX Toolset 5 (the commands are in
 
 The MSI lands in `dist/`. `.github/workflows/package-windows.yml` runs the same
 scripts for pull requests that touch packaging inputs, and on demand from the
-Actions tab, and uploads the MSI as an artifact.
+Actions tab, and uploads the MSI as an artifact. Only that workflow builds and
+ICE-validates `blink.wxs`, so check its run after any installer change.
+
+### Installer options
+
+The options dialog sets two public properties, which a quiet install
+(`msiexec /i blink.msi /qn`) can set on the command line:
+
+| Property | Default | Effect when `1` |
+| --- | --- | --- |
+| `STARTMENUSHORTCUT` | `1` | Adds the Start menu shortcut |
+| `AUTOSTART` | `1` | Writes blink's value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` |
+
+Any other value skips that part. Without a value on the command line, the
+default depends on what is installed:
+
+- A first install, or an upgrade from a version without options (0.0.x),
+  turns both on.
+- Later upgrades and repairs keep the current state. The shortcut stays if
+  the last install added it, which `HKCU\Software\blink\Installer` records;
+  starting at sign-in stays on only if blink's Run value still exists.
+
+The Run value is the one record of whether blink starts at sign-in. The
+settings window's **Start blink when I sign in** reads and writes it
+(`blink_sys::read_autostart` and `write_autostart`) instead of a config
+field, so an upgrade never re-adds a value the user turned off there. The
+`Autostart` component is transitive for the same reason: a repair follows
+the current value rather than restoring the install-time choice. A Run value
+that starts a different `blink.exe` reads as off, and saving the box checked
+points it at the running copy.
+
+Windows' startup apps switch records a disabled entry under
+`Explorer\StartupApproved\Run` without touching the Run value; blink's
+settings then show the box unchecked with a note, and turning it on there
+deletes that entry. A full uninstall deletes both values through `reg.exe`
+(`WixQuietExec`), whichever of the installer or blink created them. During
+an upgrade those actions skip, the new version rewrites the Run value if it
+existed, and a disabled startup-apps entry stays disabled.

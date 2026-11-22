@@ -18,7 +18,7 @@ changing capture, encode, ring, or mux code.
 | `crates/blink-capture` | DXGI Desktop Duplication (Windows FFI) | allowed, documented |
 | `crates/blink-audio` | WASAPI loopback + AAC MFT (Windows FFI) | allowed, documented |
 | `crates/blink-encode` | NVENC (Windows FFI) | allowed, documented |
-| `crates/blink-sys` | QPC clock, thread priority, single instance, message pump, save sound playback (Windows FFI); portable `Backoff`, `ErrorChain`, file renames | allowed, documented |
+| `crates/blink-sys` | QPC clock, thread priority, single instance, message pump, save sound playback, start at sign-in (Windows FFI); portable `Backoff`, `ErrorChain`, file renames | allowed, documented |
 
 ## Commands
 

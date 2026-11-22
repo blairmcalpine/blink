@@ -4,10 +4,11 @@ Builds dist/blink-<version>-x86_64.msi from dist/blink.exe.
 
 .DESCRIPTION
 Run build-exe.ps1 first. The version comes from the blink-app package. Needs
-WiX Toolset 5 and its Util extension:
+WiX Toolset 5 and its Util and UI extensions:
 
     dotnet tool install --global wix --version 5.0.2
     wix extension add --global WixToolset.Util.wixext/5.0.2
+    wix extension add --global WixToolset.UI.wixext/5.0.2
 
 Warnings, including those from the ICE validation that follows the build,
 are errors, except ICE91.
@@ -40,7 +41,9 @@ if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)$' -or [int]$Matches[1] -gt 255 -or 
 }
 
 $msi = Join-Path $dist "blink-$version-x86_64.msi"
-wix build (Join-Path $PSScriptRoot 'blink.wxs') -arch x64 -ext WixToolset.Util.wixext `
+# The dialogs' text comes from the UI extension's en-US strings.
+wix build (Join-Path $PSScriptRoot 'blink.wxs') -arch x64 -culture en-US `
+    -ext WixToolset.Util.wixext -ext WixToolset.UI.wixext `
     -d "Version=$version" -d "BlinkExe=$exe" -d "RepoRoot=$root" -wx -o $msi
 # ICE91 warns that per-user files are not copied to every profile in a
 # per-machine install; Scope="perUser" means there never is one. ICE61 warns
