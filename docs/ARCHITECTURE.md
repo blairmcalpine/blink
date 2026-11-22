@@ -113,13 +113,17 @@ a clip start available. Repeating frames would cost encoder work per held
 frame, which the no-extra-work goal rules out.
 
 Capture timestamps sit on a fixed grid: the QPC timeline is divided into slots
-of one target frame interval, and a frame is stamped with the start of the
-slot it was acquired in (see [Paced capture](#paced-capture)). During motion
-frames are therefore exactly one interval apart, and the only variable part
-is the gaps, in whole intervals, while the screen is static or the desktop
-updates slower than the target rate. A stamp is never later than the moment
-its image was taken, so video trails the desktop by at most one interval and
-never runs ahead of the audio clock.
+of one target frame interval, and a frame is stamped with the slot start
+nearest the moment it was acquired (see [Paced capture](#paced-capture)).
+During motion frames are therefore exactly one interval apart, and the only
+variable part is the gaps, in whole intervals, while the screen is static or
+the desktop updates slower than the target rate. A frame accumulated during
+motion is taken at its slot start, so its stamp trails the desktop update by
+up to one interval and video lags audio by that much. A frame taken mid-slot
+is stamped within half an interval either way, so video leads audio by at
+most half an interval (8.3 ms at 60 fps). Both stay well inside the
+perceptibility thresholds of ITU-R BT.1359 (about 45 ms of audio lead and
+125 ms of lag).
 
 **Needs verification**: confirm, with hardware and the players people actually
 use (editors and share targets included), that the timestamps are handled
@@ -293,25 +297,31 @@ a second.
 
 - **Nothing new at the slot.** The acquire blocks until the desktop changes
   (or the caller's 100 ms poll ends, for the static-screen IDR refresh) and
-  takes that update straight away, stamped with the slot it lands in. This
-  adds no latency and stays on the grid. Holding the update for the next slot
+  takes that update straight away, stamped with the nearest slot. This adds
+  no latency and stays on the grid. Holding the update for the next slot
   would add up to an interval of latency for the same regularity.
-- **Timestamps.** A frame is stamped with the start of the slot it was
-  acquired in, on the same QPC timeline as audio, and each frame takes a
+- **Timestamps.** A frame is stamped with the slot start nearest the moment
+  it was taken, on the same QPC timeline as audio, and each frame takes a
   later slot than the one before, so timestamps strictly increase and frames
-  during motion are exactly `1 / fps` apart. The stamp is never after the
-  moment the image was taken: video trails the desktop by under one interval
-  and never leads it. The encoder's one-IDR-per-second rule counts PTS, so it
-  lands on every `fps`-th frame during motion.
+  during motion are exactly `1 / fps` apart. A take in the second half of a
+  slot claims the next one (never further), so the stamp error stays within
+  half an interval and a frame at motion onset is not crowded against the
+  next. The encoder's one-IDR-per-second rule counts PTS, so it lands on
+  every `fps`-th frame during motion.
+- **Keyframe refreshes.** On a timeout the engine may refresh an IDR stamped
+  with the current time, so after a timeout, and when a session is created
+  (the engine may have refreshed during the outage), the slot containing the
+  current time is reserved: the next frame takes a later slot and its PTS
+  stays after the refresh.
 - **Pointer-only updates.** These are never copied. They also hold the next
   acquire until the following slot, so a moving mouse costs at most one
   acquire per slot. A content change made meanwhile accumulates into the same
   frame, and `LastPresentTime` is set whenever any content accumulated, so the
   mouse cannot hide or delay content beyond the slot.
 - **Overruns.** If an encode or a preempted thread makes the acquire start
-  after its slot has ended, the frame takes the slot it lands in. The slots
-  that passed are skipped (counted as `late_slots`), never caught up with a
-  burst.
+  nearer a later slot than its own, the frame takes the nearest slot. The
+  slots that passed are skipped (counted as `late_slots`), never caught up
+  with a burst.
 - **Resync fallback.** A content update that comes without a desktop image
   (no resource) is looked for again at the next slot without waiting. If that
   slot brings no content, the desktop went quiet with the change undelivered,
@@ -327,9 +337,17 @@ every 60 s: `copied`, `coalesced` (updates folded into copied frames),
 `unchanged_slots`, `pointer_only`, `late_slots`, `no_image`, `resyncs`, and
 the new-session diagnostics.
 
+The decisions (pacing, staleness, the empty-session check, counters) live in
+`Pacing` in `decision.rs`, which the duplicator calls around each
+`AcquireNextFrame`. The tests drive the same calls through a simulated
+desktop and engine (content, pointer-only and imageless updates, keyframe
+refreshes, pointer-only first frames, overruns), so the simulation cannot
+drift from the Windows control flow. Session loss and recreation retries are
+Windows-only and not simulated.
+
 A desktop that updates at a whole fraction of the frame rate (30 Hz into
-60 fps), with its updates phase-locked within jitter of a slot boundary,
-alternates between the slots either side of it (gaps of one and three
+60 fps), with its updates phase-locked within jitter of a slot boundary or
+midpoint, alternates between the slots either side of it (gaps of one and three
 intervals instead of two). Any fixed-grid sampler has this. It lasts only
 while the phases stay aligned.
 
