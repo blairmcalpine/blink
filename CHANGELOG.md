@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/blairmcalpine/blink/compare/v0.0.2...v0.0.3) - 2026-11-22
+
+### Added
+
+- *(audio)* record the microphone and mix it into clip audio ([#12](https://github.com/blairmcalpine/blink/pull/12))
+- *(installer)* add start at sign-in and an installer options screen ([#14](https://github.com/blairmcalpine/blink/pull/14))
+- *(app)* play a sound when a clip is saved ([#8](https://github.com/blairmcalpine/blink/pull/8))
+
+### Fixed
+
+- *(sys)* validate save sound WAVs fully and warm up playback ([#11](https://github.com/blairmcalpine/blink/pull/11))
+
+### Other
+
+- *(capture)* pace acquisition to the clip frame rate ([#9](https://github.com/blairmcalpine/blink/pull/9))
+
 ## [0.0.2](https://github.com/blairmcalpine/blink/compare/v0.0.1...v0.0.2) - 2026-11-22
 
 ### Fixed
