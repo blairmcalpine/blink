@@ -35,6 +35,7 @@ pub(crate) fn encoder_config(
 pub(crate) fn audio_config(config: &Config) -> Result<AudioConfig, UnsupportedBitrate> {
     Ok(AudioConfig {
         bitrate: AacBitrate::try_from(config.audio_bitrate_kbps)?,
+        microphone: config.mic_enabled,
     })
 }
 
@@ -126,6 +127,16 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(audio_config(&bad), Err(UnsupportedBitrate(100)));
+    }
+
+    #[test]
+    fn audio_config_follows_the_microphone_setting() {
+        assert!(audio_config(&Config::default()).unwrap().microphone);
+        let off = Config {
+            mic_enabled: false,
+            ..Config::default()
+        };
+        assert!(!audio_config(&off).unwrap().microphone);
     }
 
     #[test]

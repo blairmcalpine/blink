@@ -54,10 +54,21 @@ impl TryFrom<u32> for AacBitrate {
 pub struct UnsupportedBitrate(pub u32);
 
 /// Settings for [`AudioCapture::start`](crate::AudioCapture::start).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AudioConfig {
     /// AAC bitrate.
     pub bitrate: AacBitrate,
+    /// Whether the default recording device is mixed in (on by default).
+    pub microphone: bool,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            bitrate: AacBitrate::default(),
+            microphone: true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -87,7 +98,8 @@ mod tests {
     }
 
     #[test]
-    fn default_is_160() {
+    fn default_is_160_with_the_microphone() {
         assert_eq!(AudioConfig::default().bitrate, AacBitrate::Kbps160);
+        assert!(AudioConfig::default().microphone);
     }
 }

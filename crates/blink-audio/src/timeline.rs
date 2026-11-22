@@ -35,6 +35,11 @@
 //!
 //! Frames are assembled into 1024-frame chunks of interleaved 16-bit PCM, one
 //! AAC access unit each, and handed to a sink with the chunk's timestamp.
+//!
+//! The microphone runs a second timeline on the desktop timeline's chunk
+//! grid ([`Timeline::aligned`]), so the same corrections keep it on QPC time
+//! and its chunks carry exactly the timestamps of the desktop chunks they are
+//! mixed into (see [`crate::mix`]).
 
 use blink_ring::media::Timestamp;
 
@@ -147,8 +152,8 @@ impl Packet<'_> {
 /// A complete 1024-frame chunk, ready for the encoder.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Chunk<'a> {
-    /// [`CHUNK_SAMPLES`] interleaved 16-bit samples.
-    pub(crate) pcm: &'a [i16],
+    /// Interleaved 16-bit samples.
+    pub(crate) pcm: &'a [i16; CHUNK_SAMPLES],
     /// Timestamp of the chunk's first frame.
     pub(crate) pts: Timestamp,
 }
@@ -192,11 +197,14 @@ pub(crate) struct Timeline {
     onset: bool,
     /// A slewed drift correction is in progress.
     slewing: bool,
+    /// How far behind the wall clock [`Self::fill_silence`] stops.
+    fill_lag: i64,
     buf: [i16; CHUNK_SAMPLES],
 }
 
 impl Timeline {
-    /// Starts a segment whose first frame is due at `anchor` (100 ns ticks).
+    /// Starts a segment whose first frame is due at `anchor` (100 ns ticks),
+    /// filling silence up to [`FILL_LAG`] behind the wall clock.
     pub(crate) const fn new(anchor: i64) -> Self {
         Self {
             anchor,
@@ -204,8 +212,36 @@ impl Timeline {
             filled: 0,
             onset: true,
             slewing: false,
+            fill_lag: FILL_LAG,
             buf: [0; CHUNK_SAMPLES],
         }
+    }
+
+    /// A second source's timeline on this one's chunk grid: the same anchor,
+    /// starting empty at the chunk this one is filling, so chunk `n` of both
+    /// carries the same timestamp. Silence fill stops `fill_lag` behind the
+    /// wall clock.
+    pub(crate) const fn aligned(&self, fill_lag: i64) -> Self {
+        Self {
+            anchor: self.anchor,
+            chunks: self.chunks,
+            filled: 0,
+            onset: true,
+            slewing: false,
+            fill_lag,
+            buf: [0; CHUNK_SAMPLES],
+        }
+    }
+
+    /// The QPC time the current segment is anchored at.
+    pub(crate) const fn anchor(&self) -> i64 {
+        self.anchor
+    }
+
+    /// Timestamp of the chunk being filled, the next one emitted.
+    pub(crate) fn next_chunk_pts(&self) -> Timestamp {
+        let offset = frames_to_ticks(self.chunks.saturating_mul(CHUNK_FRAMES));
+        Timestamp::from_ticks(self.anchor.saturating_add(offset))
     }
 
     /// Frames written to the current segment, including the partial chunk.
@@ -274,7 +310,8 @@ impl Timeline {
         Ok(correction)
     }
 
-    /// Writes silence up to `now - FILL_LAG`, for when no packets arrive.
+    /// Writes silence up to `now` minus the fill lag ([`FILL_LAG`] unless
+    /// set by [`Self::aligned`]), for when no packets arrive.
     ///
     /// `now` must be read before the WASAPI buffer is drained in the same
     /// iteration; see the module documentation.
@@ -283,7 +320,7 @@ impl Timeline {
         now: i64,
         sink: &mut impl FnMut(Event<'_>) -> Result<(), E>,
     ) -> Result<Correction, E> {
-        let target = now.saturating_sub(FILL_LAG);
+        let target = now.saturating_sub(self.fill_lag);
         let gap = target.saturating_sub(self.expected());
         if gap > MAX_GAP {
             self.end_segment(target, sink)?;
@@ -444,8 +481,7 @@ impl Timeline {
         if self.filled < CHUNK_SAMPLES {
             return Ok(());
         }
-        let offset = frames_to_ticks(self.chunks.saturating_mul(CHUNK_FRAMES));
-        let pts = Timestamp::from_ticks(self.anchor.saturating_add(offset));
+        let pts = self.next_chunk_pts();
         self.filled = 0;
         self.chunks += 1;
         sink(Event::Chunk(Chunk {

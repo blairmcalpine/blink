@@ -2,7 +2,7 @@
 
 use blink_ring::media::AudioFormat;
 
-use crate::{AudioConfig, AudioError, AudioSink};
+use crate::{AudioConfig, AudioError, AudioSink, MicState};
 
 /// A running audio capture thread. On this host it cannot be created:
 /// [`AudioCapture::start`] always fails with [`AudioError::Unsupported`].
@@ -31,6 +31,12 @@ impl AudioCapture {
     #[must_use]
     pub const fn audio_format(&self) -> &AudioFormat {
         &self.format
+    }
+
+    /// What the microphone capture is doing: always off on this host.
+    #[must_use]
+    pub const fn mic_state(&self) -> MicState {
+        MicState::Off
     }
 
     /// Whether the audio thread has exited.

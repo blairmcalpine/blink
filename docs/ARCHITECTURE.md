@@ -21,7 +21,9 @@ flowchart LR
   Hotkey[blink-app hotkey] --> Ring
   DXGI["blink-capture DXGI Desktop Duplication (D3D11 texture)"] --> NVENC["blink-encode NVENC H.264"]
   NVENC --> Ring["blink-ring encoded packet ring buffer (last N seconds, GOP-aligned)"]
-  WASAPI["blink-audio WASAPI loopback"] --> AAC["AAC encode (Media Foundation MFT)"] --> Ring
+  WASAPI["blink-audio WASAPI loopback"] --> Mix["mix on the QPC grid"]
+  Mic["blink-audio WASAPI microphone"] --> Mix
+  Mix --> AAC["AAC encode (Media Foundation MFT)"] --> Ring
   Ring -->|on hotkey| Mux["blink-mux MP4 writer"] --> File[clip.mp4]
   Tray["Tray icon (main process)"] -->|Settings item| Settings["blink.exe --settings (egui window)"]
   Settings -->|"writes config.toml, exits"| Config[("config.toml")]
@@ -49,7 +51,7 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-config` | Shared config types and load/save, used by both processes. | `#![forbid(unsafe_code)]` |
 | `crates/blink-ui` | egui/eframe settings window for the `--settings` process. | `#![forbid(unsafe_code)]` |
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
-| `crates/blink-audio` | WASAPI loopback capture and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
+| `crates/blink-audio` | WASAPI loopback and microphone capture, their mix, and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-encode` | NVENC session management, resource registration, encode calls. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex, the tray thread's message pump, and asynchronous playback of in-memory WAV sounds. Also the portable helpers they share: `Backoff`, `ErrorChain`, and the replacing and no-replace file renames. | `unsafe` allowed; every block needs `// SAFETY:` |
 
@@ -142,6 +144,50 @@ is drained and the next packet starts a new segment at its real timestamp. A
 clip spanning that point has an audio timestamp jump, which the muxer must
 handle (with an edit list or by starting the clip's audio after the jump), but
 a clip cut from the last few minutes never spans it in practice.
+
+### Microphone
+
+With **Record microphone** on (the default), the audio thread also captures the
+default recording device and mixes it into the same AAC track. The setting
+only applies while system audio is on; the settings window disables it
+otherwise, so a config that had audio off never starts recording the
+microphone on upgrade.
+
+- **Device role.** The `eConsole` default, not `eCommunications`. Windows
+  treats a stream on the communications device as a call and can duck other
+  audio (the game) while it runs; the console default is also what the user
+  picked as "the microphone" in Sound settings.
+- **Format.** Shared mode with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, the same
+  as loopback, so WASAPI converts a mono or 44.1 kHz microphone to the 48 kHz
+  stereo the encoder takes.
+- **Sync.** The microphone runs its own `Timeline` (the gap fill, slew, and
+  segment logic above), created on the desktop timeline's grid, so both emit
+  1024-frame chunks with identical timestamps. A mixer pairs chunks by
+  timestamp and sums them with unity gain through a soft clipper (transparent
+  up to -1 dBFS, a `tanh` knee above). Each source's clock drift is slewed
+  against QPC independently, so the two never drift apart. When the desktop
+  timeline starts a new segment, the microphone timeline is rebuilt on its
+  grid.
+- **Latency.** Nothing waits on the microphone. Desktop chunks sit in a fixed
+  queue (no allocation after start) until their microphone chunk arrives, the
+  microphone timeline has passed them, or 200 ms after they end; then they are
+  encoded alone. The microphone fills its own gaps 150 ms behind real time,
+  later than loopback's fill, so a late microphone packet is not mistaken for
+  silence. A delivering microphone adds about one device period; a stalled
+  one holds audio back by up to these waits, about the 200 ms a save settles
+  for, so such a clip's audio can end a fraction of a second before its
+  video.
+- **Failure.** No device, access denied by the privacy settings, a removed or
+  switched device: the thread logs a warning once per cause, keeps recording
+  desktop audio, retries with backoff (up to 10 s), and follows a default
+  device change. The tray tooltip shows when the microphone is missing,
+  blocked, or unavailable.
+
+**Needs hardware verification**: that a privacy denial surfaces as
+`E_ACCESSDENIED`; the conversion of a mono 44.1 kHz microphone; Bluetooth
+headsets, which switch to their lower-quality hands-free profile while the
+microphone is open; and that the microphone's delivery latency stays inside
+the 200 ms wait.
 
 ### GOP structure
 
@@ -470,14 +516,15 @@ Win32 would be marginally lighter, but needs extensive `unsafe` code and is
 Windows-only.
 
 Settings exposed: output folder, clip length (seconds), hotkey, FPS,
-quality/bitrate, audio on/off, the optional `stretch_to`, and the save sound
-on/off.
+quality/bitrate, audio on/off, microphone on/off, the optional `stretch_to`,
+and the save sound on/off.
 
 IPC: there is none beyond the file and the process exit. The settings process
 writes `%APPDATA%\blink\config.toml` atomically (write a temp file, then rename)
 and exits. The engine spawned it, so it waits for that child to exit and then
 reloads the config off the hot path. Changes to FPS, video or audio bitrate,
-audio on/off, or `stretch_to` restart the pipeline cleanly (capture, encoder,
+audio on/off, microphone on/off (while audio is on), or `stretch_to` restart
+the pipeline cleanly (capture, encoder,
 audio, and a fresh ring). The save hotkey is suspended while the window is open and registered again
 when it closes, so a new hotkey applies live; a new clip length
 swaps in a resized ring live (the buffered clip is lost), and a new output

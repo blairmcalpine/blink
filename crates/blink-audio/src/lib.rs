@@ -1,10 +1,13 @@
-//! WASAPI loopback audio capture for blink.
+//! WASAPI loopback and microphone audio capture for blink.
 //!
 //! [`AudioCapture`] owns one audio thread. It captures what the default render
-//! endpoint plays through WASAPI loopback, keeps a sample clock anchored to the
-//! shared QPC timeline (100 ns ticks), fills silent gaps with digital silence so
-//! the stream never stalls, and encodes AAC-LC (48 kHz, stereo, raw frames
-//! without ADTS) with the Media Foundation encoder that ships with Windows.
+//! endpoint plays through WASAPI loopback and, unless turned off, the default
+//! recording endpoint (the microphone), keeps a sample clock for each anchored
+//! to the shared QPC timeline (100 ns ticks), fills silent gaps with digital
+//! silence so the stream never stalls, mixes the microphone into the desktop
+//! audio, and encodes one AAC-LC track (48 kHz, stereo, raw frames without
+//! ADTS) with the Media Foundation encoder that ships with Windows.
+//! [`AudioCapture::mic_state`] reports whether the microphone is recording.
 //! Every encoded frame reaches an [`AudioSink`] together with its
 //! [`PacketMeta`](blink_ring::media::PacketMeta); the stream's
 //! [`AudioFormat`](blink_ring::media::AudioFormat) is available from
@@ -12,7 +15,7 @@
 //!
 //! Windows only. The Windows API is gated behind `#[cfg(windows)]`; on other
 //! hosts [`AudioCapture::start`] returns `AudioError::Unsupported`, and the
-//! portable timeline, PCM, and `AudioSpecificConfig` helpers are compiled only
+//! portable timeline, mixer, PCM, and `AudioSpecificConfig` helpers are compiled only
 //! for their tests. The QPC clock and thread priority come from `blink-sys`.
 //! Every `unsafe` block needs a `// SAFETY:` comment and may contain only one
 //! unsafe operation.
@@ -27,6 +30,13 @@ use blink_ring::media::Timestamp;
 mod asc;
 mod config;
 mod error;
+mod mic;
+#[cfg(any(windows, test))]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
+)]
+mod mix;
 #[cfg(any(windows, test))]
 #[expect(
     clippy::redundant_pub_crate,
@@ -56,6 +66,7 @@ pub use config::{AacBitrate, AudioConfig, UnsupportedBitrate};
 pub use error::AudioError;
 #[cfg(windows)]
 pub use imp::AudioCapture;
+pub use mic::MicState;
 pub use sink::AudioSink;
 #[cfg(not(windows))]
 pub use stub::AudioCapture;
