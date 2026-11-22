@@ -227,16 +227,21 @@ impl<'a> SettingsApp<'a> {
 
     fn save(&mut self, ctx: &egui::Context) {
         let decision = decide(&self.draft, &self.loaded);
+        let mut startup_changed = false;
         if decision != SaveDecision::Invalid
             && let Some(toggle) = &mut self.autostart
-            && let Err(message) = toggle.apply()
         {
-            tracing::error!(error = %message, "failed to change whether blink starts at sign-in");
-            self.status = Some((
-                self.draft.clone(),
-                format!("Could not change startup: {message}"),
-            ));
-            return;
+            match toggle.apply() {
+                Ok(changed) => startup_changed = changed,
+                Err(message) => {
+                    tracing::error!(error = %message, "failed to change whether blink starts at sign-in");
+                    self.status = Some((
+                        self.draft.clone(),
+                        format!("Could not change startup: {message}"),
+                    ));
+                    return;
+                }
+            }
         }
         match decision {
             SaveDecision::Invalid => {}
@@ -253,7 +258,12 @@ impl<'a> SettingsApp<'a> {
                 Err(err) => {
                     let message = ErrorChain(&err).to_string();
                     tracing::error!(error = %message, "failed to save settings");
-                    self.status = Some((self.draft.clone(), format!("Could not save: {message}")));
+                    let what = if startup_changed {
+                        "Could not save (the startup setting was changed)"
+                    } else {
+                        "Could not save"
+                    };
+                    self.status = Some((self.draft.clone(), format!("{what}: {message}")));
                 }
             },
         }
@@ -595,6 +605,25 @@ mod tests {
         assert!(!config(&dir).exists());
         let (_, message) = app.status.as_ref().unwrap();
         assert_eq!(message, "Could not change startup: access denied");
+    }
+
+    #[test]
+    fn failed_config_save_says_the_startup_setting_already_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(config(&dir)).unwrap();
+        let outcome = Cell::new(Outcome::Cancelled);
+        let fake = Fake::new(Autostart::Off);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome).with_autostart(&fake);
+        app.autostart.as_mut().unwrap().checked = true;
+        app.draft.fps = 30;
+        let output = save(&mut app);
+        assert!(!closed(&output));
+        assert_eq!(*fake.writes.borrow(), [true]);
+        let (_, message) = app.status.as_ref().unwrap();
+        assert!(
+            message.starts_with("Could not save (the startup setting was changed): "),
+            "{message}"
+        );
     }
 
     #[test]

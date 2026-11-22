@@ -230,7 +230,9 @@ default depends on what is installed:
   turns both on.
 - Later upgrades and repairs keep the current state. The shortcut stays if
   the last install added it, which `HKCU\Software\blink\Installer` records;
-  starting at sign-in stays on only if blink's Run value still exists.
+  starting at sign-in stays on only if blink's Run value still exists. Any
+  value named `blink` counts, so one that starts another copy (a dev build,
+  say) is pointed at the installed `blink.exe`.
 
 The Run value is the one record of whether blink starts at sign-in. The
 settings window's **Start blink when I sign in** reads and writes it
@@ -245,6 +247,8 @@ Windows' startup apps switch records a disabled entry under
 `Explorer\StartupApproved\Run` without touching the Run value; blink's
 settings then show the box unchecked with a note, and turning it on there
 deletes that entry. A full uninstall deletes both values through `reg.exe`
-(`WixQuietExec`), whichever of the installer or blink created them. During
-an upgrade those actions skip, the new version rewrites the Run value if it
-existed, and a disabled startup-apps entry stays disabled.
+(`WixQuietExec`), whichever of the installer or blink created them. Those
+deletes have no rollback, so an uninstall that fails after them leaves blink
+installed but no longer starting at sign-in. During an upgrade they skip,
+the new version rewrites the Run value if it existed, and a disabled
+startup-apps entry stays disabled.

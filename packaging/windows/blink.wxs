@@ -87,8 +87,10 @@
       blink's settings window can create the Run value after the install
       skipped it, and Windows' startup apps can add a disabled entry for it,
       so neither is always the MSI's own. A full uninstall deletes both; an
-      upgrade leaves them for the new version. reg.exe fails harmlessly when
-      a value is already gone.
+      upgrade leaves them for the new version. Return="ignore" because
+      reg.exe exits 1 when a value is already gone. These deletes have no
+      rollback: if the uninstall fails after them, blink stays installed but
+      no longer starts at sign-in until it is turned on again.
     -->
     <SetProperty Id="RemoveRunValue" Value="&quot;[System64Folder]reg.exe&quot; delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v blink /f"
                  Before="RemoveRunValue" Sequence="execute" />
@@ -106,7 +108,7 @@
     <!-- Launch blink from the last dialog. Quiet installs never launch it. -->
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch blink" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
-    <Property Id="WixShellExecTarget" Value="[INSTALLFOLDER]blink.exe" />
+    <Property Id="WixShellExecTarget" Value="[#blink.exe]" />
     <CustomAction Id="LaunchBlink" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixShellExec" Impersonate="yes" />
 
     <!--
@@ -148,7 +150,7 @@
           <Publish Event="SpawnDialog" Value="CancelDlg" />
         </Control>
         <Control Id="ShortcutCheckBox" Type="CheckBox" X="135" Y="140" Width="220" Height="17" Property="BlinkShortcutChoice" CheckBoxValue="1" Text="Add a &amp;Start menu shortcut" />
-        <Control Id="AutostartCheckBox" Type="CheckBox" X="135" Y="162" Width="220" Height="17" Property="BlinkAutostartChoice" CheckBoxValue="1" Text="Start blink when I s&amp;ign in" />
+        <Control Id="AutostartCheckBox" Type="CheckBox" X="135" Y="162" Width="220" Height="17" Property="BlinkAutostartChoice" CheckBoxValue="1" Text="Start blink &amp;when I sign in" />
         <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="!(loc.WelcomeDlgBitmap)" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />

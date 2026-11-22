@@ -74,13 +74,14 @@ impl<'a> Toggle<'a> {
         })
     }
 
-    /// Writes the checkbox if it differs from the state as read.
-    pub(crate) fn apply(&mut self) -> Result<(), String> {
+    /// Writes the checkbox if it differs from the state as read. Returns
+    /// whether it wrote.
+    pub(crate) fn apply(&mut self) -> Result<bool, String> {
         let Ok(state) = self.state else {
-            return Ok(());
+            return Ok(false);
         };
         if self.checked == (state == Autostart::On) {
-            return Ok(());
+            return Ok(false);
         }
         self.setting
             .write(self.checked)
@@ -94,7 +95,7 @@ impl<'a> Toggle<'a> {
         } else {
             Autostart::Off
         });
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -160,8 +161,8 @@ pub(crate) mod tests {
         let fake = Fake::new(Autostart::On);
         let mut toggle = Toggle::new(&fake);
         toggle.checked = false;
-        toggle.apply().unwrap();
-        toggle.apply().unwrap();
+        assert_eq!(toggle.apply(), Ok(true));
+        assert_eq!(toggle.apply(), Ok(false));
         assert_eq!(*fake.writes.borrow(), [false]);
     }
 
