@@ -325,31 +325,44 @@ buffer, which is freed once both are back; more presses are ignored.
 
 When the writer reports a result, the tray thread plays a short chime: a
 rising two-note one (250 ms) when the clip was written, a lower falling pair
-(300 ms) when the save failed. The `save_sound` setting, on by default,
-turns it off; the tray thread reads it from the current config each time, so
-a change applies to the next save.
+(300 ms) when the save failed. Both start after 40 ms of silence, because a
+Bluetooth (A2DP) output that has gone idle can drop the first moments of a
+stream while it wakes. The `save_sound` setting, on by default, turns it
+off; the tray thread reads it from the current config each time, so a change
+applies to the next save.
 
 The sounds are synthesized in code (`blink-app`'s `chime` module, integer
 sine and envelope arithmetic) rather than shipped as audio files, so there is
 no asset to license and nothing in the binary but the generator. Each is
-rendered once at startup into a 16-bit mono 24 kHz WAV image (about 12 KB and
-14 KB) that lives until the process exits. `blink_sys::play_wav` hands that
-image to winmm's `PlaySoundW` with `SND_MEMORY | SND_ASYNC`: the call returns
-once winmm's own thread has the sound, and that thread keeps reading the
-image during playback, which is why the wrapper takes a `'static` slice and
-checks the RIFF length against it. A save therefore costs no allocation and
-no work on the capture, encode, or save threads; a second result while a
-sound plays cuts it off. An `IAudioClient` render stream would add a thread
-and device handling for no benefit at this length.
+rendered once at startup into a 16-bit mono 24 kHz WAV image (about 14 KB and
+16 KB) that lives until the process exits. `blink_sys::play_wav` hands that
+image to winmm's `PlaySoundW` with `SND_MEMORY | SND_ASYNC`, so winmm plays
+it on its own thread and keeps reading the image during playback. The
+wrapper therefore takes a `'static` slice, and before the call it checks
+that the RIFF length and every chunk size stay inside that slice. A save
+costs no allocation and no work on the capture, encode, or save threads; a
+second result while a sound plays cuts it off. An `IAudioClient` render
+stream would add a thread and device handling for no benefit at this length.
+
+The first `PlaySoundW` call in a process sets winmm up (its playback thread
+and the output device), which can take tens to hundreds of milliseconds. So
+that this lands at startup rather than on the first save, the tray thread
+plays 10 ms of silence when the engine starts with the sound on, and when
+the setting is turned on.
+
+blink does not pass `SND_SYSTEM`, so the sound plays under blink's own entry
+in the Windows volume mixer rather than following the system sounds slider,
+and users can set its level independently of other notifications.
 
 The chime plays through the default output device, so WASAPI loopback
 records it into the ring, and the next clip covering that moment has it in
 its audio. That is accepted, as it is in other clip recorders; turning the
 sound off is the remedy.
 
-**Needs hardware verification**: that the first `PlaySoundW` call (which
-loads winmm's audio stack) does not stall the tray thread noticeably, and
-that the chime's volume sits comfortably under typical game audio.
+**Needs hardware verification**: that `PlaySoundW` with `SND_ASYNC` returns
+without waiting for playback, that the warm-up removes any stall on the
+first save's sound, that the 40 ms lead-in is enough for Bluetooth outputs,
+and that the chime's volume sits comfortably under typical game audio.
 
 ## Settings UI
 
@@ -381,9 +394,9 @@ audio on/off, or `stretch_to` restart the pipeline cleanly (capture, encoder,
 audio, and a fresh ring). The save hotkey is suspended while the window is open and registered again
 when it closes, so a new hotkey applies live; a new clip length
 swaps in a resized ring live (the buffered clip is lost), and a new output
-folder or save sound setting applies to the next save. An invalid file is logged and ignored; the
-engine keeps its previous config. Hand edits to the file are picked up the next
-time the settings window closes.
+folder or save sound setting applies to the next save. An invalid file is
+logged and ignored; the engine keeps its previous config. Hand edits to the
+file are picked up the next time the settings window closes.
 
 `blink-config` holds the shared config types and load/save. `blink-ui` is a
 library with one entry point, `blink_ui::run(config_path)`, which `blink-app`
