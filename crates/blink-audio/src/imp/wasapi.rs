@@ -1,13 +1,37 @@
-//! WASAPI loopback capture on the default render endpoint.
+//! WASAPI shared-mode capture: loopback of the default render endpoint (the
+//! desktop audio), or the default recording endpoint (the microphone).
 //!
-//! The stream is opened in shared mode with `AUDCLNT_STREAMFLAGS_LOOPBACK`.
+//! Both use the `eConsole` role, the device Sound settings shows as the
+//! default, which is what users pick as "the microphone". Windows' automatic
+//! ducking of other sounds (game audio included) is documented to key on a
+//! stream opened on the endpoint that is the default communications device,
+//! whatever role was asked for, and on most PCs one microphone is both
+//! defaults. So the role does not avoid ducking; whether opening the
+//! microphone ducks anything needs checking on hardware.
+//!
+//! A Bluetooth headset's microphone is only reachable through its
+//! Hands-Free Profile endpoint, and opening that switches the whole headset
+//! from A2DP to HFP: every sound it plays, the game included, becomes
+//! low-quality mono for as long as the stream runs. So a default recording
+//! endpoint whose device was enumerated by `BTHHFENUM`, the Windows
+//! Bluetooth hands-free audio enumerator, is skipped before it is activated.
+//! The check reads `PKEY_Device_EnumeratorName` from the endpoint's property
+//! store, which is device metadata and opens nothing. It is believed to
+//! report the enumerator of the device behind the endpoint (`USB`,
+//! `HDAUDIO`, `BTHHFENUM`) but needs confirming on hardware, as does whether
+//! vendor stacks or Bluetooth LE Audio headsets (a different enumerator,
+//! not skipped) behave the same. An unreadable name opens the endpoint as
+//! usual.
+//!
+//! Loopback adds `AUDCLNT_STREAMFLAGS_LOOPBACK`; everything else is shared.
 //! Format negotiation, in order:
 //!
 //! 1. 48 kHz stereo 32-bit float, then 16-bit PCM, with
 //!    `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`
 //!    so the audio engine converts the mix format (any rate, any channel
-//!    layout) for us. Float is tried first because it matches the engine's
-//!    internal format; the clamp to 16 bits then happens in [`crate::pcm`].
+//!    layout, such as a mono 44.1 kHz microphone) for us. Float is tried
+//!    first because it matches the engine's internal format; the clamp to
+//!    16 bits then happens in [`crate::pcm`].
 //! 2. If the engine refuses both, the endpoint's own mix format, used only if
 //!    it already is 48 kHz stereo float or 16-bit PCM. Resampling and
 //!    downmixing are out of scope, so any other mix format is an error.
@@ -23,26 +47,29 @@ use std::thread;
 use std::time::Duration;
 
 use blink_sys::ErrorChain;
-use tracing::{debug, warn};
-use windows::Win32::Foundation::{HANDLE, WAIT_FAILED};
+use tracing::debug;
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_EnumeratorName;
+use windows::Win32::Foundation::{E_ACCESSDENIED, ERROR_NOT_FOUND, HANDLE, WAIT_FAILED};
 use windows::Win32::Media::Audio::{
     AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
     AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, IAudioCaptureClient,
-    IAudioClient, IMMDevice, IMMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
-    WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eConsole, eRender,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, EDataFlow,
+    IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator, WAVE_FORMAT_PCM,
+    WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eCapture, eConsole, eRender,
 };
 use windows::Win32::Media::KernelStreaming::{
     KSDATAFORMAT_SUBTYPE_PCM, SPEAKER_FRONT_LEFT, SPEAKER_FRONT_RIGHT, WAVE_FORMAT_EXTENSIBLE,
 };
 use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT};
-use windows::Win32::System::Com::CLSCTX_ALL;
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PropVariantToBSTR};
+use windows::Win32::System::Com::{CLSCTX_ALL, STGM_READ};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-use windows::core::{GUID, Owned, PCWSTR};
+use windows::core::{GUID, HRESULT, Owned, PCWSTR};
 
 use super::com::CoTaskMem;
 use super::{Context, Fault, has_flag};
+use crate::mic::is_hands_free_enumerator;
 use crate::pcm::SampleFormat;
 use crate::timeline::Packet;
 use crate::{AudioError, CHANNELS, SAMPLE_RATE};
@@ -71,46 +98,101 @@ pub(super) struct PacketInfo {
     pub(super) discontinuity: bool,
 }
 
-/// A started loopback stream on one endpoint. Stops on drop.
-pub(super) struct LoopbackStream {
+/// Which endpoint a [`CaptureStream`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Source {
+    /// Loopback of the default render endpoint: what the desktop plays.
+    Desktop,
+    /// The default recording endpoint.
+    Microphone,
+}
+
+impl Source {
+    const fn data_flow(self) -> EDataFlow {
+        match self {
+            Self::Desktop => eRender,
+            Self::Microphone => eCapture,
+        }
+    }
+
+    const fn stream_flags(self) -> u32 {
+        match self {
+            Self::Desktop => AUDCLNT_STREAMFLAGS_LOOPBACK,
+            Self::Microphone => 0,
+        }
+    }
+
+    const fn find_default(self) -> &'static str {
+        match self {
+            Self::Desktop => "find the default render endpoint",
+            Self::Microphone => "find the default recording endpoint",
+        }
+    }
+}
+
+/// A started capture stream on one endpoint. Stops on drop.
+pub(super) struct CaptureStream {
+    source: Source,
     client: IAudioClient,
     capture: IAudioCaptureClient,
     format: SampleFormat,
     frame_bytes: usize,
     device_id: CoTaskMem<u16>,
+    /// The endpoint's bus enumerator, read for microphones only.
+    enumerator_name: Option<String>,
     // Declared last so the handle is closed after the client is released.
     event: Option<Owned<HANDLE>>,
 }
 
-impl LoopbackStream {
-    /// Opens and starts loopback capture on the current default console
-    /// render endpoint.
-    pub(super) fn open(enumerator: &IMMDeviceEnumerator) -> Result<Self, AudioError> {
-        // SAFETY: plain COM call on a live enumerator with enum arguments.
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-            .context("find the default render endpoint")?;
+impl CaptureStream {
+    /// Opens and starts capture of `source` on its current default console
+    /// endpoint. Returns `None`, without activating the endpoint, when the
+    /// default recording endpoint is a Bluetooth hands-free microphone:
+    /// opening it would switch the headset to its hands-free profile.
+    pub(super) fn open(
+        enumerator: &IMMDeviceEnumerator,
+        source: Source,
+    ) -> Result<Option<Self>, AudioError> {
+        let device = default_device(enumerator, source)?;
+        let enumerator_name = match source {
+            Source::Desktop => None,
+            Source::Microphone => enumerator_name(&device),
+        };
+        if enumerator_name
+            .as_deref()
+            .is_some_and(is_hands_free_enumerator)
+        {
+            return Ok(None);
+        }
         let device_id = device_id(&device)?;
-        let (client, format, event) = initialize(&device)?;
+        let (client, format, event) = initialize(&device, source)?;
         // SAFETY: `client` was successfully initialized, which `GetService`
         // requires.
         let capture: IAudioCaptureClient =
             unsafe { client.GetService() }.context("get the capture client")?;
         // SAFETY: the client is initialized and, if event-driven, its event
         // handle is set, as `Start` requires.
-        unsafe { client.Start() }.context("start the loopback stream")?;
-        Ok(Self {
+        unsafe { client.Start() }.context("start the capture stream")?;
+        Ok(Some(Self {
+            source,
             client,
             capture,
             format,
             frame_bytes: format.bytes_per_sample() * usize::from(CHANNELS),
             device_id,
+            enumerator_name,
             event,
-        })
+        }))
     }
 
     /// Sample format the engine delivers.
     pub(super) const fn format(&self) -> SampleFormat {
         self.format
+    }
+
+    /// The endpoint's bus enumerator (`USB`, `HDAUDIO`, ...), if read.
+    pub(super) fn enumerator_name(&self) -> Option<&str> {
+        self.enumerator_name.as_deref()
     }
 
     /// Whether the stream signals an event per period (otherwise it is polled).
@@ -143,7 +225,7 @@ impl LoopbackStream {
         loop {
             // SAFETY: plain COM call on a started capture client.
             let next = unsafe { self.capture.GetNextPacketSize() }
-                .context("query the next loopback packet")
+                .context("query the next capture packet")
                 .map_err(Fault::Device)?;
             if next == 0 {
                 return Ok(());
@@ -163,7 +245,7 @@ impl LoopbackStream {
                     Some(&raw mut qpc_position),
                 )
             }
-            .context("read a loopback packet")
+            .context("read a capture packet")
             .map_err(Fault::Device)?;
             if frames == 0 {
                 // `AUDCLNT_S_BUFFER_EMPTY`: no packet was acquired, so there is
@@ -201,23 +283,21 @@ impl LoopbackStream {
             // SAFETY: releases exactly the packet acquired above, with the
             // frame count `GetBuffer` returned.
             let released =
-                unsafe { self.capture.ReleaseBuffer(frames) }.context("release a loopback packet");
+                unsafe { self.capture.ReleaseBuffer(frames) }.context("release a capture packet");
             handled.map_err(Fault::Fatal)?;
             released.map_err(Fault::Device)?;
         }
     }
 
-    /// Whether this stream's endpoint is still the default console render
-    /// endpoint.
+    /// Whether this stream's endpoint is still the default console endpoint
+    /// for its source.
     pub(super) fn is_default(&self, enumerator: &IMMDeviceEnumerator) -> Result<bool, AudioError> {
-        // SAFETY: plain COM call on a live enumerator with enum arguments.
-        let device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-            .context("find the default render endpoint")?;
+        let device = default_device(enumerator, self.source)?;
         Ok(device_id(&device)?.as_wide() == self.device_id.as_wide())
     }
 }
 
-impl Drop for LoopbackStream {
+impl Drop for CaptureStream {
     fn drop(&mut self) {
         // SAFETY: plain COM call on the started client; an error (for example
         // an invalidated device) leaves nothing to clean up.
@@ -225,6 +305,51 @@ impl Drop for LoopbackStream {
             debug!(error = %ErrorChain(&error), "IAudioClient::Stop failed");
         }
     }
+}
+
+/// The default console endpoint for `source`. Fails with `E_NOTFOUND` when
+/// there is none, such as a machine without a microphone.
+fn default_device(
+    enumerator: &IMMDeviceEnumerator,
+    source: Source,
+) -> Result<IMMDevice, AudioError> {
+    // SAFETY: plain COM call on a live enumerator with enum arguments.
+    unsafe { enumerator.GetDefaultAudioEndpoint(source.data_flow(), eConsole) }
+        .context(source.find_default())
+}
+
+/// The bus enumerator of the device behind `device` (`USB`, `HDAUDIO`,
+/// `BTHHFENUM`, ...), from the endpoint's property store, which reading does
+/// not activate the endpoint. `None`, logged at debug, if it cannot be read;
+/// the endpoint is then opened as usual.
+fn enumerator_name(device: &IMMDevice) -> Option<String> {
+    match read_enumerator_name(device) {
+        Ok(name) => Some(name),
+        Err(error) => {
+            debug!(error = %ErrorChain(&error), "cannot read the endpoint's enumerator name");
+            None
+        }
+    }
+}
+
+fn read_enumerator_name(device: &IMMDevice) -> Result<String, AudioError> {
+    // SAFETY: plain COM call on a live device, asking for read-only access.
+    let store = unsafe { device.OpenPropertyStore(STGM_READ) }
+        .context("open the endpoint property store")?;
+    // SAFETY: the key is a reference to a constant that outlives the call;
+    // the returned PROPVARIANT is owned by this function.
+    let mut value = unsafe { store.GetValue(&PKEY_Device_EnumeratorName) }
+        .context("read the endpoint enumerator name")?;
+    // SAFETY: `value` is a PROPVARIANT initialized by `GetValue`, which the
+    // call only reads; the returned BSTR is owned and freed on drop.
+    let name = unsafe { PropVariantToBSTR(&raw const value) }
+        .context("convert the endpoint enumerator name");
+    // SAFETY: `value` was initialized by `GetValue` and is not used after
+    // being cleared, which frees any string it holds.
+    if let Err(error) = unsafe { PropVariantClear(&raw mut value) } {
+        debug!(error = %ErrorChain(&error), "PropVariantClear failed");
+    }
+    Ok(name?.to_string())
 }
 
 fn device_id(device: &IMMDevice) -> Result<CoTaskMem<u16>, AudioError> {
@@ -240,15 +365,20 @@ fn device_id(device: &IMMDevice) -> Result<CoTaskMem<u16>, AudioError> {
 /// the module documentation.
 fn initialize(
     device: &IMMDevice,
+    source: Source,
 ) -> Result<(IAudioClient, SampleFormat, Option<Owned<HANDLE>>), AudioError> {
-    let convert = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    let convert = source.stream_flags()
+        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
     for format in [SampleFormat::F32, SampleFormat::S16] {
         let wave = requested_format(format);
         for event_driven in [true, false] {
             match try_initialize(device, (&raw const wave).cast(), convert, event_driven) {
                 Ok((client, event)) => return Ok((client, format, event)),
+                // Privacy settings refuse every format alike.
+                Err(error) if is_access_denied(&error) => return Err(error),
                 Err(error) => {
-                    debug!(?format, event_driven, error = %ErrorChain(&error), "loopback format refused");
+                    debug!(?source, ?format, event_driven, error = %ErrorChain(&error), "capture format refused");
                 }
             }
         }
@@ -266,7 +396,9 @@ fn initialize(
         wave.nChannels,
         wave.wBitsPerSample,
     );
-    warn!(
+    // Logged once per open attempt; a failure is warned about by the caller.
+    debug!(
+        ?source,
         tag,
         sample_rate,
         channels,
@@ -275,9 +407,26 @@ fn initialize(
         "audio engine refused converted 48 kHz stereo capture; trying the endpoint mix format"
     );
     let format = classify(&wave, sub_format)?;
-    try_initialize(device, mix.as_ptr(), 0, true)
-        .or_else(|_| try_initialize(device, mix.as_ptr(), 0, false))
+    let flags = source.stream_flags();
+    try_initialize(device, mix.as_ptr(), flags, true)
+        .or_else(|_| try_initialize(device, mix.as_ptr(), flags, false))
         .map(|(client, event)| (client, format, event))
+}
+
+/// Whether `error` is `E_ACCESSDENIED`, which a recording endpoint returns
+/// while the Windows privacy settings deny desktop apps the microphone.
+pub(super) fn is_access_denied(error: &AudioError) -> bool {
+    matches!(error, AudioError::Windows { source, .. } if source.code() == E_ACCESSDENIED)
+}
+
+/// Whether `error` is `E_NOTFOUND`: there is no endpoint of the kind asked
+/// for.
+pub(super) fn is_not_found(error: &AudioError) -> bool {
+    matches!(
+        error,
+        AudioError::Windows { source, .. }
+            if source.code() == HRESULT::from_win32(ERROR_NOT_FOUND.0)
+    )
 }
 
 fn activate(device: &IMMDevice) -> Result<IAudioClient, AudioError> {
@@ -293,7 +442,7 @@ fn try_initialize(
     event_driven: bool,
 ) -> Result<(IAudioClient, Option<Owned<HANDLE>>), AudioError> {
     let client = activate(device)?;
-    let mut flags = AUDCLNT_STREAMFLAGS_LOOPBACK | extra_flags;
+    let mut flags = extra_flags;
     if event_driven {
         flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
     }
@@ -310,7 +459,7 @@ fn try_initialize(
             None,
         )
     }
-    .context("initialize the loopback stream")?;
+    .context("initialize the capture stream")?;
     if !event_driven {
         return Ok((client, None));
     }
@@ -321,7 +470,7 @@ fn try_initialize(
     // SAFETY: `CreateEventW` returned a fresh handle that nothing else owns.
     let event = unsafe { Owned::new(event) };
     // SAFETY: the client was initialized with `EVENTCALLBACK` and the handle is
-    // a live event that outlives the client (`LoopbackStream` field order).
+    // a live event that outlives the client (`CaptureStream` field order).
     unsafe { client.SetEventHandle(*event) }.context("set the audio event")?;
     Ok((client, Some(event)))
 }

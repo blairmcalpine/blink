@@ -20,6 +20,10 @@ const DEFAULT_STRETCH: Resolution = Resolution {
 
 /// The editable copy of a [`Config`], shaped for the widgets that edit it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag mirrors an independent settings checkbox"
+)]
 pub(crate) struct Draft {
     /// Edited as text; trimmed when converted.
     pub(crate) output_dir: String,
@@ -29,6 +33,8 @@ pub(crate) struct Draft {
     pub(crate) video_bitrate_kbps: u32,
     pub(crate) audio_enabled: bool,
     pub(crate) audio_bitrate_kbps: u32,
+    /// Kept while audio is off, which disables its checkbox.
+    pub(crate) mic_enabled: bool,
     pub(crate) stretch_enabled: bool,
     /// Kept while stretching is off, so toggling it back restores the size.
     pub(crate) stretch: Resolution,
@@ -48,6 +54,7 @@ impl Draft {
                 config.audio_enabled,
                 config.audio_bitrate_kbps,
             ),
+            mic_enabled: config.mic_enabled,
             stretch_enabled: config.stretch_to.is_some(),
             stretch: config.stretch_to.unwrap_or(DEFAULT_STRETCH),
             save_sound: config.save_sound,
@@ -65,6 +72,7 @@ impl Draft {
             video_bitrate_kbps: self.video_bitrate_kbps,
             audio_enabled: self.audio_enabled,
             audio_bitrate_kbps: audio_bitrate_to_save(self.audio_enabled, self.audio_bitrate_kbps),
+            mic_enabled: self.mic_enabled,
             stretch_to: self.stretch_enabled.then_some(self.stretch),
             save_sound: self.save_sound,
         }
@@ -217,6 +225,7 @@ pub(crate) mod tests {
             video_bitrate_kbps: 50_000,
             audio_enabled: false,
             audio_bitrate_kbps: 192,
+            mic_enabled: false,
             stretch_to: Some("1280x960".parse().unwrap()),
             save_sound: false,
         }
@@ -234,6 +243,7 @@ pub(crate) mod tests {
                 video_bitrate_kbps: 50_000,
                 audio_enabled: false,
                 audio_bitrate_kbps: 192,
+                mic_enabled: false,
                 stretch_enabled: true,
                 stretch: Resolution {
                     width: 1280,
@@ -418,6 +428,7 @@ pub(crate) mod tests {
             video_bitrate_kbps: 0,
             audio_enabled: true,
             audio_bitrate_kbps: 1,
+            mic_enabled: true,
             stretch_enabled: true,
             stretch: Resolution {
                 width: 0,

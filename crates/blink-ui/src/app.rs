@@ -172,6 +172,13 @@ impl<'a> SettingsApp<'a> {
             });
         });
 
+        row(ui, "", None, |ui| {
+            ui.add_enabled_ui(draft.audio_enabled, |ui| {
+                ui.checkbox(&mut draft.mic_enabled, "Record microphone")
+                    .on_disabled_hover_text("Turn on system audio to record the microphone.");
+            });
+        });
+
         row(ui, "Stretch to", errors.stretch_to.as_deref(), |ui| {
             ui.checkbox(&mut draft.stretch_enabled, "On");
             ui.add_enabled_ui(draft.stretch_enabled, |ui| {

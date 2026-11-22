@@ -7,8 +7,8 @@
 //!   the save sound ([`sound`]) when a save finishes.
 //! - **Capture thread** (below normal, [`capture`]): Desktop Duplication into
 //!   NVENC into the ring. Never waits on I/O or on a save.
-//! - **Audio thread** (below normal, owned by `blink-audio`): WASAPI loopback
-//!   into AAC into the ring.
+//! - **Audio thread** (below normal, owned by `blink-audio`): WASAPI loopback,
+//!   mixed with the microphone when enabled, into AAC into the ring.
 //! - **Save threads** ([`save`]): a cutter copies each clip out of the ring
 //!   in chunks at below-normal priority as soon as it can, and a writer
 //!   writes the MP4s in background mode.
@@ -34,6 +34,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use blink_audio::MicState;
 use blink_config::Config;
 use blink_ring::media::Timestamp;
 use blink_sys::{ErrorChain, SingleInstance, ThreadPriority};
@@ -173,6 +174,8 @@ struct Engine {
     /// When video paused for an unsupported mode, until frames return.
     paused_since: Option<Timestamp>,
     last_save: Option<SaveResult>,
+    /// The microphone state the tooltip last showed.
+    mic_state: MicState,
     /// The unsupported display mode last warned about.
     warned_unsupported: Option<(u32, u32)>,
 }
@@ -204,6 +207,7 @@ impl Engine {
             capture_state: CaptureState::Starting,
             paused_since: None,
             last_save: None,
+            mic_state: MicState::Off,
             warned_unsupported: None,
         };
         engine.bind_hotkey();
@@ -251,6 +255,11 @@ impl Engine {
                 }
             }
             self.audio.poll(&self.ring);
+            let mic_state = self.audio.mic_state();
+            if mic_state != self.mic_state {
+                self.mic_state = mic_state;
+                self.update_tooltip();
+            }
             if !self.settings_open && self.hotkey_retry_at.is_some_and(|at| Instant::now() >= at) {
                 self.bind_hotkey();
             }
@@ -463,6 +472,7 @@ impl Engine {
             requested_hotkey: self.config.hotkey,
             hotkey_registered: self.hotkey.current() == Some(self.config.hotkey),
             clip_seconds: self.config.clip_seconds,
+            microphone: self.mic_state,
         }));
     }
 }

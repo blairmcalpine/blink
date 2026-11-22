@@ -40,6 +40,7 @@ impl ReloadPlan {
             video_bitrate_kbps,
             audio_enabled,
             audio_bitrate_kbps,
+            mic_enabled,
             stretch_to,
             save_sound,
         } = new;
@@ -47,6 +48,7 @@ impl ReloadPlan {
             || *video_bitrate_kbps != old.video_bitrate_kbps
             || *audio_enabled != old.audio_enabled
             || *audio_bitrate_kbps != old.audio_bitrate_kbps
+            || (*audio_enabled && *mic_enabled != old.mic_enabled)
             || *stretch_to != old.stretch_to;
         Self {
             rebind_hotkey: *hotkey != old.hotkey,
@@ -96,10 +98,24 @@ mod tests {
         assert_eq!(plan(|c| c.video_bitrate_kbps = 50_000), RESTART);
         assert_eq!(plan(|c| c.audio_enabled = !c.audio_enabled), RESTART);
         assert_eq!(plan(|c| c.audio_bitrate_kbps = 192), RESTART);
+        assert_eq!(plan(|c| c.mic_enabled = false), RESTART);
         assert_eq!(
             plan(|c| c.stretch_to = Some("1920x1080".parse().unwrap())),
             RESTART
         );
+    }
+
+    #[test]
+    fn the_microphone_setting_is_inert_while_audio_is_off() {
+        let old = Config {
+            audio_enabled: false,
+            ..Config::default()
+        };
+        let new = Config {
+            mic_enabled: false,
+            ..old.clone()
+        };
+        assert!(ReloadPlan::between(&old, &new).is_noop());
     }
 
     #[test]

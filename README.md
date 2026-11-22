@@ -1,7 +1,8 @@
 # blink
 
 A bare-bones Windows screen clipper. Press a hotkey and blink saves the last N
-seconds of your screen and system audio as an MP4 in a folder you choose.
+seconds of your screen, system audio, and microphone as an MP4 in a folder you
+choose.
 
 blink exists for one reason: clipping should not cost frames. Capture runs
 through DXGI Desktop Duplication, H.264 encoding runs on the GPU through NVIDIA
@@ -13,10 +14,20 @@ window opens only on demand in a separate process.
 A short chime confirms each saved clip, and a lower tone means the save
 failed. Turn it off with **Play a sound when a clip is saved** in Settings.
 
+Clips include your default recording device, mixed with the system audio.
+Turn it off with **Record microphone** in Settings. A Bluetooth headset's
+microphone is skipped on purpose: opening it switches the headset to its
+hands-free mode, which makes everything it plays, the game included,
+low-quality mono. The tray tooltip says when this happens. To record your
+voice, make a wired or USB microphone, or the PC's built-in one, the default
+recording device in Windows Sound settings; blink picks up the change within
+a second.
+
 ## Status
 
 Pre-alpha. The whole pipeline is implemented: desktop capture, NVENC encode,
-system-audio capture with AAC encode, the packet ring, MP4 muxing, the tray and
+system-audio capture mixed with the default microphone (a settings toggle, on
+by default) into one AAC track, the packet ring, MP4 muxing, the tray and
 hotkey, and the settings window. It has not had broad hardware testing yet, and
 the items marked **needs hardware verification** in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) are still open. Expect rough
