@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use blink_audio::{AudioCapture, AudioConfig};
+use blink_audio::{AudioCapture, AudioConfig, MicState};
 use blink_ring::media::{AudioFormat, PacketMeta};
 use blink_sys::{Backoff, ErrorChain};
 
@@ -64,6 +64,14 @@ impl AudioSupervisor {
         }
     }
 
+    /// What the running capture's microphone is doing; off while no capture
+    /// runs.
+    pub(super) fn mic_state(&self) -> MicState {
+        self.capture
+            .as_ref()
+            .map_or(MicState::Off, AudioCapture::mic_state)
+    }
+
     /// Notices a capture thread that exited on its own and restarts it when
     /// its backoff delay has passed. Call it every few hundred milliseconds.
     pub(super) fn poll(&mut self, ring: &Arc<SharedRing>) {
@@ -104,6 +112,7 @@ impl AudioSupervisor {
             Ok(capture) => {
                 tracing::info!(
                     kbps = config.bitrate.kbps(),
+                    microphone = config.microphone,
                     format = ?capture.audio_format(),
                     "audio capture started"
                 );

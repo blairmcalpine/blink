@@ -1,6 +1,7 @@
 //! What the tray tooltip says about the recorder, so a release build (with
 //! no console) still shows when capture or a save is failing.
 
+use blink_audio::MicState;
 use blink_config::Hotkey;
 use blink_ring::media::Timestamp;
 
@@ -86,6 +87,18 @@ pub(crate) struct Status {
     pub(crate) hotkey_registered: bool,
     /// Clip length in seconds.
     pub(crate) clip_seconds: u32,
+    /// What the microphone is doing.
+    pub(crate) microphone: MicState,
+}
+
+/// The tooltip line for a microphone that should be recording but is not.
+const fn mic_line(state: MicState) -> Option<&'static str> {
+    match state {
+        MicState::Off | MicState::Starting | MicState::Recording => None,
+        MicState::NotFound => Some("No microphone found; recording desktop audio only"),
+        MicState::Denied => Some("Microphone blocked by Windows privacy settings"),
+        MicState::Unavailable => Some("Microphone unavailable; retrying"),
+    }
 }
 
 /// The message for an unsupported display mode.
@@ -99,7 +112,7 @@ pub(crate) fn unsupported_message(width: u32, height: u32) -> String {
 
 /// The tray tooltip for `status`, one line per concern, cut to fit.
 pub(crate) fn tooltip(status: &Status) -> String {
-    let mut lines = Vec::with_capacity(3);
+    let mut lines = Vec::with_capacity(4);
     lines.push(if status.hotkey_registered {
         format!(
             "blink: {} saves the last {} s",
@@ -120,6 +133,9 @@ pub(crate) fn tooltip(status: &Status) -> String {
         CaptureState::Unsupported { width, height, .. } => {
             lines.push(format!("Paused: {width}x{height} is too large for H.264"));
         }
+    }
+    if let Some(line) = mic_line(status.microphone) {
+        lines.push(line.to_owned());
     }
     match &status.last_save {
         None => {}
@@ -160,7 +176,30 @@ mod tests {
             requested_hotkey: Config::default().hotkey,
             hotkey_registered: true,
             clip_seconds: 30,
+            microphone: MicState::Recording,
         }
+    }
+
+    #[test]
+    fn only_a_failing_microphone_gets_a_line() {
+        for state in [MicState::Off, MicState::Starting, MicState::Recording] {
+            let text = tooltip(&Status {
+                microphone: state,
+                ..status()
+            });
+            assert_eq!(text.lines().count(), 1, "{state:?}: {text}");
+        }
+        let denied = tooltip(&Status {
+            capture: CaptureState::Starting,
+            microphone: MicState::Denied,
+            last_save: Some(SaveResult::Failed("disk full".to_owned())),
+            ..status()
+        });
+        let lines: Vec<_> = denied.lines().collect();
+        assert_eq!(lines.len(), 4, "{denied}");
+        assert!(lines[2].contains("privacy"));
+        assert!(mic_line(MicState::NotFound).is_some());
+        assert!(mic_line(MicState::Unavailable).is_some());
     }
 
     #[test]
