@@ -40,6 +40,7 @@ use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 use self::com::MediaRuntime;
 use self::encoder::AacEncoder;
 use self::wasapi::{CaptureStream, PacketInfo, Source, is_access_denied, is_not_found};
+use crate::mic::OpenFailure;
 use crate::mix::{Mix, MixStats};
 use crate::timeline::{Correction, Event, Packet};
 use crate::{AudioConfig, AudioError, AudioSink, MicState};
@@ -429,26 +430,14 @@ impl Stats {
     }
 }
 
-/// Why an endpoint is not open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Failure {
-    /// There is no default endpoint of this kind.
-    NotFound,
-    /// The privacy settings deny access.
-    Denied,
-    /// Anything else.
-    Other,
-}
-
-impl Failure {
-    fn of(error: &AudioError) -> Self {
-        if is_not_found(error) {
-            Self::NotFound
-        } else if is_access_denied(error) {
-            Self::Denied
-        } else {
-            Self::Other
-        }
+/// Classifies why opening an endpoint failed.
+fn open_failure(error: &AudioError) -> OpenFailure {
+    if is_not_found(error) {
+        OpenFailure::NotFound
+    } else if is_access_denied(error) {
+        OpenFailure::Denied
+    } else {
+        OpenFailure::Other
     }
 }
 
@@ -458,12 +447,14 @@ struct Endpoint {
     source: Source,
     enumerator: IMMDeviceEnumerator,
     stream: Option<CaptureStream>,
+    /// When the open stream was opened.
+    opened_at: Instant,
     backoff: Backoff,
     next_open: Instant,
     next_device_check: Instant,
     /// Why the last attempt failed, until one succeeds. A failure is warned
     /// about once, when it first happens or changes kind; repeats are debug.
-    failure: Option<Failure>,
+    failure: Option<OpenFailure>,
     open_failures: u32,
 }
 
@@ -478,6 +469,7 @@ impl Endpoint {
             source,
             enumerator,
             stream: None,
+            opened_at: now,
             backoff: Backoff::new(INITIAL_RETRY_DELAY, max_delay),
             next_open: now,
             next_device_check: now,
@@ -488,15 +480,7 @@ impl Endpoint {
 
     /// The state to report for this endpoint as the microphone.
     const fn mic_state(&self) -> MicState {
-        if self.stream.is_some() {
-            return MicState::Recording;
-        }
-        match self.failure {
-            None => MicState::Starting,
-            Some(Failure::NotFound) => MicState::NotFound,
-            Some(Failure::Denied) => MicState::Denied,
-            Some(Failure::Other) => MicState::Unavailable,
-        }
+        MicState::of_endpoint(self.stream.is_some(), self.failure)
     }
 
     /// Opens the stream if none is open and the backoff delay has passed.
@@ -513,15 +497,15 @@ impl Endpoint {
                     event_driven = stream.is_event_driven(),
                     "audio capture stream started"
                 );
-                self.backoff.reset();
                 self.failure = None;
                 self.open_failures = 0;
+                self.opened_at = Instant::now();
                 self.next_device_check = after(DEVICE_CHECK_INTERVAL);
                 self.stream = Some(stream);
                 true
             }
             Err(error) => {
-                let failure = Failure::of(&error);
+                let failure = open_failure(&error);
                 if self.failure == Some(failure) {
                     debug!(
                         source = ?self.source,
@@ -540,21 +524,21 @@ impl Endpoint {
         }
     }
 
-    fn warn_failure(&self, failure: Failure, error: &AudioError) {
+    fn warn_failure(&self, failure: OpenFailure, error: &AudioError) {
         let error = ErrorChain(error);
         match (self.source, failure) {
             (Source::Desktop, _) => {
                 warn!(%error, "cannot open the default render endpoint; retrying");
             }
-            (Source::Microphone, Failure::NotFound) => {
+            (Source::Microphone, OpenFailure::NotFound) => {
                 warn!(%error, "no microphone; recording desktop audio only until one appears");
             }
-            (Source::Microphone, Failure::Denied) => warn!(
+            (Source::Microphone, OpenFailure::Denied) => warn!(
                 %error,
                 "microphone access is denied in the Windows privacy settings; recording desktop \
                  audio only"
             ),
-            (Source::Microphone, Failure::Other) => {
+            (Source::Microphone, OpenFailure::Other) => {
                 warn!(%error, "cannot open the microphone; recording desktop audio only, retrying");
             }
         }
@@ -569,8 +553,13 @@ impl Endpoint {
     }
 
     /// Drains the open stream, then checks for a default-endpoint change.
-    /// Endpoint failures close the stream for an immediate reopen and return
-    /// `Ok(true)`; only errors from `on_packet` are returned.
+    /// Endpoint failures close the stream and return `Ok(true)`; only errors
+    /// from `on_packet` are returned. A stream that ran for a while is
+    /// reopened at once and resets the backoff; one lost soon after opening
+    /// waits out the next backoff delay, so a device that opens and then
+    /// fails at once is not reopened every iteration.
+    ///
+    /// Losses log at info: the reopen's failure, if any, carries the warning.
     fn drain(
         &mut self,
         on_packet: &mut impl FnMut(Packet<'_>, PacketInfo) -> Result<(), AudioError>,
@@ -582,7 +571,7 @@ impl Endpoint {
         let lost = match stream.drain(on_packet) {
             Err(Fault::Fatal(error)) => return Err(error),
             Err(Fault::Device(error)) => {
-                warn!(?source, error = %ErrorChain(&error), "capture stream lost; reopening");
+                info!(?source, error = %ErrorChain(&error), "capture stream lost; reopening");
                 true
             }
             Ok(()) if Instant::now() >= self.next_device_check => {
@@ -603,7 +592,12 @@ impl Endpoint {
         };
         if lost {
             self.stream = None;
-            self.next_open = Instant::now();
+            if self.opened_at.elapsed() >= DEVICE_CHECK_INTERVAL {
+                self.backoff.reset();
+                self.next_open = Instant::now();
+            } else {
+                self.next_open = after(self.backoff.next_delay());
+            }
         }
         Ok(lost)
     }

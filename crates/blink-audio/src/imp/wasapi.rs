@@ -2,10 +2,12 @@
 //! desktop audio), or the default recording endpoint (the microphone).
 //!
 //! Both use the `eConsole` role, the device Sound settings shows as the
-//! default. Windows treats a stream on the `eCommunications` default (the
-//! "default communication device") as communications activity, which can
-//! trigger its automatic ducking of other sounds, game audio included; voice
-//! chat apps choose their own device anyway.
+//! default, which is what users pick as "the microphone". Windows' automatic
+//! ducking of other sounds (game audio included) is documented to key on a
+//! stream opened on the endpoint that is the default communications device,
+//! whatever role was asked for, and on most PCs one microphone is both
+//! defaults. So the role does not avoid ducking; whether opening the
+//! microphone ducks anything needs checking on hardware.
 //!
 //! Loopback adds `AUDCLNT_STREAMFLAGS_LOOPBACK`; everything else is shared.
 //! Format negotiation, in order:
@@ -13,8 +15,9 @@
 //! 1. 48 kHz stereo 32-bit float, then 16-bit PCM, with
 //!    `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY`
 //!    so the audio engine converts the mix format (any rate, any channel
-//!    layout, such as a mono 44.1 kHz microphone) for us. Float is tried first because it matches the engine's
-//!    internal format; the clamp to 16 bits then happens in [`crate::pcm`].
+//!    layout, such as a mono 44.1 kHz microphone) for us. Float is tried
+//!    first because it matches the engine's internal format; the clamp to
+//!    16 bits then happens in [`crate::pcm`].
 //! 2. If the engine refuses both, the endpoint's own mix format, used only if
 //!    it already is 48 kHz stereo float or 16-bit PCM. Resampling and
 //!    downmixing are out of scope, so any other mix format is an error.

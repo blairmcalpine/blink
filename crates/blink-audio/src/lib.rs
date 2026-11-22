@@ -7,8 +7,7 @@
 //! silence so the stream never stalls, mixes the microphone into the desktop
 //! audio, and encodes one AAC-LC track (48 kHz, stereo, raw frames without
 //! ADTS) with the Media Foundation encoder that ships with Windows.
-//! [`AudioCapture::mic_state`] reports whether the microphone is recording.
-//! Every encoded frame reaches an [`AudioSink`] together with its
+//! On Windows, `AudioCapture::mic_state` reports the [`MicState`]. Every encoded frame reaches an [`AudioSink`] together with its
 //! [`PacketMeta`](blink_ring::media::PacketMeta); the stream's
 //! [`AudioFormat`](blink_ring::media::AudioFormat) is available from
 //! [`AudioCapture::audio_format`] as soon as [`AudioCapture::start`] returns.

@@ -24,8 +24,39 @@ pub enum MicState {
     Unavailable,
 }
 
+/// Why an endpoint is not open.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
+)]
+pub(crate) enum OpenFailure {
+    /// There is no default endpoint of this kind.
+    NotFound,
+    /// The privacy settings deny access.
+    Denied,
+    /// Anything else.
+    Other,
+}
+
 #[cfg(any(windows, test))]
 impl MicState {
+    /// The state of a microphone endpoint that has a stream open (`open`),
+    /// or else last failed to open with `failure` (`None` before the first
+    /// attempt).
+    pub(crate) const fn of_endpoint(open: bool, failure: Option<OpenFailure>) -> Self {
+        if open {
+            return Self::Recording;
+        }
+        match failure {
+            None => Self::Starting,
+            Some(OpenFailure::NotFound) => Self::NotFound,
+            Some(OpenFailure::Denied) => Self::Denied,
+            Some(OpenFailure::Other) => Self::Unavailable,
+        }
+    }
+
     /// Every state, in [`Self::to_u8`] order.
     const ALL: [Self; 6] = [
         Self::Off,
@@ -69,5 +100,28 @@ mod tests {
         }
         assert_eq!(MicState::from_u8(200), MicState::Off);
         assert_eq!(MicState::default(), MicState::Off);
+    }
+
+    #[test]
+    fn an_open_stream_records_whatever_failed_before() {
+        let failures = [
+            None,
+            Some(OpenFailure::NotFound),
+            Some(OpenFailure::Denied),
+            Some(OpenFailure::Other),
+        ];
+        for failure in failures {
+            assert_eq!(MicState::of_endpoint(true, failure), MicState::Recording);
+        }
+        let closed = failures.map(|failure| MicState::of_endpoint(false, failure));
+        assert_eq!(
+            closed,
+            [
+                MicState::Starting,
+                MicState::NotFound,
+                MicState::Denied,
+                MicState::Unavailable
+            ]
+        );
     }
 }
