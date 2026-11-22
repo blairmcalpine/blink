@@ -3,27 +3,32 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt as _;
 
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_SUCCESS,
+};
 use windows::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_ROUTINE_FLAGS, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_EXPAND_SZ,
-    RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+    HKEY_CURRENT_USER, REG_ROUTINE_FLAGS, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows::core::HSTRING;
 
 use crate::SysError;
 
 /// How many times a read retries when the value grows between the size query
-/// and the read, which an expanded `REG_EXPAND_SZ` can also cause.
+/// and the read. Expanding a `REG_EXPAND_SZ` can also outgrow the size the
+/// query reported.
 const READ_ATTEMPTS: usize = 4;
 
-/// Reads the string value `name` of `HKCU\subkey`, expanding a
-/// `REG_EXPAND_SZ`. `None` if the key or the value does not exist.
+/// Reads the string value `name` of `HKCU\subkey`. `RRF_RT_REG_SZ` without
+/// `RRF_NOEXPAND` also accepts a `REG_EXPAND_SZ` and expands it; asking for
+/// `RRF_RT_REG_EXPAND_SZ` too would fail. `None` if the key or the value
+/// does not exist.
 pub(crate) fn read_string(
     subkey: &str,
     name: &str,
     context: &'static str,
 ) -> Result<Option<String>, SysError> {
-    let Some(bytes) = read(subkey, name, RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, context)? else {
+    let Some(bytes) = read(subkey, name, RRF_RT_REG_SZ, context)? else {
         return Ok(None);
     };
     let (pairs, _) = bytes.as_chunks::<2>();
@@ -57,7 +62,8 @@ pub(crate) fn write_string(
     let name = HSTRING::from(name);
     let data: Vec<u16> = value.encode_wide().chain([0]).collect();
     let size = std::mem::size_of_val(data.as_slice());
-    let size = u32::try_from(size).map_err(|_| windows_error(ERROR_MORE_DATA.into(), context))?;
+    let size =
+        u32::try_from(size).map_err(|_| windows_error(ERROR_INVALID_PARAMETER.into(), context))?;
     // SAFETY: `subkey` and `name` are NUL-terminated wide strings, and `data`
     // is `size` bytes of a NUL-terminated wide string, all alive for the
     // call. HKEY_CURRENT_USER is a predefined key that needs no opening.
@@ -117,8 +123,8 @@ fn read(
                 Some(&raw mut size),
             )
         };
-        let len =
-            usize::try_from(size).map_err(|_| windows_error(ERROR_MORE_DATA.into(), context))?;
+        let len = usize::try_from(size)
+            .map_err(|_| windows_error(ERROR_INVALID_PARAMETER.into(), context))?;
         match status {
             ERROR_SUCCESS if buffer.is_some() || len == 0 => {
                 data.truncate(len);
@@ -134,4 +140,101 @@ fn read(
 
 const fn windows_error(source: windows::core::Error, context: &'static str) -> SysError {
     SysError::Windows { context, source }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use windows::Win32::System::Registry::{REG_EXPAND_SZ, RegDeleteKeyW};
+
+    use super::*;
+
+    /// A per-run key under `HKCU\Software`, deleted on drop.
+    struct ScratchKey(String);
+
+    impl ScratchKey {
+        fn new() -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(format!(
+                r"Software\blink-test-{}-{nanos}",
+                std::process::id()
+            ))
+        }
+    }
+
+    impl Drop for ScratchKey {
+        fn drop(&mut self) {
+            let key = HSTRING::from(self.0.as_str());
+            // SAFETY: `key` is a NUL-terminated wide string alive for the
+            // call; the scratch key has values but no subkeys.
+            let status = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, &key) };
+            assert!(
+                status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strings_round_trip_and_delete() {
+        let key = ScratchKey::new();
+        let value = r#""C:\Users\Ada Lovelace\blink\blink.exe""#;
+        write_string(&key.0, "run", OsStr::new(value), "write").unwrap();
+        assert_eq!(
+            read_string(&key.0, "run", "read").unwrap().as_deref(),
+            Some(value)
+        );
+        delete(&key.0, "run", "delete").unwrap();
+        assert_eq!(read_string(&key.0, "run", "read").unwrap(), None);
+        delete(&key.0, "run", "delete again").unwrap();
+    }
+
+    #[test]
+    fn missing_keys_and_values_read_as_none() {
+        let key = ScratchKey::new();
+        assert_eq!(read_string(&key.0, "absent", "read").unwrap(), None);
+        assert_eq!(read_binary(&key.0, "absent", "read").unwrap(), None);
+        delete(&key.0, "absent", "delete").unwrap();
+        write_string(&key.0, "present", OsStr::new("x"), "write").unwrap();
+        assert_eq!(read_string(&key.0, "absent", "read").unwrap(), None);
+    }
+
+    #[test]
+    fn expandable_strings_read_expanded() {
+        let key = ScratchKey::new();
+        let subkey = HSTRING::from(key.0.as_str());
+        let name = HSTRING::from("expand");
+        let data: Vec<u16> = OsStr::new(r"%SystemRoot%\blink.exe")
+            .encode_wide()
+            .chain([0])
+            .collect();
+        let size = u32::try_from(std::mem::size_of_val(data.as_slice())).unwrap();
+        // SAFETY: as in `write_string`, with `data` a NUL-terminated wide
+        // string of `size` bytes.
+        let status = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                &subkey,
+                &name,
+                REG_EXPAND_SZ.0,
+                Some(data.as_ptr().cast()),
+                size,
+            )
+        };
+        status.ok().unwrap();
+        let read = read_string(&key.0, "expand", "read").unwrap().unwrap();
+        assert!(!read.contains('%'), "{read}");
+        assert!(read.to_ascii_lowercase().ends_with(r"\blink.exe"), "{read}");
+    }
+
+    #[test]
+    fn a_string_is_not_read_as_binary() {
+        let key = ScratchKey::new();
+        write_string(&key.0, "text", OsStr::new("x"), "write").unwrap();
+        read_binary(&key.0, "text", "read").unwrap_err();
+    }
 }

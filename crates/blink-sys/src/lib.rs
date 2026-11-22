@@ -4,13 +4,12 @@
 //! that have nothing to do with capture or audio themselves: the shared QPC
 //! clock ([`QpcClock`], `qpc_now`), thread priority
 //! (`set_current_thread_priority`, `BackgroundMode`), a single-instance mutex
-//! (`SingleInstance`), a message pump for the tray thread
-//! (`pump_messages`), asynchronous playback of short in-memory sounds
-//! (`play_wav`), and starting blink at sign-in (`read_autostart`,
-//! `write_autostart`, which own blink's per-user Run value). They live here
-//! once, as safe wrappers, so `blink-app`
-//! (which forbids `unsafe`) can use them and the FFI crates do not duplicate
-//! them.
+//! (`SingleInstance`), a message pump for the tray thread (`pump_messages`),
+//! asynchronous playback of short in-memory sounds (`play_wav`), and
+//! starting blink at sign-in (`read_autostart`, `write_autostart`, which own
+//! blink's per-user Run value). They live here once, as safe wrappers, so
+//! `blink-app` (which forbids `unsafe`) can use them and the FFI crates do
+//! not duplicate them.
 //!
 //! A few portable helpers live here for the same reason, because every crate
 //! that needs them already depends on this one: [`Backoff`], the retry delay
@@ -20,8 +19,8 @@
 //! on Windows.
 //!
 //! On other hosts only the portable items exist ([`QpcClock`]'s arithmetic,
-//! [`SysError`], [`Autostart`], and the helpers above), so the workspace still builds and
-//! their logic is unit tested everywhere. Every `unsafe` block needs a
+//! [`SysError`], [`Autostart`], and the helpers above), so the workspace
+//! still builds and their logic is unit tested everywhere. Every `unsafe` block needs a
 //! `// SAFETY:` comment and may contain only one unsafe operation.
 
 mod autostart;

@@ -51,15 +51,22 @@ pub enum Autostart {
 ///
 /// # Errors
 ///
-/// [`SysError::Windows`] if either registry value exists but cannot be read.
+/// [`SysError::Windows`] if the Run value exists but cannot be read.
 #[cfg(windows)]
 pub fn read_autostart(exe: &Path) -> Result<Autostart, SysError> {
     let run = registry::read_string(RUN_KEY, VALUE_NAME, "read blink's Run value")?;
+    // Windows writes this entry, not blink. One it cannot read (such as a
+    // value of another type) is treated as approved rather than hiding the
+    // setting behind an error.
     let approval = registry::read_binary(
         STARTUP_APPROVED_KEY,
         VALUE_NAME,
         "read blink's startup-apps entry",
-    )?;
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(error = %crate::ErrorChain(&error), "ignoring blink's startup-apps entry");
+        None
+    });
     Ok(classify(run.as_deref(), approval.as_deref(), exe))
 }
 
