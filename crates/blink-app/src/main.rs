@@ -132,7 +132,16 @@ fn run_settings() -> ExitCode {
         tracing::error!("cannot locate the per-user config folder");
         return ExitCode::FAILURE;
     };
-    match blink_ui::run(&path) {
+    #[cfg(windows)]
+    let run_key = RunKey::for_this_exe();
+    #[cfg(windows)]
+    let autostart = run_key
+        .as_ref()
+        .map(|key| -> &dyn blink_ui::AutostartSetting { key });
+    // Starting at sign-in is a Windows feature; elsewhere there is no row.
+    #[cfg(not(windows))]
+    let autostart = None;
+    match blink_ui::run(&path, autostart) {
         Ok(blink_ui::Outcome::Saved) => {
             tracing::info!(path = %path.display(), "settings saved");
             ExitCode::SUCCESS
@@ -148,6 +157,36 @@ fn run_settings() -> ExitCode {
     }
 }
 
+/// Starting this blink.exe at sign-in, through the per-user Run key.
+#[cfg(windows)]
+struct RunKey {
+    exe: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl RunKey {
+    /// `None`, with a warning, when the running executable's path is
+    /// unknown; the settings window then has no startup row.
+    fn for_this_exe() -> Option<Self> {
+        std::env::current_exe()
+            .inspect_err(|error| {
+                tracing::warn!(error = %ErrorChain(error), "cannot locate blink.exe for the startup setting");
+            })
+            .ok()
+            .map(|exe| Self { exe })
+    }
+}
+
+#[cfg(windows)]
+impl blink_ui::AutostartSetting for RunKey {
+    fn read(&self) -> Result<blink_sys::Autostart, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(blink_sys::read_autostart(&self.exe)?)
+    }
+
+    fn write(&self, enabled: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(blink_sys::write_autostart(&self.exe, enabled)?)
+    }
+}
 /// Tells the user the process crashed; release builds have no console.
 #[cfg(windows)]
 fn notify_crash(message: &str) {

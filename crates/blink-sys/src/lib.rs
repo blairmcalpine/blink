@@ -5,8 +5,10 @@
 //! clock ([`QpcClock`], `qpc_now`), thread priority
 //! (`set_current_thread_priority`, `BackgroundMode`), a single-instance mutex
 //! (`SingleInstance`), a message pump for the tray thread
-//! (`pump_messages`), and asynchronous playback of short in-memory sounds
-//! (`play_wav`). They live here once, as safe wrappers, so `blink-app`
+//! (`pump_messages`), asynchronous playback of short in-memory sounds
+//! (`play_wav`), and starting blink at sign-in (`read_autostart`,
+//! `write_autostart`, which own blink's per-user Run value). They live here
+//! once, as safe wrappers, so `blink-app`
 //! (which forbids `unsafe`) can use them and the FFI crates do not duplicate
 //! them.
 //!
@@ -18,10 +20,11 @@
 //! on Windows.
 //!
 //! On other hosts only the portable items exist ([`QpcClock`]'s arithmetic,
-//! [`SysError`], and the helpers above), so the workspace still builds and
+//! [`SysError`], [`Autostart`], and the helpers above), so the workspace still builds and
 //! their logic is unit tested everywhere. Every `unsafe` block needs a
 //! `// SAFETY:` comment and may contain only one unsafe operation.
 
+mod autostart;
 mod backoff;
 mod clock;
 #[cfg_attr(
@@ -38,11 +41,20 @@ mod fs;
 mod instance;
 #[cfg(windows)]
 mod messages;
+#[cfg(windows)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
+)]
+mod registry;
 #[cfg(any(windows, test))]
 mod sound;
 #[cfg(windows)]
 mod thread;
 
+pub use autostart::Autostart;
+#[cfg(windows)]
+pub use autostart::{read_autostart, write_autostart};
 pub use backoff::Backoff;
 pub use clock::QpcClock;
 #[cfg(windows)]

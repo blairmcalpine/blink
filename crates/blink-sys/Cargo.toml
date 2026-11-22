@@ -1,6 +1,6 @@
 [package]
 name = "blink-sys"
-description = "Win32 plumbing shared by blink's crates: the QPC clock, thread priority, single instance, the message pump, and notification sounds."
+description = "Win32 plumbing shared by blink's crates: the QPC clock, thread priority, single instance, the message pump, notification sounds, and starting at sign-in."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,6 +26,7 @@ features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Performance",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ]

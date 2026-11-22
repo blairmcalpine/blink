@@ -12,6 +12,7 @@ use blink_config::{
 use eframe::egui;
 
 use crate::Outcome;
+use crate::autostart::{AutostartSetting, Toggle};
 use crate::draft::{Draft, Errors, SaveDecision, decide, fps_choices};
 use crate::keys::{Recorder, Step};
 
@@ -42,6 +43,8 @@ pub(crate) struct SettingsApp<'a> {
     /// write, and the draft it was for. Shown until the draft changes.
     status: Option<(Draft, String)>,
     outcome: &'a Cell<Outcome>,
+    /// The start-at-sign-in row, when the host can read and write it.
+    autostart: Option<Toggle<'a>>,
 }
 
 impl<'a> SettingsApp<'a> {
@@ -54,7 +57,14 @@ impl<'a> SettingsApp<'a> {
             recorder: Recorder::default(),
             status: None,
             outcome,
+            autostart: None,
         }
+    }
+
+    /// Adds the start-at-sign-in row, reading its current state now.
+    pub(crate) fn with_autostart(mut self, setting: &'a dyn AutostartSetting) -> Self {
+        self.autostart = Some(Toggle::new(setting));
+        self
     }
 
     /// Draws one frame.
@@ -175,6 +185,22 @@ impl<'a> SettingsApp<'a> {
         row(ui, "Sound", None, |ui| {
             ui.checkbox(&mut draft.save_sound, "Play a sound when a clip is saved");
         });
+        if let Some(toggle) = &mut self.autostart {
+            let error = toggle.error();
+            row(ui, "Startup", error.as_deref(), |ui| {
+                ui.add_enabled_ui(toggle.is_readable(), |ui| {
+                    let checkbox = ui.checkbox(&mut toggle.checked, "Start blink when I sign in");
+                    if checkbox.changed() {
+                        self.status = None;
+                    }
+                });
+            });
+            if let Some(note) = toggle.note() {
+                ui.label("");
+                ui.weak(note);
+                ui.end_row();
+            }
+        }
 
         browse
     }
@@ -200,7 +226,19 @@ impl<'a> SettingsApp<'a> {
     }
 
     fn save(&mut self, ctx: &egui::Context) {
-        match decide(&self.draft, &self.loaded) {
+        let decision = decide(&self.draft, &self.loaded);
+        if decision != SaveDecision::Invalid
+            && let Some(toggle) = &mut self.autostart
+            && let Err(message) = toggle.apply()
+        {
+            tracing::error!(error = %message, "failed to change whether blink starts at sign-in");
+            self.status = Some((
+                self.draft.clone(),
+                format!("Could not change startup: {message}"),
+            ));
+            return;
+        }
+        match decision {
             SaveDecision::Invalid => {}
             SaveDecision::Unchanged => {
                 tracing::info!("settings unchanged; not rewriting the config");
@@ -317,7 +355,10 @@ fn menu(ui: &mut egui::Ui, id: &str, value: &mut u32, options: &[u32], unit: &st
 mod tests {
     use std::fs;
 
+    use blink_sys::Autostart;
+
     use super::*;
+    use crate::autostart::tests::Fake;
     use crate::draft::tests::sample;
 
     /// The settings file in the scratch directory `dir`.
@@ -522,6 +563,66 @@ mod tests {
             message.starts_with("Could not save: failed to write config"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn save_applies_the_autostart_checkbox_without_rewriting_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = Cell::new(Outcome::Cancelled);
+        let fake = Fake::new(Autostart::On);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome).with_autostart(&fake);
+        app.autostart.as_mut().unwrap().checked = false;
+        let output = save(&mut app);
+        assert!(closed(&output));
+        assert_eq!(*fake.writes.borrow(), [false]);
+        assert_eq!(outcome.get(), Outcome::Cancelled);
+        assert!(!config(&dir).exists());
+    }
+
+    #[test]
+    fn failed_autostart_write_keeps_the_window_open_and_the_config_unwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = Cell::new(Outcome::Cancelled);
+        let fake = Fake {
+            fail_writes: true,
+            ..Fake::new(Autostart::Off)
+        };
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome).with_autostart(&fake);
+        app.autostart.as_mut().unwrap().checked = true;
+        app.draft.fps = 60;
+        let output = save(&mut app);
+        assert!(!closed(&output));
+        assert!(!config(&dir).exists());
+        let (_, message) = app.status.as_ref().unwrap();
+        assert_eq!(message, "Could not change startup: access denied");
+    }
+
+    #[test]
+    fn invalid_settings_leave_autostart_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = Cell::new(Outcome::Cancelled);
+        let fake = Fake::new(Autostart::Off);
+        let loaded = Config {
+            clip_seconds: 1,
+            ..sample()
+        };
+        let mut app = SettingsApp::new(config(&dir), loaded, &outcome).with_autostart(&fake);
+        app.autostart.as_mut().unwrap().checked = true;
+        save(&mut app);
+        assert!(fake.writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn autostart_row_draws_its_note_without_repainting() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = Cell::new(Outcome::Cancelled);
+        let fake = Fake::new(Autostart::DisabledByWindows);
+        let mut app = SettingsApp::new(config(&dir), sample(), &outcome).with_autostart(&fake);
+        let ctx = egui::Context::default();
+        let (size, output) = settle(&ctx, &mut app);
+        assert!((150.0..450.0).contains(&size.y), "{size:?}");
+        let viewport = output.viewport_output.get(&egui::ViewportId::ROOT).unwrap();
+        assert_eq!(viewport.repaint_delay, std::time::Duration::MAX);
     }
 
     /// Runs headless frames like a window would: each requested inner size
