@@ -37,7 +37,7 @@ use anyhow::Context as _;
 use blink_audio::MicState;
 use blink_config::Config;
 use blink_ring::media::Timestamp;
-use blink_sys::{ErrorChain, SingleInstance, ThreadPriority};
+use blink_sys::{ErrorChain, NamedEvent, SingleInstance, ThreadPriority};
 
 use self::audio::AudioSupervisor;
 use self::save::{SaveRequest, Saver, local_time};
@@ -59,6 +59,11 @@ const HOTKEY_RETRY: Duration = Duration::from_secs(10);
 
 /// The per-session mutex that keeps a second recorder from starting.
 const INSTANCE_MUTEX: &str = "Local\\blink-engine";
+
+/// The per-session event a second copy of blink sets to have the running
+/// recorder open its settings window. Created before [`INSTANCE_MUTEX`] is
+/// taken, so whenever a second copy finds the mutex held, this event exists.
+const OPEN_SETTINGS_EVENT: &str = "Local\\blink-open-settings";
 
 /// Messages from worker threads to the tray thread.
 pub(super) enum EngineEvent {
@@ -104,21 +109,24 @@ fn report_in_background(level: rfd::MessageLevel, message: String) {
     }
 }
 
-/// Runs the recorder until Quit. Startup failures are returned; the caller
+/// Runs the recorder until Quit, opening the settings window once started
+/// when `open_settings` is set. If blink is already running, asks it to open
+/// its settings window and returns. Startup failures are returned; the caller
 /// logs and shows them.
-pub(crate) fn run() -> anyhow::Result<ExitCode> {
+pub(crate) fn run(open_settings: bool) -> anyhow::Result<ExitCode> {
     if let Err(error) = blink_sys::set_current_thread_priority(ThreadPriority::BelowNormal) {
         tracing::warn!(error = %ErrorChain(&error), "could not lower the tray thread priority");
     }
+    let settings_requests =
+        NamedEvent::create(OPEN_SETTINGS_EVENT).context("cannot create the open-settings event")?;
     let Some(_instance) = SingleInstance::acquire(INSTANCE_MUTEX)
         .context("cannot check whether blink is already running")?
     else {
-        tracing::info!("blink is already running; exiting");
-        message_box(
-            rfd::MessageLevel::Info,
-            "blink is already running. Find it in the notification area.",
-        );
-        return Ok(ExitCode::FAILURE);
+        tracing::info!("blink is already running; asking it to open its settings");
+        settings_requests
+            .set()
+            .context("blink is already running, but cannot ask it to open its settings")?;
+        return Ok(ExitCode::SUCCESS);
     };
     let config_path = blink_config::default_config_path()
         .context("cannot locate the per-user config folder (%APPDATA%)")?;
@@ -128,7 +136,10 @@ pub(crate) fn run() -> anyhow::Result<ExitCode> {
     });
     tracing::info!(?config, path = %config_path.display(), "settings loaded");
 
-    let mut engine = Engine::start(config_path, config)?;
+    let mut engine = Engine::start(config_path, config, settings_requests)?;
+    if open_settings {
+        engine.open_settings();
+    }
     let code = engine.run();
     engine.shutdown();
     Ok(code)
@@ -169,6 +180,8 @@ struct Engine {
     hotkey_retry_at: Option<Instant>,
     events: Sender<EngineEvent>,
     received: Receiver<EngineEvent>,
+    /// Set by a second copy of blink to have this one open its settings.
+    settings_requests: NamedEvent,
     settings_open: bool,
     capture_state: CaptureState,
     /// When video paused for an unsupported mode, until frames return.
@@ -181,7 +194,11 @@ struct Engine {
 }
 
 impl Engine {
-    fn start(config_path: PathBuf, config: Config) -> anyhow::Result<Self> {
+    fn start(
+        config_path: PathBuf,
+        config: Config,
+        settings_requests: NamedEvent,
+    ) -> anyhow::Result<Self> {
         sound::prepare();
         if config.save_sound {
             sound::warm_up();
@@ -203,6 +220,7 @@ impl Engine {
             hotkey_retry_at: None,
             events,
             received,
+            settings_requests,
             settings_open: false,
             capture_state: CaptureState::Starting,
             paused_since: None,
@@ -236,6 +254,10 @@ impl Engine {
                         return ExitCode::SUCCESS;
                     }
                 }
+            }
+            if self.settings_requests.take() {
+                tracing::info!("blink was started again; opening settings");
+                self.open_settings();
             }
             while let Ok(event) = self.received.try_recv() {
                 match event {

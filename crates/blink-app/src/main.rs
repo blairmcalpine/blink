@@ -4,7 +4,10 @@
 //! packets into the clip ring, an audio thread, a save thread, and the tray
 //! and hotkey thread that drives them (see `engine`). `blink --settings` runs
 //! the settings window instead, as a separate short-lived process, so the
-//! recorder never loads a UI toolkit.
+//! recorder never loads a UI toolkit. `blink --open-settings` runs the
+//! recorder and has it open the settings window once started, as the
+//! installer's "Launch blink" and the Start menu shortcut do. Starting blink while it already runs asks
+//! the running recorder to open its settings window instead.
 //!
 //! The recorder only runs on Windows; elsewhere the binary still builds, and
 //! `--settings` works for UI development.
@@ -103,12 +106,18 @@ use blink_sys::ErrorChain;
 /// The argument that runs the settings window instead of the recorder.
 const SETTINGS_FLAG: &str = "--settings";
 
+/// The argument that runs the recorder and opens the settings window.
+const OPEN_SETTINGS_FLAG: &str = "--open-settings";
+
 fn main() -> ExitCode {
     let mut settings = false;
+    let mut open_settings = false;
     let mut unknown = Vec::new();
     for arg in std::env::args_os().skip(1) {
         if arg == OsStr::new(SETTINGS_FLAG) {
             settings = true;
+        } else if arg == OsStr::new(OPEN_SETTINGS_FLAG) {
+            open_settings = true;
         } else {
             unknown.push(arg);
         }
@@ -122,7 +131,7 @@ fn main() -> ExitCode {
     if settings {
         run_settings()
     } else {
-        run_recorder()
+        run_recorder(open_settings)
     }
 }
 
@@ -198,9 +207,9 @@ fn notify_crash(message: &str) {
 const fn notify_crash(_message: &str) {}
 
 #[cfg(windows)]
-fn run_recorder() -> ExitCode {
+fn run_recorder(open_settings: bool) -> ExitCode {
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "blink starting");
-    match engine::run() {
+    match engine::run(open_settings) {
         Ok(code) => code,
         Err(error) => {
             let message = ErrorChain(error.as_ref()).to_string();
@@ -212,7 +221,7 @@ fn run_recorder() -> ExitCode {
 }
 
 #[cfg(not(windows))]
-fn run_recorder() -> ExitCode {
+fn run_recorder(_open_settings: bool) -> ExitCode {
     tracing::error!(
         "blink records with DXGI Desktop Duplication and NVENC, so it only runs on Windows; \
          `blink {SETTINGS_FLAG}` opens the settings window on this host"

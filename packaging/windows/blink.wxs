@@ -105,11 +105,13 @@
       <Custom Action="RemoveStartupApprovedValue" After="RemoveRunValue" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
 
-    <!-- Launch blink from the last dialog. Quiet installs never launch it. -->
+    <!--
+      Launch blink from the last dialog, with its settings window open so it
+      is clear blink is running. Quiet installs never launch it.
+    -->
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch blink" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
-    <Property Id="WixShellExecTarget" Value="[#blink.exe]" />
-    <CustomAction Id="LaunchBlink" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixShellExec" Impersonate="yes" />
+    <CustomAction Id="LaunchBlink" FileRef="blink.exe" ExeCommand="--open-settings" Return="asyncNoWait" />
 
     <!--
       WixUI_Minimal with its license dialog replaced by OptionsDlg. The
@@ -212,6 +214,7 @@
                   Name="blink"
                   Description="Save the last seconds of your screen as a clip"
                   Target="[INSTALLFOLDER]blink.exe"
+                  Arguments="--open-settings"
                   WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue Root="HKCU" Key="Software\blink\Installer" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
       </Component>

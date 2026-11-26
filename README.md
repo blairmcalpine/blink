@@ -50,7 +50,11 @@ run it. It installs blink for your user only, into
 `%LOCALAPPDATA%\Programs\blink`, without asking for administrator rights. Its
 one options screen adds a Start menu shortcut and starts blink when you sign
 in to Windows; both are on by default. The last screen can launch blink right
-away. Each release also has a `.sha256` file with the installer's checksum.
+away, with its settings window open. Each release also has a `.sha256` file
+with the installer's checksum.
+
+blink runs in the notification area. Starting it from the Start menu opens its
+settings window too, whether or not it was already running.
 
 To change whether blink starts when you sign in later, use **Start blink when
 I sign in** in blink's settings. Turning blink off under **Settings > Apps >

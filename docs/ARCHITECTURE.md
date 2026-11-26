@@ -53,7 +53,7 @@ keyframe, drops the packets before it, and remuxes what remains into MP4.
 | `crates/blink-capture` | DXGI Desktop Duplication and D3D11 device management. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-audio` | WASAPI loopback and microphone capture, their mix, and AAC encode through a Media Foundation MFT. | `unsafe` allowed; every block needs `// SAFETY:` |
 | `crates/blink-encode` | NVENC session management, resource registration, encode calls. | `unsafe` allowed; every block needs `// SAFETY:` |
-| `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex, the tray thread's message pump, and asynchronous playback of in-memory WAV sounds. Also the portable helpers they share: `Backoff`, `ErrorChain`, and the replacing and no-replace file renames. | `unsafe` allowed; every block needs `// SAFETY:` |
+| `crates/blink-sys` | Win32 plumbing the other crates share: the QPC clock, thread priority and background mode, the single-instance mutex and the named event a second copy sets to open settings, the tray thread's message pump, and asynchronous playback of in-memory WAV sounds. Also the portable helpers they share: `Backoff`, `ErrorChain`, and the replacing and no-replace file renames. | `unsafe` allowed; every block needs `// SAFETY:` |
 
 The four FFI crates are the only place `unsafe` is permitted. They are also
 where bugs are most expensive, so they carry the strictest review bar.
@@ -535,6 +535,15 @@ item spawns `blink.exe --settings`, a separate short-lived process that shows a
 small fixed-size egui window on eframe's OpenGL (glow) renderer. It repaints
 only on input, never continuously. Closing the window exits the process, so the
 settings UI and its GL context cost nothing while gaming.
+
+Two other paths open the same window. `blink.exe --open-settings`, which the
+installer's "Launch blink" and the Start menu shortcut run, starts the
+recorder and then opens it. A
+second `blink.exe` finds the `Local\blink-engine` mutex held, sets the named
+event `Local\blink-open-settings`, and exits; the tray thread polls that event
+every tick and opens the window, unless one is already open. The recorder
+creates the event before taking the mutex, so a second copy that finds the
+mutex held always finds the event too.
 
 Rationale: an in-process GPU-backed UI keeps a GPU context resident for the life
 of the process; a separate process that exits removes that cost entirely, so the
