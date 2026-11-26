@@ -573,6 +573,9 @@ fn owned(clip_packets: impl Iterator<Item = (PacketMeta, Vec<u8>)>) -> Vec<(Pack
 /// the window invariant must hold; under pressure clip audio may lose a prefix.
 fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy: bool) {
     let iterations = if cfg!(miri) { 250 } else { 12_000 };
+    // Copying each clip out for comparison dominates under Miri, so it checks
+    // every few steps; pushes and evictions still run every step.
+    let clip_every = if cfg!(miri) { 5 } else { 1 };
     let window = Timestamp::from_ticks(400 * MS);
     let mut ring = ClipRing::with_limits(window, byte_capacity, packet_capacity);
     ring.set_video_format(video_format(64));
@@ -614,6 +617,9 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
         if roomy {
             let cutoff = newest.saturating_sub(window);
             assert!(ring.keyframes.get(1).is_none_or(|next| next.pts > cutoff));
+        }
+        if step % clip_every != 0 {
+            continue;
         }
         let end = newest.saturating_add(Timestamp::from_ticks(1));
         if ring.snapshot(end, window, &mut clip).is_err() {
@@ -694,9 +700,12 @@ fn reused_clip_buffer_does_not_grow() {
     }
     ring.snapshot(FOREVER, FOREVER, &mut clip).expect("clip");
     let data_len = clip.data_len();
+    let clip_every = if cfg!(miri) { 10 } else { 1 };
     for step in 200..400 {
         push(&mut ring, video(step * 10, step % 30 == 0), &[1; 8]);
-        ring.snapshot(FOREVER, FOREVER, &mut clip).expect("clip");
+        if step % clip_every == 0 {
+            ring.snapshot(FOREVER, FOREVER, &mut clip).expect("clip");
+        }
     }
     assert!(clip.data_len() <= 1 << 12);
     assert!(data_len > 0);
