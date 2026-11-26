@@ -37,7 +37,7 @@ const SETTLE: Timestamp = Timestamp::from_millis(200);
 const NAME_ATTEMPTS: u32 = 100;
 
 /// Requests accepted at once: one being written plus one being cut or
-/// queued, which bounds memory to two clip buffers.
+/// queued, which bounds the media kept past its eviction to two clips'.
 const MAX_OUTSTANDING: u32 = 2;
 
 /// One save, captured when the hotkey or menu item fired.

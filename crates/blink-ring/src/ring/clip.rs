@@ -1,29 +1,41 @@
-//! Reusable buffer that a clip is copied into on the save thread.
+//! The packets of one saved clip.
 
+use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
+use super::blocks::Block;
 use crate::media::{AudioFormat, PacketMeta, StreamKind, Timestamp, VideoFormat};
 
-/// The packets of one clip, owned by the save thread and reused across saves.
+/// The packets of one clip, filled by
+/// [`ClipRing::snapshot`](crate::ClipRing::snapshot) or by hand with
+/// [`ClipBuf::begin`] and the `push_*` methods.
 ///
-/// Filled by [`ClipRing::begin_clip`](crate::ClipRing::begin_clip) and
-/// [`ClipRing::copy_clip`](crate::ClipRing::copy_clip), or by hand with
-/// [`ClipBuf::begin`] and the `push_*` methods. All payloads live in one byte
-/// vector, so a reused buffer stops allocating once it has grown to the
-/// largest clip saved.
+/// A clip cut from the ring copies no payload: it shares the ring's blocks,
+/// which stay alive until the clip is dropped even if the ring evicts them
+/// meanwhile. Drop the clip once it is written, so those blocks are freed.
 ///
 /// The clip is presented from [`start`](Self::start) to [`end`](Self::end).
 /// Video starts at a keyframe at `start`. Audio may include one frame before
 /// `start` as AAC decoder preroll; the muxer trims it with an edit list.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct ClipBuf {
     video_format: Option<VideoFormat>,
     audio_format: Option<AudioFormat>,
     start: Timestamp,
     end: Timestamp,
-    data: Vec<u8>,
-    video: Vec<(PacketMeta, Range<usize>)>,
-    audio: Vec<(PacketMeta, Range<usize>)>,
+    blocks: Vec<Block>,
+    video: Vec<Packet>,
+    audio: Vec<Packet>,
+    data_len: usize,
+}
+
+/// Where one packet's payload lives in a clip's blocks.
+#[derive(Clone)]
+struct Packet {
+    meta: PacketMeta,
+    block: usize,
+    range: Range<usize>,
 }
 
 impl ClipBuf {
@@ -33,18 +45,7 @@ impl ClipBuf {
         Self::default()
     }
 
-    /// Creates an empty buffer with room for `bytes` of payload and `packets` packets.
-    #[must_use]
-    pub fn with_capacity(bytes: usize, packets: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(bytes),
-            video: Vec::with_capacity(packets),
-            audio: Vec::with_capacity(packets / 4),
-            ..Self::default()
-        }
-    }
-
-    /// Clears the buffer for a new clip, keeping its allocations.
+    /// Clears the buffer for a new clip.
     pub fn begin(
         &mut self,
         video_format: &VideoFormat,
@@ -56,62 +57,51 @@ impl ClipBuf {
         self.audio_format = audio_format.cloned();
         self.start = start;
         self.end = end;
-        self.data.clear();
+        self.blocks.clear();
         self.video.clear();
         self.audio.clear();
+        self.data_len = 0;
     }
 
-    /// Empties the buffer and makes room for a clip of up to `bytes` of
-    /// payload and `packets` packets of each stream, touching the payload
-    /// pages so that copying into them later neither allocates nor
-    /// page-faults.
-    ///
-    /// Call it before [`ClipRing::begin_clip`](crate::ClipRing::begin_clip)
-    /// without holding the ring's lock, sized from
-    /// [`ClipRing::bytes_used`](crate::ClipRing::bytes_used) and
-    /// [`ClipRing::len`](crate::ClipRing::len), so the copy under the lock
-    /// only moves bytes.
-    pub fn prepare(&mut self, bytes: usize, packets: usize) {
-        self.data.clear();
-        self.video.clear();
-        self.audio.clear();
-        self.data.resize(bytes, 0);
-        self.data.clear();
-        self.video.reserve(packets);
-        self.audio.reserve(packets);
+    /// Makes room for `video` and `audio` more packets.
+    pub(super) fn reserve(&mut self, video: usize, audio: usize) {
+        self.video.reserve(video);
+        self.audio.reserve(audio);
     }
 
-    /// Reserves room for `bytes` more payload and `packets` more packets.
-    pub fn reserve(&mut self, bytes: usize, packets: usize) {
-        self.data.reserve(bytes);
-        self.video.reserve(packets);
-    }
-
-    /// Appends a video access unit (Annex B, as pushed into the ring).
+    /// Appends a video access unit (Annex B, as pushed into the ring),
+    /// copying it.
     pub fn push_video(&mut self, meta: PacketMeta, payload: &[u8]) {
-        self.push_parts(StreamKind::Video, meta, payload, &[]);
+        self.push_owned(StreamKind::Video, meta, payload);
     }
 
-    /// Appends a raw AAC frame.
+    /// Appends a raw AAC frame, copying it.
     pub fn push_audio(&mut self, meta: PacketMeta, payload: &[u8]) {
-        self.push_parts(StreamKind::Audio, meta, payload, &[]);
+        self.push_owned(StreamKind::Audio, meta, payload);
     }
 
-    /// Appends a packet whose payload is split in two, as at the arena's end.
-    pub(super) fn push_parts(
-        &mut self,
-        kind: StreamKind,
-        meta: PacketMeta,
-        first: &[u8],
-        second: &[u8],
-    ) {
-        let begin = self.data.len();
-        self.data.extend_from_slice(first);
-        self.data.extend_from_slice(second);
-        let entry = (meta, begin..self.data.len());
+    fn push_owned(&mut self, kind: StreamKind, meta: PacketMeta, payload: &[u8]) {
+        self.share(Arc::new(payload.to_vec()));
+        self.push_shared(kind, meta, 0..payload.len());
+    }
+
+    /// Adds a block that the following [`push_shared`](Self::push_shared)
+    /// packets live in.
+    pub(super) fn share(&mut self, block: Block) {
+        self.blocks.push(block);
+    }
+
+    /// Appends a packet whose payload is `range` of the last shared block.
+    pub(super) fn push_shared(&mut self, kind: StreamKind, meta: PacketMeta, range: Range<usize>) {
+        self.data_len = self.data_len.saturating_add(range.len());
+        let packet = Packet {
+            meta,
+            block: self.blocks.len().saturating_sub(1),
+            range,
+        };
         match kind {
-            StreamKind::Video => self.video.push(entry),
-            StreamKind::Audio => self.audio.push(entry),
+            StreamKind::Video => self.video.push(packet),
+            StreamKind::Audio => self.audio.push(packet),
         }
     }
 
@@ -170,20 +160,28 @@ impl ClipBuf {
     /// Total payload bytes.
     #[must_use]
     pub const fn data_len(&self) -> usize {
-        self.data.len()
+        self.data_len
     }
 
-    /// Payload bytes the buffer can hold without allocating.
-    #[must_use]
-    pub const fn data_capacity(&self) -> usize {
-        self.data.capacity()
+    fn packets<'a>(&'a self, list: &'a [Packet]) -> impl Iterator<Item = (PacketMeta, &'a [u8])> {
+        list.iter().filter_map(|packet| {
+            let block = self.blocks.get(packet.block)?;
+            Some((packet.meta, block.get(packet.range.clone())?))
+        })
     }
+}
 
-    fn packets<'a>(
-        &'a self,
-        list: &'a [(PacketMeta, Range<usize>)],
-    ) -> impl Iterator<Item = (PacketMeta, &'a [u8])> {
-        list.iter()
-            .filter_map(|(meta, range)| Some((*meta, self.data.get(range.clone())?)))
+impl fmt::Debug for ClipBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClipBuf")
+            .field("video_format", &self.video_format)
+            .field("audio_format", &self.audio_format)
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("video_packets", &self.video.len())
+            .field("audio_packets", &self.audio.len())
+            .field("blocks", &self.blocks.len())
+            .field("data_len", &self.data_len)
+            .finish()
     }
 }

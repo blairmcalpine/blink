@@ -2,15 +2,15 @@
 //! as soon as its settle delay has passed, and a writer thread that writes
 //! the finished buffers.
 //!
-//! Splitting the stages keeps copying from ever waiting on the disk. The ring
+//! Splitting the stages keeps cutting from ever waiting on the disk. The ring
 //! keeps only a few seconds beyond the clip length, so a save queued behind a
 //! slow write would otherwise lose the start of its clip to eviction.
 //!
-//! Memory: one [`ClipBuf`] (about one clip of encoded media) is kept between
-//! saves, in a single spare slot. A second exists only while one save is
-//! being written and the next is cut; the writer frees whichever buffer finds
-//! the slot full, so a burst of saves costs a transient allocation rather
-//! than doubling the resident size for good.
+//! Memory: a [`ClipBuf`] copies no payload; it shares the ring's blocks, and
+//! is dropped as soon as it is written. A save therefore costs only the
+//! blocks the ring evicts while the clip is being written (about a second
+//! of media), not a second copy of the clip, and nothing is kept between
+//! saves.
 
 use std::io;
 use std::sync::Arc;
@@ -19,7 +19,6 @@ use std::thread::{self, JoinHandle};
 
 use blink_ring::ClipBuf;
 use blink_ring::media::Timestamp;
-use parking_lot::Mutex;
 
 use crate::cut::{CutError, cut};
 use crate::shared::SharedRing;
@@ -38,18 +37,12 @@ pub(crate) struct Job<P> {
 /// A job once cut, on its way to the writer.
 struct Cut<P> {
     job: Job<P>,
-    clip: ClipBuf,
-    result: Result<(), CutError>,
+    clip: Result<ClipBuf, CutError>,
 }
-
-/// The one buffer kept between saves.
-type Spare = Arc<Mutex<Option<ClipBuf>>>;
 
 /// The two save threads. Dropping it lets queued jobs finish, then joins.
 pub(crate) struct SavePipeline<P> {
     jobs: Option<Sender<Job<P>>>,
-    #[cfg(test)]
-    spare: Spare,
     cutter: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
 }
@@ -76,28 +69,22 @@ impl<P: Send + 'static> SavePipeline<P> {
     {
         let (jobs, job_queue) = mpsc::channel::<Job<P>>();
         let (cuts, cut_queue) = mpsc::channel::<Cut<P>>();
-        let spare = Spare::default();
-        let writer_spare = Arc::clone(&spare);
-        let cutter_spare = Arc::clone(&spare);
         let writer = thread::Builder::new()
             .name("blink-write".to_owned())
             .spawn(move || {
                 let _guard = writer_init();
-                for Cut { job, clip, result } in cut_queue {
-                    write(job, result.map(|()| &clip));
-                    give_back(&writer_spare, clip);
+                for Cut { job, clip } in cut_queue {
+                    write(job, clip.as_ref().map_err(|error| *error));
                 }
             })?;
         let cutter = thread::Builder::new()
             .name("blink-save".to_owned())
             .spawn(move || {
                 cutter_init();
-                run_cutter(&ring, &settle, &job_queue, &cutter_spare, &cuts);
+                run_cutter(&ring, &settle, &job_queue, &cuts);
             })?;
         Ok(Self {
             jobs: Some(jobs),
-            #[cfg(test)]
-            spare,
             cutter: Some(cutter),
             writer: Some(writer),
         })
@@ -117,20 +104,6 @@ impl<P: Send + 'static> SavePipeline<P> {
             .into_iter()
             .all(|thread| thread.as_ref().is_some_and(|thread| !thread.is_finished()))
     }
-}
-
-/// Keeps `clip` as the spare if the slot is empty; otherwise frees it,
-/// outside the lock.
-fn give_back(spare: &Mutex<Option<ClipBuf>>, clip: ClipBuf) {
-    let mut slot = spare.lock();
-    let extra = if slot.is_none() {
-        *slot = Some(clip);
-        None
-    } else {
-        Some(clip)
-    };
-    drop(slot);
-    drop(extra);
 }
 
 impl<P> SavePipeline<P> {
@@ -158,15 +131,12 @@ fn run_cutter<P>(
     ring: &SharedRing,
     settle: &dyn Fn(Timestamp),
     jobs: &Receiver<Job<P>>,
-    spare: &Mutex<Option<ClipBuf>>,
     cuts: &Sender<Cut<P>>,
 ) {
     for job in jobs {
-        // Reused across saves, so after the largest clip it stops allocating.
-        let mut clip = spare.lock().take().unwrap_or_default();
         settle(job.now);
-        let result = cut(ring, &mut clip, job.now, job.duration);
-        if cuts.send(Cut { job, clip, result }).is_err() {
+        let clip = cut(ring, job.now, job.duration);
+        if cuts.send(Cut { job, clip }).is_err() {
             tracing::error!("the clip writer is gone; cannot save clips");
             return;
         }
@@ -240,14 +210,6 @@ mod tests {
             let duration = duration.unwrap();
             assert!(duration >= clip, "clip {payload} is only {duration:?}");
         }
-        // Up to two buffers were in flight; one is kept.
-        assert!(
-            pipeline
-                .spare
-                .lock()
-                .as_ref()
-                .is_some_and(|clip| clip.data_capacity() > 0)
-        );
     }
 
     #[test]
@@ -284,70 +246,5 @@ mod tests {
             duration: Timestamp::from_secs(5),
             payload: 3,
         }));
-    }
-
-    #[test]
-    fn the_spare_buffer_is_reused_and_kept() {
-        // Larger than these cuts ask for, so capacity shows reuse.
-        const MARK: usize = 8 << 20;
-        let ring = Arc::new(SharedRing::new(RingSize::for_config(&config())));
-        Source::new().run_until(&ring, NOW_MS);
-        let (results, received) = mpsc::channel();
-        let (written, wait_for_write) = mpsc::channel();
-        let mut pipeline = SavePipeline::spawn(
-            ring,
-            |_now| {},
-            || {},
-            || (),
-            move |job: Job<u32>, clip: Result<&ClipBuf, CutError>| {
-                let capacity = clip.map(ClipBuf::data_capacity);
-                results.send((job.payload, capacity)).unwrap();
-                written.send(()).unwrap();
-            },
-        )
-        .unwrap();
-        *pipeline.spare.lock() = Some(ClipBuf::with_capacity(MARK, 0));
-        for payload in 0..2 {
-            assert!(pipeline.submit(Job {
-                now: Timestamp::from_ticks(NOW_MS * MS),
-                duration: Timestamp::from_secs(CLIP_SECS.into()),
-                payload,
-            }));
-            // One at a time, so each cut finds the buffer the last write
-            // gave back.
-            wait_for_write.recv().unwrap();
-            let returned = (0..500).any(|_| {
-                thread::sleep(Duration::from_millis(10));
-                pipeline.spare.lock().is_some()
-            });
-            assert!(returned, "the writer gave the buffer back");
-        }
-        pipeline.shutdown();
-        let results: Vec<_> = received.iter().collect();
-        for (payload, capacity) in results {
-            assert!(
-                capacity.unwrap() >= MARK,
-                "save {payload} got a fresh buffer: {capacity:?}"
-            );
-        }
-        assert!(
-            pipeline
-                .spare
-                .lock()
-                .as_ref()
-                .is_some_and(|clip| clip.data_capacity() >= MARK)
-        );
-    }
-
-    #[test]
-    fn only_one_spare_is_kept() {
-        let spare = Mutex::new(None);
-        give_back(&spare, ClipBuf::with_capacity(1 << 10, 0));
-        give_back(&spare, ClipBuf::with_capacity(1 << 20, 0));
-        assert_eq!(
-            spare.lock().take().map(|clip| clip.data_capacity()),
-            Some(1 << 10),
-            "the second buffer was freed, not swapped in"
-        );
     }
 }

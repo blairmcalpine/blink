@@ -396,64 +396,6 @@ fn save_time_before_any_keyframe_has_no_clip() {
 }
 
 #[test]
-fn chunked_copy_matches_one_shot_and_sees_late_packets() {
-    let mut ring = ring(60_000, 1 << 12);
-    push_gops(&mut ring, 0, 2, 5, 7);
-    for pts in (0..1000).step_by(25) {
-        push(&mut ring, audio(pts), &[5; 3]);
-    }
-    let now = Timestamp::from_ticks(1000 * MS);
-    let mut clip = ClipBuf::new();
-    let mut cursor = ring.begin_clip(now, FOREVER, &mut clip).expect("clip");
-    let mut calls = 0;
-    while ring.copy_clip(&mut cursor, &mut clip, 10).expect("copy") == CopyProgress::More {
-        calls += 1;
-        if calls == 3 {
-            // A frame still in the encoder at save time lands between chunks.
-            push(&mut ring, video(999, false), &[6; 7]);
-            push(&mut ring, video(1000, false), &[6; 7]);
-        }
-    }
-    assert!(calls > 5);
-    let mut expected = ClipBuf::new();
-    ring.snapshot(now, FOREVER, &mut expected).expect("clip");
-    assert_eq!(clip, expected);
-    assert_eq!(video_pts_ms(&clip).last(), Some(&999));
-}
-
-#[test]
-fn copy_reports_eviction_and_format_changes() {
-    let mut ring = ClipRing::with_limits(Timestamp::from_secs(60), 1 << 12, 12);
-    ring.set_video_format(video_format(64));
-    ring.set_audio_format(audio_format(48_000));
-    push_gops(&mut ring, 0, 2, 5, 1);
-    let mut clip = ClipBuf::new();
-    let mut cursor = ring.begin_clip(FOREVER, FOREVER, &mut clip).expect("clip");
-    assert_eq!(
-        ring.copy_clip(&mut cursor, &mut clip, 1),
-        Ok(CopyProgress::More)
-    );
-    push_gops(&mut ring, 1000, 1, 5, 1);
-    assert_eq!(
-        ring.copy_clip(&mut cursor, &mut clip, 1),
-        Err(ClipError::Evicted)
-    );
-
-    let mut cursor = ring.begin_clip(FOREVER, FOREVER, &mut clip).expect("clip");
-    ring.set_audio_format(audio_format(44_100));
-    assert_eq!(
-        ring.copy_clip(&mut cursor, &mut clip, 1),
-        Err(ClipError::FormatChanged)
-    );
-    let mut cursor = ring.begin_clip(FOREVER, FOREVER, &mut clip).expect("clip");
-    ring.set_video_format(video_format(32));
-    assert_eq!(
-        ring.copy_clip(&mut cursor, &mut clip, 1),
-        Err(ClipError::FormatChanged)
-    );
-}
-
-#[test]
 fn audio_preroll_frame_is_included() {
     let mut ring = ring(60_000, 1 << 12);
     for pts in (0..100).step_by(21) {
@@ -591,7 +533,6 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
         video: Vec::new(),
         audio: Vec::new(),
     };
-    let mut clip = ClipBuf::new();
     for step in 0..iterations {
         let roll = next();
         let len = usize::try_from(roll % 40 + 1).expect("small");
@@ -610,6 +551,8 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
             list.push((meta, vec![fill; len]));
         }
         assert_eq!(ring.bytes_used(), bytes_in_entries(&ring));
+        assert!(ring.bytes_reserved() <= ring.byte_capacity());
+        assert!(ring.bytes_used() <= ring.bytes_reserved());
         assert!(ring.len() <= ring.packet_capacity());
         let Some(newest) = ring.newest_pts() else {
             continue;
@@ -622,6 +565,7 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
             continue;
         }
         let end = newest.saturating_add(Timestamp::from_ticks(1));
+        let mut clip = ClipBuf::new();
         if ring.snapshot(end, window, &mut clip).is_err() {
             continue;
         }
@@ -662,58 +606,6 @@ fn randomized_under_pressure_with_skew() {
 #[test]
 fn randomized_window_only_with_skew() {
     randomized(1 << 16, 4096, 30, true);
-}
-
-#[test]
-fn push_never_reallocates() {
-    let iterations = if cfg!(miri) { 500 } else { 50_000 };
-    let mut ring = ring(500, 512);
-    let arena_ptr = ring.arena.as_ptr();
-    let entries_capacity = ring.entries.capacity();
-    let keyframes_capacity = ring.keyframes.capacity();
-    for step in 0..iterations {
-        let pts = i64::from(step) * 10;
-        let len = usize::try_from(step % 29 + 1).expect("small");
-        let meta = if step % 4 == 0 {
-            audio(pts)
-        } else {
-            video(pts, step % 30 == 1)
-        };
-        let _ = push(&mut ring, meta, &[0x5a; 32][..len]);
-    }
-    assert!(!ring.is_empty());
-    assert_eq!(ring.arena.as_ptr(), arena_ptr);
-    assert_eq!(ring.byte_capacity(), 512);
-    assert_eq!(ring.entries.capacity(), entries_capacity);
-    assert_eq!(ring.keyframes.capacity(), keyframes_capacity);
-}
-
-#[test]
-fn reused_clip_buffer_does_not_grow() {
-    let mut ring = ring(500, 1 << 12);
-    let mut clip = ClipBuf::with_capacity(1 << 12, 512);
-    for step in 0..200 {
-        push(&mut ring, video(step * 10, step % 30 == 0), &[1; 8]);
-        if step % 7 == 0 {
-            push(&mut ring, audio(step * 10), &[2; 4]);
-        }
-    }
-    ring.snapshot(FOREVER, FOREVER, &mut clip).expect("clip");
-    let data_len = clip.data_len();
-    let clip_every = if cfg!(miri) { 10 } else { 1 };
-    for step in 200..400 {
-        push(&mut ring, video(step * 10, step % 30 == 0), &[1; 8]);
-        if step % clip_every == 0 {
-            ring.snapshot(FOREVER, FOREVER, &mut clip).expect("clip");
-        }
-    }
-    assert!(clip.data_len() <= 1 << 12);
-    assert!(data_len > 0);
-    assert_eq!(
-        clip.audio_len(),
-        0,
-        "audio ended before the last clip's keyframe"
-    );
 }
 
 #[test]
@@ -772,35 +664,95 @@ fn debug_output_summarizes() {
 }
 
 #[test]
-fn prepare_sizes_the_buffer_for_the_whole_ring() {
-    let mut ring = ring(10_000, 1 << 16);
-    push_gops(&mut ring, 0, 3, 10, 100);
-    ring.push(audio(50), &[1; 30]).expect("push accepted");
-    let mut clip = snapshot(&ring, 3_000, 3_000);
-    assert!(clip.video_len() > 0);
-
-    clip.prepare(ring.bytes_used(), ring.len());
-    assert_eq!(clip.data_len(), 0);
-    assert_eq!(clip.video_len(), 0);
-    assert_eq!(clip.audio_len(), 0);
-    let capacity = clip.data_capacity();
-    assert!(capacity >= ring.bytes_used());
-
-    let mut cursor = ring
-        .begin_clip(
-            Timestamp::from_ticks(3_000 * MS),
-            Timestamp::from_ticks(3_000 * MS),
-            &mut clip,
-        )
-        .expect("clip available");
-    let progress = ring
-        .copy_clip(&mut cursor, &mut clip, usize::MAX)
-        .expect("copied");
-    assert_eq!(progress, CopyProgress::Done);
-    assert_eq!(clip.data_len(), ring.bytes_used());
+fn recommends_packet_capacity_from_fps() {
+    // 30 s plus 4 s of slack at 60 video and 64 audio packets a second.
     assert_eq!(
-        clip.data_capacity(),
-        capacity,
-        "the copy did not reallocate"
+        ClipRing::recommended_packet_capacity(Timestamp::from_secs(30), 60),
+        34 * 124
     );
+    assert_eq!(
+        ClipRing::recommended_packet_capacity(Timestamp::from_ticks(-1), 240),
+        4 * 304
+    );
+}
+
+#[test]
+fn memory_follows_the_media_held() {
+    // A 1 MiB-block ring with room for far more than this test stores.
+    let mut ring = ring(1000, 64 << 20);
+    assert_eq!(ring.bytes_reserved(), 0, "nothing is allocated up front");
+    // A burst: 2 s of 100 KB frames.
+    push_gops(&mut ring, 0, 4, 5, 100_000);
+    let busy = ring.bytes_reserved();
+    assert!(busy >= ring.bytes_used());
+    // Then a quiet screen: one tiny IDR a second.
+    for second in 2..10 {
+        push(&mut ring, video(second * 1000, true), &[1; 100]);
+    }
+    assert!(ring.bytes_used() < 1000);
+    assert!(
+        ring.bytes_reserved() <= 1 << 20,
+        "the burst's blocks were freed: {} of {busy}",
+        ring.bytes_reserved()
+    );
+}
+
+#[test]
+fn a_steady_stream_stops_allocating() {
+    let iterations = if cfg!(miri) { 2_000 } else { 50_000 };
+    let mut ring = ring(500, 4096);
+    let entries_capacity = ring.entries.capacity();
+    let keyframes_capacity = ring.keyframes.capacity();
+    let mut warm = None;
+    for step in 0..iterations {
+        let pts = i64::from(step) * 10;
+        let meta = if step % 4 == 0 {
+            audio(pts)
+        } else {
+            video(pts, step % 30 == 1)
+        };
+        let _ = push(&mut ring, meta, &[0x5a; 20]);
+        if step == iterations / 2 {
+            warm = Some(ring.store.allocations);
+        }
+    }
+    assert_eq!(Some(ring.store.allocations), warm);
+    assert_eq!(ring.entries.capacity(), entries_capacity);
+    assert_eq!(ring.keyframes.capacity(), keyframes_capacity);
+}
+
+#[test]
+fn a_clip_shares_blocks_and_outlives_their_eviction() {
+    let mut ring = ring(1000, 1 << 12);
+    push_gops(&mut ring, 0, 2, 5, 30);
+    let clip = snapshot_all(&ring);
+    let before: Vec<_> = clip
+        .video()
+        .map(|(meta, data)| (meta, data.to_vec()))
+        .collect();
+    assert_eq!(clip.data_len(), 300);
+    // The ring moves on far past the clip, evicting all of it.
+    push_gops(&mut ring, 5000, 6, 5, 30);
+    assert_eq!(video_pts_ms(&snapshot_all(&ring)).first(), Some(&6500));
+    let after: Vec<_> = clip
+        .video()
+        .map(|(meta, data)| (meta, data.to_vec()))
+        .collect();
+    assert_eq!(before, after);
+    assert!(before.iter().all(|(_, data)| data == &[0xab; 30]));
+}
+
+#[test]
+fn pushes_after_a_snapshot_do_not_touch_the_clip() {
+    let mut ring = ring(60_000, 1 << 12);
+    push(&mut ring, video(0, true), &[1; 4]);
+    let clip = snapshot_all(&ring);
+    push(&mut ring, video(100, false), &[2; 4]);
+    assert_eq!(
+        clip.video()
+            .map(|(_, data)| data.to_vec())
+            .collect::<Vec<_>>(),
+        [vec![1; 4]]
+    );
+    assert_eq!(video_pts_ms(&snapshot_all(&ring)), [0, 100]);
 }

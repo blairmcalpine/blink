@@ -1,24 +1,30 @@
 //! The GOP-aligned clip ring.
 
-mod arena;
+mod blocks;
 mod clip;
 
 use std::collections::VecDeque;
 use std::fmt;
 use std::mem::size_of;
+use std::sync::Arc;
 
 use thiserror::Error;
 use tracing::warn;
 
-use self::arena::Arena;
+use self::blocks::Blocks;
 pub use self::clip::ClipBuf;
 use crate::media::{AudioFormat, PacketMeta, StreamKind, Timestamp, VideoFormat};
 
-/// Upper bound on packets per second used to size the metadata deque:
-/// 240 fps video plus 48 kHz AAC (about 47 frames per second), with headroom.
+/// Upper bound on packets per second used to size the metadata deque when
+/// the caller does not give one: 240 fps video plus 48 kHz AAC (about 47
+/// frames per second), with headroom.
 const MAX_PACKETS_PER_SECOND: usize = 512;
 
-/// Media kept beyond the window, which both the arena and the metadata deque
+/// Audio packets per second that [`ClipRing::recommended_packet_capacity`]
+/// allows for on top of the video rate: 48 kHz AAC is about 47.
+const AUDIO_PACKETS_PER_SECOND: u32 = 64;
+
+/// Media kept beyond the window, which both the byte limit and the metadata deque
 /// are sized for: eviction is whole-GOP, so up to one GOP (1 to 2 s) more
 /// than the window is held.
 const GOP_SLACK: Timestamp = Timestamp::from_secs(4);
@@ -65,37 +71,14 @@ pub enum ClipError {
     /// No video format is set, or no keyframe is stored before the save time.
     #[error("no keyframe is buffered before the save time")]
     NoKeyframe,
-    /// Packets the clip still needed were evicted between copy calls.
-    #[error("packets needed by the clip were evicted while copying")]
-    Evicted,
-    /// A format change discarded the segment between copy calls.
-    #[error("the stream format changed while copying the clip")]
-    FormatChanged,
 }
 
-/// Whether [`ClipRing::copy_clip`] has reached the end of the ring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyProgress {
-    /// Every packet stored so far has been visited; the clip is complete.
-    Done,
-    /// The byte budget ran out; call again (after releasing the lock).
-    More,
-}
-
-/// Position of an in-progress clip copy. Created by [`ClipRing::begin_clip`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClipCursor {
-    generation: u64,
-    next_seq: u64,
-    video_from: u64,
-    audio_from: u64,
-    end: Timestamp,
-}
-
-/// One stored packet: its metadata and where its bytes live in the arena.
+/// One stored packet: its metadata and where its bytes live.
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     meta: PacketMeta,
+    /// Id of the block holding the payload.
+    block: u64,
     offset: usize,
     len: usize,
     seq: u64,
@@ -110,12 +93,15 @@ struct Keyframe {
 
 /// Ring buffer of the last N seconds of encoded audio and video.
 ///
-/// All storage is allocated in the constructor: one contiguous circular byte
-/// arena for payloads and fixed-capacity deques for packet metadata. Pushing
-/// never allocates. When the time window, the byte capacity, or the packet
-/// capacity is exceeded, the ring evicts whole video GOPs from the front,
-/// together with the audio stored before the next kept keyframe, so every
-/// stored video packet can be decoded.
+/// Payloads live in 1 MiB blocks that are allocated as media arrives and
+/// freed as it is evicted, so the ring's memory follows what it holds (a few
+/// megabytes on a static desktop) rather than its byte capacity, which is
+/// only a limit. One freed block is kept for reuse, so a steady stream stops
+/// allocating once the window is full. Packet metadata lives in
+/// fixed-capacity deques allocated in the constructor. When the time window,
+/// the byte capacity, or the packet capacity is exceeded, the ring evicts
+/// whole video GOPs from the front, together with the audio stored before
+/// the next kept keyframe, so every stored video packet can be decoded.
 ///
 /// Packets are stored in push order. Video and audio arrive on different
 /// threads with different latency, so audio stored just before a keyframe can
@@ -139,12 +125,14 @@ struct Keyframe {
 ///
 /// # Saving a clip
 ///
-/// The save thread owns a [`ClipBuf`] and copies the clip in bounded chunks so
-/// producers are never blocked for long:
+/// [`ClipRing::snapshot`] cuts a clip without copying any payload: the
+/// [`ClipBuf`] shares the ring's blocks, so the lock is held only while the
+/// packet list is built, and the clip's media stays alive while it is
+/// written even if the ring evicts it meanwhile:
 ///
 /// ```
 /// use std::sync::Mutex;
-/// use blink_ring::{ClipBuf, ClipRing, CopyProgress};
+/// use blink_ring::{ClipBuf, ClipRing};
 /// use blink_ring::media::{PacketMeta, StreamKind, Timestamp, VideoFormat};
 ///
 /// let ring = Mutex::new(ClipRing::with_capacity(Timestamp::from_secs(30), 1 << 20));
@@ -168,19 +156,15 @@ struct Keyframe {
 ///
 /// let mut clip = ClipBuf::new();
 /// let now = Timestamp::from_secs(1);
-/// let mut cursor = ring
-///     .lock()
+/// ring.lock()
 ///     .map_err(|_| "poisoned")?
-///     .begin_clip(now, Timestamp::from_secs(10), &mut clip)?;
-/// while ring.lock().map_err(|_| "poisoned")?.copy_clip(&mut cursor, &mut clip, 1 << 20)?
-///     == CopyProgress::More
-/// {}
+///     .snapshot(now, Timestamp::from_secs(10), &mut clip)?;
 /// assert_eq!(clip.video_len(), 1);
 /// assert_eq!(clip.end(), now);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub struct ClipRing {
-    arena: Arena,
+    store: Blocks,
     entries: VecDeque<Entry>,
     keyframes: VecDeque<Keyframe>,
     packet_capacity: usize,
@@ -188,7 +172,6 @@ pub struct ClipRing {
     next_seq: u64,
     newest: Option<Timestamp>,
     video_synced: bool,
-    generation: u64,
     audio_from_seq: u64,
     long_gop_warned: bool,
     video_format: Option<VideoFormat>,
@@ -197,10 +180,11 @@ pub struct ClipRing {
 
 impl ClipRing {
     /// Creates a ring that keeps at least `window` of media in at most
-    /// `byte_capacity` payload bytes.
+    /// `byte_capacity` bytes of payload blocks.
     ///
     /// Size `byte_capacity` with [`ClipRing::recommended_byte_capacity`]; a
-    /// smaller arena evicts by bytes before the window is reached. The packet
+    /// smaller limit evicts by bytes before the window is reached. It is
+    /// only a limit: blocks are allocated as media arrives. The packet
     /// capacity is derived from the window, assuming at most 512 packets per
     /// second plus 4 seconds of GOP slack, and never exceeds `byte_capacity`
     /// (every packet holds at least one byte).
@@ -213,7 +197,9 @@ impl ClipRing {
         )
     }
 
-    /// Creates a ring with an explicit cap on the number of stored packets.
+    /// Creates a ring with an explicit cap on the number of stored packets,
+    /// whose metadata is allocated up front. Size it with
+    /// [`ClipRing::recommended_packet_capacity`].
     ///
     /// `packet_capacity` is clamped to `1..=byte_capacity` and to what the
     /// allocator can address. Exceeding it evicts GOPs the same way exceeding
@@ -226,7 +212,7 @@ impl ClipRing {
             .min(max_allocation(size_of::<Entry>()))
             .max(1);
         Self {
-            arena: Arena::with_capacity(byte_capacity),
+            store: Blocks::new(byte_capacity),
             entries: VecDeque::with_capacity(packet_capacity),
             keyframes: VecDeque::with_capacity(packet_capacity),
             packet_capacity,
@@ -234,7 +220,6 @@ impl ClipRing {
             next_seq: 0,
             newest: None,
             video_synced: false,
-            generation: 0,
             audio_from_seq: 0,
             long_gop_warned: false,
             video_format: None,
@@ -242,7 +227,7 @@ impl ClipRing {
         }
     }
 
-    /// Arena size for `window` at a combined audio and video bitrate of
+    /// Byte capacity for `window` at a combined audio and video bitrate of
     /// `bits_per_second`: the window plus the ring's GOP slack (4 s), with 25%
     /// headroom for bitrate overshoot.
     #[must_use]
@@ -254,6 +239,17 @@ impl ClipRing {
         usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 
+    /// Packet capacity for `window` of video at `fps` plus AAC audio: the
+    /// window plus the ring's GOP slack (4 s), at `fps` video packets and
+    /// 64 audio packets a second. Capture is paced to at most one frame per
+    /// slot of `fps`, so the video rate never exceeds it.
+    #[must_use]
+    pub fn recommended_packet_capacity(window: Timestamp, fps: u32) -> usize {
+        let per_second =
+            usize::try_from(fps.saturating_add(AUDIO_PACKETS_PER_SECOND)).unwrap_or(usize::MAX);
+        kept_secs(window).saturating_mul(per_second)
+    }
+
     /// Starts a new segment with `format`, discarding every stored packet.
     ///
     /// Setting the format that is already current is a no-op, so the stored
@@ -262,7 +258,6 @@ impl ClipRing {
         if self.video_format.as_ref() != Some(&format) {
             self.clear_packets();
             self.newest = None;
-            self.generation = self.generation.wrapping_add(1);
             self.video_format = Some(format);
         }
     }
@@ -274,12 +269,13 @@ impl ClipRing {
     pub fn set_audio_format(&mut self, format: AudioFormat) {
         if self.audio_format.as_ref() != Some(&format) {
             self.audio_from_seq = self.next_seq;
-            self.generation = self.generation.wrapping_add(1);
             self.audio_format = Some(format);
         }
     }
 
-    /// Stores one encoded packet, evicting old GOPs as needed. Never allocates.
+    /// Stores one encoded packet, evicting old GOPs as needed. Allocates
+    /// only to open a block when no freed one is spare, which a steady
+    /// stream stops doing once the window is full.
     ///
     /// # Errors
     ///
@@ -295,20 +291,20 @@ impl ClipRing {
         if self.is_orphan(meta) {
             return Ok(PushOutcome::DroppedAwaitingKeyframe);
         }
-        let offset = self
-            .arena
-            .push(payload)
-            .ok_or_else(|| PushError::PayloadTooLarge {
-                len: payload.len(),
-                capacity: self.arena.capacity(),
-            })?;
-        self.store(meta, offset, payload.len());
+        let (block, offset) =
+            self.store
+                .push(payload)
+                .ok_or_else(|| PushError::PayloadTooLarge {
+                    len: payload.len(),
+                    capacity: self.store.limit(),
+                })?;
+        self.record(meta, block, offset, payload.len());
         self.enforce_window();
         Ok(PushOutcome::Stored)
     }
 
-    /// Starts cutting a clip that ends at `now` (the save request time) and
-    /// covers about `duration` before it.
+    /// Cuts the clip that ends at `now` (the save request time) and covers
+    /// about `duration` before it into `clip`, replacing its contents.
     ///
     /// The clip starts at the latest stored keyframe at or before
     /// `now - duration`, so it can run up to one GOP longer than `duration`.
@@ -318,20 +314,22 @@ impl ClipRing {
     /// AAC preroll frame before it), excluding packets with a PTS at or after
     /// `now`.
     ///
-    /// This resets `clip` and reserves room for the packets stored so far,
-    /// which allocates only if `clip` has not held a clip this large before.
-    /// Copy the packets with [`ClipRing::copy_clip`].
+    /// No payload is copied: `clip` shares the blocks the packets live in,
+    /// so this only builds the packet list, in time linear in the packets
+    /// stored. The newest block, once shared, is not written again; the next
+    /// push opens a fresh one. Drop `clip` once it is written, so the
+    /// blocks it shares can be freed or reused.
     ///
     /// # Errors
     ///
     /// Returns [`ClipError::NoKeyframe`] if no video format is set or no
     /// keyframe is stored before `now`.
-    pub fn begin_clip(
+    pub fn snapshot(
         &self,
         now: Timestamp,
         duration: Timestamp,
         clip: &mut ClipBuf,
-    ) -> Result<ClipCursor, ClipError> {
+    ) -> Result<(), ClipError> {
         let video_format = self.video_format.as_ref().ok_or(ClipError::NoKeyframe)?;
         let target = now.saturating_sub(duration);
         let start = *self
@@ -342,95 +340,51 @@ impl ClipRing {
             .or_else(|| self.keyframes.front())
             .filter(|keyframe| keyframe.pts < now)
             .ok_or(ClipError::NoKeyframe)?;
-        let audio_from = self.clip_audio_start(start);
-        let cursor = ClipCursor {
-            generation: self.generation,
-            next_seq: start.seq.min(audio_from),
+        let selection = Selection {
             video_from: start.seq,
-            audio_from,
+            audio_from: self.clip_audio_start(start),
             end: now,
         };
         clip.begin(video_format, self.audio_format.as_ref(), start.pts, now);
-        let (bytes, packets) = self
-            .entries
-            .iter()
-            .filter(|entry| cursor.includes(entry))
-            .fold((0_usize, 0_usize), |(bytes, packets), entry| {
-                (bytes.saturating_add(entry.len), packets + 1)
-            });
-        clip.reserve(bytes, packets);
-        Ok(cursor)
-    }
-
-    /// Copies the next packets of the clip into `clip`, stopping once about
-    /// `max_bytes` have been copied. Hold the ring's lock only for one call:
-    /// a budget of 1 MB keeps each call to roughly 100 µs.
-    ///
-    /// Packets pushed between calls with a PTS before the clip end are picked
-    /// up too, so starting the copy one frame after the save request also
-    /// catches frames still in the encoder.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClipError::Evicted`] if packets the clip still needed were
-    /// evicted since the last call, and [`ClipError::FormatChanged`] after a
-    /// format change. Start over with [`ClipRing::begin_clip`] in both cases.
-    pub fn copy_clip(
-        &self,
-        cursor: &mut ClipCursor,
-        clip: &mut ClipBuf,
-        max_bytes: usize,
-    ) -> Result<CopyProgress, ClipError> {
-        if cursor.generation != self.generation {
-            return Err(ClipError::FormatChanged);
-        }
         let front_seq = self
             .entries
             .front()
             .map_or(self.next_seq, |entry| entry.seq);
-        let skip = cursor
-            .next_seq
-            .checked_sub(front_seq)
-            .and_then(|skip| usize::try_from(skip).ok())
-            .ok_or(ClipError::Evicted)?;
-        let mut copied = 0_usize;
-        for entry in self.entries.iter().skip(skip) {
-            cursor.next_seq = entry.seq.wrapping_add(1);
-            if !cursor.includes(entry) {
-                continue;
+        let skip = usize::try_from(
+            selection
+                .video_from
+                .min(selection.audio_from)
+                .saturating_sub(front_seq),
+        )
+        .unwrap_or(usize::MAX);
+        let included = || {
+            self.entries
+                .iter()
+                .skip(skip)
+                .filter(|entry| selection.includes(entry))
+        };
+        let (video, audio) =
+            included().fold((0, 0), |(video, audio), entry| match entry.meta.kind {
+                StreamKind::Video => (video + 1, audio),
+                StreamKind::Audio => (video, audio + 1),
+            });
+        clip.reserve(video, audio);
+        let mut shared = None;
+        for entry in included() {
+            if shared != Some(entry.block) {
+                let Some(block) = self.store.block(entry.block) else {
+                    continue;
+                };
+                clip.share(Arc::clone(block));
+                shared = Some(entry.block);
             }
-            let (first, second) = self
-                .arena
-                .parts(entry.offset, entry.len)
-                .ok_or(ClipError::Evicted)?;
-            clip.push_parts(entry.meta.kind, entry.meta, first, second);
-            copied = copied.saturating_add(entry.len);
-            if copied >= max_bytes {
-                break;
-            }
+            clip.push_shared(
+                entry.meta.kind,
+                entry.meta,
+                entry.offset..entry.offset.saturating_add(entry.len),
+            );
         }
-        Ok(if cursor.next_seq == self.next_seq {
-            CopyProgress::Done
-        } else {
-            CopyProgress::More
-        })
-    }
-
-    /// Cuts a whole clip in one call: [`ClipRing::begin_clip`] plus
-    /// [`ClipRing::copy_clip`] without a byte budget. This holds `&self` for
-    /// the full copy; prefer the chunked form when producers share a lock.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClipError::NoKeyframe`] as [`ClipRing::begin_clip`] does.
-    pub fn snapshot(
-        &self,
-        now: Timestamp,
-        duration: Timestamp,
-        clip: &mut ClipBuf,
-    ) -> Result<(), ClipError> {
-        let mut cursor = self.begin_clip(now, duration, clip)?;
-        self.copy_clip(&mut cursor, clip, usize::MAX).map(|_| ())
+        Ok(())
     }
 
     /// Number of stored packets.
@@ -448,13 +402,20 @@ impl ClipRing {
     /// Payload bytes currently stored.
     #[must_use]
     pub const fn bytes_used(&self) -> usize {
-        self.arena.len()
+        self.store.used()
     }
 
-    /// Size of the payload arena in bytes.
+    /// Bytes of payload blocks the ring holds now, used or not: its
+    /// payload memory, apart from at most three spare blocks.
+    #[must_use]
+    pub const fn bytes_reserved(&self) -> usize {
+        self.store.reserved()
+    }
+
+    /// Most bytes of payload blocks the ring may hold.
     #[must_use]
     pub const fn byte_capacity(&self) -> usize {
-        self.arena.capacity()
+        self.store.limit()
     }
 
     /// Maximum number of stored packets.
@@ -491,10 +452,10 @@ impl ClipRing {
         if payload.is_empty() {
             return Err(PushError::EmptyPayload);
         }
-        if payload.len() > self.arena.capacity() {
+        if payload.len() > self.store.limit() {
             return Err(PushError::PayloadTooLarge {
                 len: payload.len(),
-                capacity: self.arena.capacity(),
+                capacity: self.store.limit(),
             });
         }
         match kind {
@@ -509,7 +470,7 @@ impl ClipRing {
         matches!(meta.kind, StreamKind::Video) && !meta.keyframe && !self.video_synced
     }
 
-    fn store(&mut self, meta: PacketMeta, offset: usize, len: usize) {
+    fn record(&mut self, meta: PacketMeta, block: u64, offset: usize, len: usize) {
         let seq = self.next_seq;
         self.next_seq = seq.wrapping_add(1);
         if matches!(meta.kind, StreamKind::Video) && meta.keyframe {
@@ -518,6 +479,7 @@ impl ClipRing {
         }
         self.entries.push_back(Entry {
             meta,
+            block,
             offset,
             len,
             seq,
@@ -544,7 +506,7 @@ impl ClipRing {
 
     /// Evicts until `len` more bytes and one more packet fit.
     fn make_room(&mut self, len: usize) {
-        while self.arena.free() < len || self.entries.len() >= self.packet_capacity {
+        while !self.store.fits(len) || self.entries.len() >= self.packet_capacity {
             if !self.evict_step() {
                 break;
             }
@@ -566,7 +528,7 @@ impl ClipRing {
             return false;
         } else {
             warn!(
-                bytes = self.arena.len(),
+                bytes = self.store.used(),
                 packets = self.entries.len(),
                 "clip ring overflowed within one GOP; dropped it and waiting for an IDR"
             );
@@ -643,20 +605,29 @@ impl ClipRing {
 
     fn pop_entry(&mut self) {
         if let Some(entry) = self.entries.pop_front() {
-            self.arena.pop_front(entry.len);
+            let first_needed = self.entries.front().map(|front| front.block);
+            self.store.release(entry.len, first_needed);
         }
     }
 
     fn clear_packets(&mut self) {
         self.entries.clear();
         self.keyframes.clear();
-        self.arena.clear();
+        self.store.clear();
         self.video_synced = false;
         self.long_gop_warned = false;
     }
 }
 
-impl ClipCursor {
+/// The packets of a clip: video from one sequence number, audio from
+/// another, everything before the save time.
+struct Selection {
+    video_from: u64,
+    audio_from: u64,
+    end: Timestamp,
+}
+
+impl Selection {
     /// Whether `entry` belongs to the clip.
     fn includes(&self, entry: &Entry) -> bool {
         entry.meta.pts < self.end
@@ -672,8 +643,9 @@ impl fmt::Debug for ClipRing {
         f.debug_struct("ClipRing")
             .field("packets", &self.entries.len())
             .field("packet_capacity", &self.packet_capacity)
-            .field("bytes_used", &self.arena.len())
-            .field("byte_capacity", &self.arena.capacity())
+            .field("bytes_used", &self.store.used())
+            .field("bytes_reserved", &self.store.reserved())
+            .field("byte_capacity", &self.store.limit())
             .field("window", &self.window)
             .field("newest", &self.newest)
             .field("video_format", &self.video_format)
@@ -704,11 +676,15 @@ const fn kept(window: Timestamp) -> Timestamp {
     window.saturating_add(GOP_SLACK)
 }
 
-fn default_packet_capacity(window: Timestamp, byte_capacity: usize) -> usize {
+/// Whole seconds the ring keeps for `window` (see [`kept`]), rounded up.
+fn kept_secs(window: Timestamp) -> usize {
     let ticks = u64::try_from(kept(window).ticks()).unwrap_or(0);
     let secs = ticks.div_ceil(Timestamp::TICKS_PER_SECOND.unsigned_abs());
-    usize::try_from(secs)
-        .unwrap_or(usize::MAX)
+    usize::try_from(secs).unwrap_or(usize::MAX)
+}
+
+fn default_packet_capacity(window: Timestamp, byte_capacity: usize) -> usize {
+    kept_secs(window)
         .saturating_mul(MAX_PACKETS_PER_SECOND)
         .min(byte_capacity)
 }

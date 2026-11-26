@@ -21,10 +21,10 @@ pub(crate) struct RingSlot {
 
 /// The clip ring behind one mutex.
 ///
-/// Every lock is short: one packet push, or one bounded chunk of a save. The
-/// lock is never held across I/O, an encode, or a thread join. The save
-/// thread locks it through [`SharedRing::read_fair`] between chunks, so a
-/// producer waiting on it always gets it next.
+/// Every lock is short: one packet push, or one save building its packet
+/// list (no payload is copied). The lock is never held across I/O, an
+/// encode, or a thread join. The save thread locks it through
+/// [`SharedRing::read_fair`], so a producer waiting on it gets it next.
 pub(crate) struct SharedRing {
     slot: Mutex<RingSlot>,
 }
@@ -45,8 +45,7 @@ impl SharedRing {
     }
 
     /// Runs `read` with the ring locked, then unlocks fairly: a thread
-    /// waiting for the lock gets it before the caller can lock again. For
-    /// the save thread's chunked copy, which locks back to back.
+    /// waiting for the lock gets it before the caller can lock again.
     pub(crate) fn read_fair<T>(&self, read: impl FnOnce(&RingSlot) -> T) -> T {
         let slot = self.lock();
         let value = read(&slot);
@@ -54,8 +53,8 @@ impl SharedRing {
         value
     }
 
-    /// Swaps in an empty ring of `size`. The new arena is allocated and the
-    /// old one freed outside the lock, so producers wait only for the swap.
+    /// Swaps in an empty ring of `size`. The new ring is built and the old
+    /// one freed outside the lock, so producers wait only for the swap.
     pub(crate) fn replace(&self, size: RingSize) {
         let mut ring = size.build();
         {
@@ -66,7 +65,8 @@ impl SharedRing {
         drop(ring);
         tracing::info!(
             window_secs = size.window.ticks() / Timestamp::TICKS_PER_SECOND,
-            bytes = size.byte_capacity,
+            max_bytes = size.byte_capacity,
+            max_packets = size.packet_capacity,
             "clip ring replaced"
         );
     }
@@ -183,6 +183,7 @@ pub(crate) mod tests {
         SharedRing::new(RingSize {
             window: Timestamp::from_secs(5),
             byte_capacity: 1 << 16,
+            packet_capacity: 1 << 10,
         })
     }
 
@@ -203,6 +204,7 @@ pub(crate) mod tests {
         ring.replace(RingSize {
             window: Timestamp::from_secs(6),
             byte_capacity: 1 << 16,
+            packet_capacity: 1 << 10,
         });
         assert!(ring.lock().ring.video_format().is_none());
 
