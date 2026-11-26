@@ -4,7 +4,7 @@ mod api;
 mod session;
 
 use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11Texture2D};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12};
 use windows::core::Interface;
 
 use blink_ring::media::{PacketMeta, StreamKind, Timestamp, VideoFormat};
@@ -15,9 +15,10 @@ use self::session::{Bitstream, PictureInput, Registered, Session};
 use crate::annexb::parameter_sets;
 use crate::config::bitrate_bps;
 use crate::ffi::{
-    NV_ENC_CODEC_H264_GUID, NV_ENC_CONFIG, NV_ENC_INITIALIZE_PARAMS, NV_ENC_PIC_FLAG_FORCEIDR,
-    NV_ENC_PIC_FLAG_OUTPUT_SPSPPS, NV_ENC_RECONFIGURE_PARAMS, NV_ENC_RECONFIGURE_PARAMS_VER,
-    NV_MAX_SEQ_HDR_LEN, RECONFIGURE_FORCE_IDR_BIT, RECONFIGURE_RESET_ENCODER_BIT, zeroed,
+    NV_ENC_BUFFER_FORMAT_ARGB, NV_ENC_BUFFER_FORMAT_NV12, NV_ENC_CODEC_H264_GUID, NV_ENC_CONFIG,
+    NV_ENC_INITIALIZE_PARAMS, NV_ENC_PIC_FLAG_FORCEIDR, NV_ENC_PIC_FLAG_OUTPUT_SPSPPS,
+    NV_ENC_RECONFIGURE_PARAMS, NV_ENC_RECONFIGURE_PARAMS_VER, NV_MAX_SEQ_HDR_LEN,
+    RECONFIGURE_FORCE_IDR_BIT, RECONFIGURE_RESET_ENCODER_BIT, zeroed,
 };
 use crate::idr::IdrScheduler;
 use crate::params::{TUNING, apply_config, fill_initialize, preset_guid};
@@ -26,11 +27,11 @@ use crate::{EncodeError, EncoderConfig};
 /// Registered textures kept at once: the capture pool
 /// (`blink_capture::TEXTURE_POOL_SIZE`) plus one spare.
 ///
-/// Each registration holds a texture alive (about 33 MB at 4K), so the cap
+/// Each registration holds a texture alive (12 MB at 4K in NV12), so the cap
 /// bounds what a replaced pool can pin if `release_textures` is missed.
 /// Beyond it the least recently registered texture is unregistered, so a
 /// capture pool larger than this would re-register on every frame.
-pub const MAX_REGISTERED_TEXTURES: usize = 4;
+pub const MAX_REGISTERED_TEXTURES: usize = 2;
 
 /// Initial capacity of the reused output buffer: one second at the target
 /// bitrate, but at least 256 KiB, which covers a typical IDR frame. A larger
@@ -54,9 +55,11 @@ struct Registration {
     /// reused while it is registered.
     texture: ID3D11Texture2D,
     handle: Registered,
+    /// The `NV_ENC_BUFFER_FORMAT` it was registered with.
+    format: u32,
 }
 
-/// An NVENC H.264 session encoding BGRA D3D11 textures.
+/// An NVENC H.264 session encoding NV12 (or BGRA) D3D11 textures.
 ///
 /// Create it on the capture thread with the device from
 /// `blink_capture::create_device` and call [`encode`](Self::encode) with each
@@ -90,8 +93,8 @@ struct Registration {
 /// buffers each with a completion event registered through
 /// `nvEncRegisterAsyncEvent`, and a separate thread that waits on the events
 /// and locks the buffers in submit order, so capture only submits. Inputs stay
-/// mapped until their output is locked, which the three-texture pool allows
-/// for at most two frames in flight.
+/// mapped until their output is locked, so the capture pool would need a
+/// texture per frame in flight plus one being written.
 ///
 /// Not `Send`: it holds COM interfaces and an NVENC session bound to the
 /// device whose immediate context the capture thread uses.
@@ -171,9 +174,11 @@ impl Encoder {
         Ok(encoder)
     }
 
-    /// Encodes one BGRA texture captured at `timestamp`.
+    /// Encodes one texture captured at `timestamp`.
     ///
-    /// The texture must be `DXGI_FORMAT_B8G8R8A8_UNORM`, single-sampled, on
+    /// The texture must be `DXGI_FORMAT_NV12` (BT.709 studio range, which
+    /// NVENC encodes as is) or `DXGI_FORMAT_B8G8R8A8_UNORM` (which NVENC
+    /// converts first, on CUDA cores), single-sampled, on
     /// the encoder's device, and exactly the current encode size. It is
     /// registered with NVENC the first time it is seen and the registration
     /// is reused afterwards, so the capture pool's textures are each
@@ -182,7 +187,7 @@ impl Encoder {
     /// steady state allocates nothing.
     ///
     /// NVENC reads the texture on the same device after capture's
-    /// `CopyResource`, which the driver orders. **Needs hardware
+    /// conversion or copy, which the driver orders. **Needs hardware
     /// verification**: if torn or stale frames show up, capture should
     /// `Flush` its context after the copy.
     ///
@@ -200,10 +205,10 @@ impl Encoder {
         timestamp: Timestamp,
     ) -> Result<EncodedFrame<'_>, EncodeError> {
         let index = self.registration_for(texture)?;
-        let registered = self
+        let (registered, format) = self
             .registrations
             .get(index)
-            .map(|registration| &registration.handle)
+            .map(|registration| (&registration.handle, registration.format))
             .ok_or(EncodeError::Invariant(
                 "the cached texture registration is missing",
             ))?;
@@ -224,6 +229,7 @@ impl Encoder {
             } else {
                 0
             },
+            format,
         };
         let encoded = self.session.encode_picture(&picture).and_then(|()| {
             let output = &mut self.output;
@@ -266,8 +272,8 @@ impl Encoder {
     ///
     /// On a static screen nothing is encoded, so the capture loop polls this
     /// and, when it returns `true`, re-encodes its last captured texture
-    /// stamped `now`. That texture is still intact: the capture pool only
-    /// reuses it after three newer frames.
+    /// stamped `now`. That texture is still intact: capture only writes it
+    /// again for a newer frame.
     #[must_use]
     pub fn idr_due(&self, now: Timestamp) -> bool {
         self.idr.due(now)
@@ -361,34 +367,40 @@ impl Encoder {
             return Ok(index);
         }
 
-        self.check_texture(texture)?;
+        let format = self.check_texture(texture)?;
         if self.registrations.len() >= MAX_REGISTERED_TEXTURES {
             let oldest = self.registrations.remove(0);
             unregister(&self.session, oldest);
         }
-        let handle = self
-            .session
-            .register(texture, self.settings.width, self.settings.height)?;
+        let handle =
+            self.session
+                .register(texture, self.settings.width, self.settings.height, format)?;
         tracing::debug!(
             width = self.settings.width,
             height = self.settings.height,
+            nv12 = format == NV_ENC_BUFFER_FORMAT_NV12,
             "registered capture texture with NVENC"
         );
         self.registrations.push(Registration {
             texture: texture.clone(),
             handle,
+            format,
         });
         Ok(self.registrations.len() - 1)
     }
 
-    fn check_texture(&self, texture: &ID3D11Texture2D) -> Result<(), EncodeError> {
+    /// Checks that NVENC can read `texture` and returns the
+    /// `NV_ENC_BUFFER_FORMAT` to register it with.
+    fn check_texture(&self, texture: &ID3D11Texture2D) -> Result<u32, EncodeError> {
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `texture` is a live interface and `desc` is a writable
         // descriptor of the type `GetDesc` fills.
         unsafe { texture.GetDesc(&raw mut desc) };
-        if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-            return Err(EncodeError::UnsupportedTextureFormat(desc.Format.0));
-        }
+        let format = match desc.Format {
+            DXGI_FORMAT_NV12 => NV_ENC_BUFFER_FORMAT_NV12,
+            DXGI_FORMAT_B8G8R8A8_UNORM => NV_ENC_BUFFER_FORMAT_ARGB,
+            other => return Err(EncodeError::UnsupportedTextureFormat(other.0)),
+        };
         if desc.ArraySize != 1 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 {
             return Err(EncodeError::UnsupportedTextureLayout {
                 array_size: desc.ArraySize,
@@ -404,7 +416,7 @@ impl Encoder {
                 height: self.settings.height,
             });
         }
-        Ok(())
+        Ok(format)
     }
 }
 

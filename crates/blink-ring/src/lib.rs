@@ -1,9 +1,10 @@
 //! Encoded-packet ring buffer for blink.
 //!
 //! The recorder keeps the last N seconds of encoded H.264 and AAC in memory.
-//! [`ClipRing`] holds those packets in one preallocated circular byte arena,
-//! evicts whole GOPs as time passes, and copies a GOP-aligned clip into a
-//! reusable [`ClipBuf`] when the user saves. [`media`] holds the media types shared by every crate in the
+//! [`ClipRing`] holds those packets in byte blocks allocated as media arrives
+//! and freed as it is evicted, evicts whole GOPs as time passes, and cuts a
+//! GOP-aligned [`ClipBuf`] that shares those blocks, copying no payload,
+//! when the user saves. [`media`] holds the media types shared by every crate in the
 //! pipeline, and [`h264`] the Annex B splitting the encoder and muxer share.
 //!
 //! The crate is platform-agnostic, contains no `unsafe`, and its tests run
@@ -16,4 +17,4 @@ pub mod h264;
 pub mod media;
 mod ring;
 
-pub use ring::{ClipBuf, ClipCursor, ClipError, ClipRing, CopyProgress, PushError, PushOutcome};
+pub use ring::{ClipBuf, ClipError, ClipRing, PushError, PushOutcome};

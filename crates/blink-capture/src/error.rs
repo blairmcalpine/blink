@@ -78,6 +78,19 @@ pub enum CaptureError {
     #[cfg(windows)]
     #[error("unsupported desktop image format {0:?}")]
     UnsupportedFormat(DXGI_FORMAT),
+    /// The D3D11 video processor cannot read (or write) a format the NV12
+    /// conversion needs.
+    #[cfg(windows)]
+    #[error(
+        "the video processor does not support {format:?} as {}",
+        if *input { "input" } else { "output" }
+    )]
+    VideoProcessorFormat {
+        /// The format.
+        format: DXGI_FORMAT,
+        /// Whether it was needed as input rather than output.
+        input: bool,
+    },
 }
 
 #[cfg(windows)]

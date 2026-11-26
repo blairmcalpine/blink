@@ -1,6 +1,6 @@
 //! Saving clips: cut out of the ring, then written as MP4s.
 //!
-//! Two threads ([`crate::pipeline`]): the cutter copies each clip at below
+//! Two threads ([`crate::pipeline`]): the cutter cuts each clip at below
 //! normal priority as soon as its settle delay has passed, so a game's
 //! threads preempt it but it is not starved while it holds the ring lock (see
 //! [`crate::cut`]). The writer, the only thread that touches the disk, runs
@@ -37,7 +37,7 @@ const SETTLE: Timestamp = Timestamp::from_millis(200);
 const NAME_ATTEMPTS: u32 = 100;
 
 /// Requests accepted at once: one being written plus one being cut or
-/// queued, which bounds memory to two clip buffers.
+/// queued, which bounds the media kept past its eviction to two clips'.
 const MAX_OUTSTANDING: u32 = 2;
 
 /// One save, captured when the hotkey or menu item fired.

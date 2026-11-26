@@ -14,11 +14,10 @@ use windows::core::Interface;
 use super::api::Api;
 use crate::EncodeError;
 use crate::ffi::{
-    GUID, NV_ENC_BUFFER_FORMAT_ARGB, NV_ENC_CONFIG_VER, NV_ENC_CREATE_BITSTREAM_BUFFER,
-    NV_ENC_CREATE_BITSTREAM_BUFFER_VER, NV_ENC_DEVICE_TYPE_DIRECTX, NV_ENC_INITIALIZE_PARAMS,
-    NV_ENC_INPUT_IMAGE, NV_ENC_INPUT_PTR, NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX,
-    NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER, NV_ENC_MAP_INPUT_RESOURCE,
-    NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+    GUID, NV_ENC_CONFIG_VER, NV_ENC_CREATE_BITSTREAM_BUFFER, NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
+    NV_ENC_DEVICE_TYPE_DIRECTX, NV_ENC_INITIALIZE_PARAMS, NV_ENC_INPUT_IMAGE, NV_ENC_INPUT_PTR,
+    NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX, NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER,
+    NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_OUTPUT_PTR, NV_ENC_PIC_PARAMS,
     NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT_FRAME, NV_ENC_PIC_TYPE_IDR, NV_ENC_PRESET_CONFIG,
     NV_ENC_PRESET_CONFIG_VER, NV_ENC_RECONFIGURE_PARAMS, NV_ENC_REGISTER_RESOURCE,
@@ -51,6 +50,8 @@ pub(super) struct PictureInput<'a> {
     pub(super) duration: u64,
     /// `NV_ENC_PIC_FLAGS` for this picture.
     pub(super) flags: u32,
+    /// The `NV_ENC_BUFFER_FORMAT` the input was registered with.
+    pub(super) format: u32,
 }
 
 /// An open NVENC session on a D3D11 device. Destroyed on drop.
@@ -175,15 +176,14 @@ impl Session {
         self.check("nvEncDestroyBitstreamBuffer", status)
     }
 
-    /// `nvEncRegisterResource` for a BGRA D3D11 texture.
-    ///
-    /// `NV_ENC_BUFFER_FORMAT_ARGB` is word-ordered with blue in the low byte,
-    /// so its memory order is B, G, R, A: `DXGI_FORMAT_B8G8R8A8_UNORM`.
+    /// `nvEncRegisterResource` for a D3D11 texture in `format`, an
+    /// `NV_ENC_BUFFER_FORMAT` matching the texture's DXGI format.
     pub(super) fn register(
         &self,
         texture: &ID3D11Texture2D,
         width: u32,
         height: u32,
+        format: u32,
     ) -> Result<Registered, EncodeError> {
         let mut params: NV_ENC_REGISTER_RESOURCE = zeroed();
         params.version = NV_ENC_REGISTER_RESOURCE_VER;
@@ -194,7 +194,7 @@ impl Session {
         params.pitch = 0;
         params.subResourceIndex = 0;
         params.resourceToRegister = texture.as_raw();
-        params.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+        params.bufferFormat = format;
         params.bufferUsage = NV_ENC_INPUT_IMAGE;
         // SAFETY: live session; the texture pointer is live for the call, and
         // the caller keeps a reference until the resource is unregistered.
@@ -257,7 +257,7 @@ impl Session {
         params.inputDuration = picture.duration;
         params.inputBuffer = picture.input.0.as_ptr();
         params.outputBitstream = picture.output.0.as_ptr();
-        params.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
+        params.bufferFmt = picture.format;
         params.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
         // SAFETY: live session; the input is mapped and the output buffer is
         // unlocked; both belong to this session.

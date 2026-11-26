@@ -173,6 +173,9 @@ pub(crate) const NV_ENC_PIC_FLAG_OUTPUT_SPSPPS: u32 = 0x4;
 /// bits." On little-endian memory that is bytes B, G, R, A, which is
 /// `DXGI_FORMAT_B8G8R8A8_UNORM`.
 pub(crate) const NV_ENC_BUFFER_FORMAT_ARGB: u32 = 0x0100_0000;
+/// `NV_ENC_BUFFER_FORMAT_NV12`: "Semi-Planar YUV [Y plane followed by
+/// interleaved UV plane]", which is `DXGI_FORMAT_NV12`.
+pub(crate) const NV_ENC_BUFFER_FORMAT_NV12: u32 = 0x1;
 /// `NV_ENC_LEVEL_AUTOSELECT`.
 pub(crate) const NV_ENC_LEVEL_AUTOSELECT: u32 = 0;
 /// `NV_ENC_BFRAME_REF_MODE_DISABLED`.

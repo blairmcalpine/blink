@@ -1,25 +1,15 @@
 //! Cutting a clip out of the shared ring while the producers keep pushing.
 //!
-//! The buffer is sized and its pages touched before the first lock, so the
-//! locked phases only copy bytes. The lock is held for one chunk at a time
-//! and handed back with a fair unlock, so a capture or audio push waits at
-//! most one chunk (about 100 µs per MB) behind a save.
+//! The cut copies no payload: the clip shares the ring's blocks, so the lock
+//! is held only while the clip's packet list is built (tens of microseconds
+//! for a 30 s clip at 60 fps), and handed back with a fair unlock so a
+//! waiting capture or audio push goes next. The blocks stay alive while the
+//! clip is written even if the ring evicts them meanwhile.
 
 use blink_ring::media::Timestamp;
-use blink_ring::{ClipBuf, ClipError, CopyProgress};
+use blink_ring::{ClipBuf, ClipError};
 
 use crate::shared::SharedRing;
-
-/// Bytes copied out of the ring per lock.
-pub(crate) const CHUNK_BYTES: usize = 1 << 20;
-
-/// Copies restarted after the ring evicted packets the copy still needed.
-const ATTEMPTS: u32 = 3;
-
-/// Headroom over the ring's contents when sizing the clip buffer, for packets
-/// with a PTS before the save time that arrive during the copy.
-const EXTRA_BYTES: usize = 1 << 20;
-const EXTRA_PACKETS: usize = 256;
 
 /// Why no clip could be cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -29,101 +19,24 @@ pub(crate) enum CutError {
     /// recording started.
     #[error("nothing to save yet: no video has been captured yet")]
     NothingYet,
-    /// The ring kept evicting packets the copy still needed.
-    #[error("the clip buffer overwrote the clip faster than it could be copied")]
-    Evicted,
-    /// A stream's format changed mid-copy: the display mode, an encoder
-    /// restart, or the audio device's format.
-    #[error("the video or audio format changed while saving, which starts a new recording")]
-    FormatChanged,
-    /// A settings change replaced the ring mid-copy; its packets are gone.
-    #[error("a settings change replaced the clip buffer while saving")]
-    RingReplaced,
     /// Any other ring error.
-    #[error("failed to copy the clip")]
+    #[error("failed to cut the clip")]
     Ring(#[source] ClipError),
 }
 
-/// Copies the clip that ends at `now` and covers about `duration` into
-/// `clip`, retrying when eviction overtakes the copy.
+/// Cuts the clip that ends at `now` and covers about `duration`.
 pub(crate) fn cut(
     ring: &SharedRing,
-    clip: &mut ClipBuf,
     now: Timestamp,
     duration: Timestamp,
-) -> Result<(), CutError> {
-    cut_with(ring, clip, now, duration, CHUNK_BYTES, &mut || {})
-}
-
-/// [`cut`] with a chunk size, calling `between` each time the lock is
-/// released so tests can push while a copy is in flight.
-fn cut_with(
-    ring: &SharedRing,
-    clip: &mut ClipBuf,
-    now: Timestamp,
-    duration: Timestamp,
-    chunk: usize,
-    between: &mut dyn FnMut(),
-) -> Result<(), CutError> {
-    let mut attempt = 1;
-    loop {
-        match copy(ring, clip, now, duration, chunk, between) {
-            Err(CutError::Evicted) if attempt < ATTEMPTS => {
-                tracing::debug!(attempt, "ring evicted packets mid-copy; starting over");
-                attempt += 1;
-            }
-            result => return result,
-        }
-    }
-}
-
-fn copy(
-    ring: &SharedRing,
-    clip: &mut ClipBuf,
-    now: Timestamp,
-    duration: Timestamp,
-    chunk: usize,
-    between: &mut dyn FnMut(),
-) -> Result<(), CutError> {
-    let (bytes, packets, epoch) = {
-        let slot = ring.lock();
-        (slot.ring.bytes_used(), slot.ring.len(), slot.epoch)
-    };
-    clip.prepare(
-        bytes.saturating_add(EXTRA_BYTES),
-        packets.saturating_add(EXTRA_PACKETS),
-    );
-    let mut cursor = ring.read_fair(|slot| {
-        if slot.epoch != epoch {
-            return Err(CutError::RingReplaced);
-        }
-        slot.ring
-            .begin_clip(now, duration, clip)
-            .map_err(clip_error)
-    })?;
-    loop {
-        between();
-        let progress = ring.read_fair(|slot| {
-            if slot.epoch != epoch {
-                return Err(CutError::RingReplaced);
-            }
-            slot.ring
-                .copy_clip(&mut cursor, clip, chunk)
-                .map_err(clip_error)
+) -> Result<ClipBuf, CutError> {
+    let mut clip = ClipBuf::new();
+    ring.read_fair(|slot| slot.ring.snapshot(now, duration, &mut clip))
+        .map_err(|error| match error {
+            ClipError::NoKeyframe => CutError::NothingYet,
+            error => CutError::Ring(error),
         })?;
-        if progress == CopyProgress::Done {
-            return Ok(());
-        }
-    }
-}
-
-const fn clip_error(error: ClipError) -> CutError {
-    match error {
-        ClipError::NoKeyframe => CutError::NothingYet,
-        ClipError::Evicted => CutError::Evicted,
-        ClipError::FormatChanged => CutError::FormatChanged,
-        error => CutError::Ring(error),
-    }
+    Ok(clip)
 }
 
 #[cfg(test)]
@@ -198,34 +111,22 @@ pub(crate) mod tests {
     /// `now - CLIP_SECS`.
     pub(crate) const NOW_MS: i64 = 20_900;
 
-    /// Fills `ring` up to a save at [`NOW_MS`], plus the 300 ms of packets
-    /// that arrive while the save waits for the encoder to drain, then cuts
-    /// the clip while the source pushes another 50 ms every time the copy
-    /// releases the lock.
-    fn save_during_pushes(ring: &SharedRing) -> (Result<(), CutError>, ClipBuf) {
-        let mut source = Source::new();
-        let mut pushed_until = NOW_MS + 300;
-        source.run_until(ring, pushed_until);
-        let mut clip = ClipBuf::new();
-        let result = cut_with(
+    /// Fills `ring` from `source` up to a save at [`NOW_MS`], plus the
+    /// 300 ms of packets that arrive while the save waits for the encoder to
+    /// drain, then cuts.
+    fn save_after_settle(ring: &SharedRing, source: &mut Source) -> Result<ClipBuf, CutError> {
+        source.run_until(ring, NOW_MS + 300);
+        cut(
             ring,
-            &mut clip,
             Timestamp::from_ticks(NOW_MS * MS),
             Timestamp::from_secs(CLIP_SECS.into()),
-            8 << 10,
-            &mut || {
-                pushed_until += 50;
-                source.run_until(ring, pushed_until);
-            },
-        );
-        (result, clip)
+        )
     }
 
     #[test]
-    fn saving_while_pushes_arrive_gets_the_full_clip() {
+    fn saving_after_the_settle_gets_the_full_clip() {
         let ring = SharedRing::new(RingSize::for_config(&config()));
-        let (result, clip) = save_during_pushes(&ring);
-        assert_eq!(result, Ok(()));
+        let clip = save_after_settle(&ring, &mut Source::new()).unwrap();
         assert!(
             clip.duration() >= Timestamp::from_secs(CLIP_SECS.into()),
             "clip is {:?} long",
@@ -243,8 +144,7 @@ pub(crate) mod tests {
             window: Timestamp::from_secs(CLIP_SECS.into()),
             ..size
         });
-        let (result, clip) = save_during_pushes(&ring);
-        assert_eq!(result, Ok(()));
+        let clip = save_after_settle(&ring, &mut Source::new()).unwrap();
         assert!(
             clip.duration() < Timestamp::from_secs(CLIP_SECS.into()),
             "without slack the keyframe before the clip start is already evicted: {:?}",
@@ -253,94 +153,40 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_replaced_ring_aborts_the_save() {
+    fn a_clip_survives_the_ring_moving_on_and_replacement() {
         let ring = SharedRing::new(RingSize::for_config(&config()));
         let mut source = Source::new();
-        source.run_until(&ring, 10_000);
-        let mut clip = ClipBuf::new();
-        let replacement = RingSize::for_config(&Config {
-            clip_seconds: 30,
-            ..Config::default()
-        });
-        let result = cut_with(
-            &ring,
-            &mut clip,
-            Timestamp::from_ticks(10_000 * MS),
-            Timestamp::from_secs(CLIP_SECS.into()),
-            8 << 10,
-            &mut || ring.replace(replacement),
-        );
-        assert_eq!(result, Err(CutError::RingReplaced));
-    }
-
-    #[test]
-    fn a_format_change_aborts_the_save() {
-        let ring = SharedRing::new(RingSize::for_config(&config()));
-        let mut source = Source::new();
-        source.run_until(&ring, 10_000);
-        let mut clip = ClipBuf::new();
-        let result = cut_with(
-            &ring,
-            &mut clip,
-            Timestamp::from_ticks(10_000 * MS),
-            Timestamp::from_secs(CLIP_SECS.into()),
-            8 << 10,
-            &mut || source.video.set_format(&ring, video_format(1920)),
-        );
-        assert_eq!(result, Err(CutError::FormatChanged));
-    }
-
-    #[test]
-    fn eviction_mid_copy_is_retried() {
-        let ring = SharedRing::new(RingSize::for_config(&config()));
-        let mut source = Source::new();
-        source.run_until(&ring, 20_000);
-        let mut clip = ClipBuf::new();
-        let mut calls = 0;
-        let result = cut_with(
-            &ring,
-            &mut clip,
-            Timestamp::from_ticks(20_000 * MS),
-            Timestamp::from_secs(CLIP_SECS.into()),
-            8 << 10,
-            &mut || {
-                calls += 1;
-                if calls == 1 {
-                    // Far enough ahead to evict the start of the clip.
-                    source.run_until(&ring, 25_000);
-                }
-            },
-        );
-        assert_eq!(result, Ok(()));
-        assert!(calls > 2, "the copy started over");
-        assert!(clip.duration() > Timestamp::ZERO);
-        assert_eq!(clip.end(), Timestamp::from_ticks(20_000 * MS));
+        let clip = save_after_settle(&ring, &mut source).unwrap();
+        let before: Vec<Vec<u8>> = clip.video().map(|(_, data)| data.to_vec()).collect();
+        // Long enough to evict the whole clip, then a settings change.
+        source.run_until(&ring, NOW_MS + 30_000);
+        let mut held = ClipBuf::new();
+        ring.read_fair(|slot| {
+            slot.ring.snapshot(
+                Timestamp::from_ticks((NOW_MS + 30_000) * MS),
+                Timestamp::from_secs(3600),
+                &mut held,
+            )
+        })
+        .unwrap();
+        assert!(held.start() > clip.end(), "the ring evicted the whole clip");
+        ring.replace(RingSize::for_config(&config()));
+        let after: Vec<Vec<u8>> = clip.video().map(|(_, data)| data.to_vec()).collect();
+        assert_eq!(before, after);
+        assert_ne!(before.len(), 0);
     }
 
     #[test]
     fn an_empty_ring_has_nothing_to_save() {
         let ring = SharedRing::new(RingSize::for_config(&config()));
-        let mut clip = ClipBuf::new();
         assert_eq!(
-            cut(
-                &ring,
-                &mut clip,
-                Timestamp::from_ticks(MS),
-                Timestamp::from_secs(5)
-            ),
-            Err(CutError::NothingYet)
+            cut(&ring, Timestamp::from_ticks(MS), Timestamp::from_secs(5)).err(),
+            Some(CutError::NothingYet)
         );
     }
 
     #[test]
     fn errors_explain_themselves() {
-        for error in [
-            CutError::NothingYet,
-            CutError::Evicted,
-            CutError::FormatChanged,
-            CutError::RingReplaced,
-        ] {
-            assert!(error.to_string().len() > 20);
-        }
+        assert!(CutError::NothingYet.to_string().len() > 20);
     }
 }

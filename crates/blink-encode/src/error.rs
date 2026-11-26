@@ -77,8 +77,11 @@ pub enum EncodeError {
         /// Encoder height.
         height: u32,
     },
-    /// The texture is not `DXGI_FORMAT_B8G8R8A8_UNORM`.
-    #[error("texture format {0} is not DXGI_FORMAT_B8G8R8A8_UNORM (87)")]
+    /// The texture is neither `DXGI_FORMAT_NV12` nor
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM`.
+    #[error(
+        "texture format {0} is neither DXGI_FORMAT_NV12 (103) nor DXGI_FORMAT_B8G8R8A8_UNORM (87)"
+    )]
     UnsupportedTextureFormat(i32),
     /// The texture is an array, has mipmaps, or is multisampled; NVENC input
     /// must be a single-sampled 2D subresource.

@@ -49,14 +49,18 @@ pub(crate) const RING_SLACK: Timestamp = Timestamp::from_secs(3);
 pub(crate) struct RingSize {
     /// Media kept: one clip length plus [`RING_SLACK`].
     pub(crate) window: Timestamp,
-    /// Payload arena size, from [`ClipRing::recommended_byte_capacity`].
+    /// Most payload bytes held, from [`ClipRing::recommended_byte_capacity`].
+    /// A limit, not an allocation: the ring allocates as media arrives.
     pub(crate) byte_capacity: usize,
+    /// Most packets held, from [`ClipRing::recommended_packet_capacity`];
+    /// their metadata is allocated up front.
+    pub(crate) packet_capacity: usize,
 }
 
 impl RingSize {
     /// The ring for `config`: a window of `clip_seconds` plus
     /// [`RING_SLACK`], with room for that much video and audio at their
-    /// configured bitrates.
+    /// configured bitrates and frame rate.
     pub(crate) fn for_config(config: &Config) -> Self {
         let window =
             Timestamp::from_secs(i64::from(config.clip_seconds)).saturating_add(RING_SLACK);
@@ -64,12 +68,13 @@ impl RingSize {
         Self {
             window,
             byte_capacity: ClipRing::recommended_byte_capacity(window, kbps * 1000),
+            packet_capacity: ClipRing::recommended_packet_capacity(window, config.fps),
         }
     }
 
     /// Allocates a ring of this size.
     pub(crate) fn build(self) -> ClipRing {
-        ClipRing::with_capacity(self.window, self.byte_capacity)
+        ClipRing::with_limits(self.window, self.byte_capacity, self.packet_capacity)
     }
 }
 
@@ -160,6 +165,10 @@ mod tests {
         );
         // At least the raw clip: 60 s at 20.16 Mbit/s.
         assert!(size.byte_capacity >= 60 * 20_160_000 / 8);
+        assert_eq!(
+            size.packet_capacity,
+            ClipRing::recommended_packet_capacity(Timestamp::from_secs(63), 60)
+        );
         let ring = size.build();
         drop(ring);
     }

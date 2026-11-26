@@ -2,7 +2,7 @@
 //!
 //! `Encoder` loads `nvEncodeAPI64.dll` from the installed NVIDIA driver at
 //! runtime, opens an NVENC session on the D3D11 device that capture uses,
-//! registers each captured BGRA texture once, and encodes it on the GPU into an
+//! registers each captured NV12 (or BGRA) texture once, and encodes it on the GPU into an
 //! Annex B access unit plus [`PacketMeta`](blink_ring::media::PacketMeta) for
 //! the ring. Nothing is read back to the CPU except the compressed bitstream.
 //! `Encoder::video_format` gives the SPS/PPS for

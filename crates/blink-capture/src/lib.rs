@@ -2,7 +2,8 @@
 //!
 //! `create_device` makes the hardware D3D11 device that capture and the
 //! encoder share, and `DesktopDuplicator` turns one output into a stream of
-//! `CaptureEvent`s: BGRA textures on that device, acquired at most once per
+//! `CaptureEvent`s: NV12 textures on that device (BGRA where the video
+//! processor cannot convert), acquired at most once per
 //! slot of the target frame rate and stamped with the slot's `blink_ring`
 //! `Timestamp` on the shared QPC timeline. Frames never leave
 //! the GPU. The duplicator recovers from `DXGI_ERROR_ACCESS_LOST` on display
@@ -29,14 +30,14 @@ mod decision;
     clippy::redundant_pub_crate,
     reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
-mod rotation;
-#[cfg(any(windows, test))]
+mod schedule;
+
+#[cfg(windows)]
 #[expect(
     clippy::redundant_pub_crate,
     reason = "restricted visibility in a root-level module conflicts with the denied unreachable_pub"
 )]
-mod schedule;
-
+mod convert;
 #[cfg(windows)]
 mod device;
 #[cfg(windows)]
