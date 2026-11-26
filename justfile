@@ -53,7 +53,8 @@ test:
 
 # Run blink-ring tests under Miri (nightly).
 miri:
-    cargo +nightly miri test -p blink-ring
+    cargo +nightly miri nextest run -p blink-ring
+    cargo +nightly miri test --doc -p blink-ring
 
 # Licenses, advisories, dependency bans, and sources.
 deny:

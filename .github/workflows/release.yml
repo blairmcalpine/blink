@@ -113,6 +113,7 @@ jobs:
     if: needs.release.outputs.tag != ''
     permissions:
       contents: read
+      pull-requests: read
     uses: ./.github/workflows/package-windows.yml
     with:
       ref: ${{ needs.release.outputs.tag }}
