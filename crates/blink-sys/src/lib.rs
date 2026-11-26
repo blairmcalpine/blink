@@ -4,7 +4,8 @@
 //! that have nothing to do with capture or audio themselves: the shared QPC
 //! clock ([`QpcClock`], `qpc_now`), thread priority
 //! (`set_current_thread_priority`, `BackgroundMode`), a single-instance mutex
-//! (`SingleInstance`), a message pump for the tray thread (`pump_messages`),
+//! (`SingleInstance`), a named event a second copy sets to wake the first
+//! (`NamedEvent`), a message pump for the tray thread (`pump_messages`),
 //! asynchronous playback of short in-memory sounds (`play_wav`), and
 //! starting blink at sign-in (`read_autostart`, `write_autostart`, which own
 //! blink's per-user Run value). They live here once, as safe wrappers, so
@@ -35,6 +36,8 @@ mod clock;
 )]
 mod error;
 mod error_chain;
+#[cfg(windows)]
+mod event;
 mod fs;
 #[cfg(windows)]
 mod instance;
@@ -60,6 +63,8 @@ pub use clock::QpcClock;
 pub use clock::{qpc_counter, qpc_now};
 pub use error::SysError;
 pub use error_chain::ErrorChain;
+#[cfg(windows)]
+pub use event::NamedEvent;
 pub use fs::{rename_no_replace, rename_replacing};
 #[cfg(windows)]
 pub use instance::SingleInstance;
