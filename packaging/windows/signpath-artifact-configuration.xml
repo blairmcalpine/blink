@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for the blink-msi workflow artifact. SignPath
+  stores its own copy: paste this into the project's default artifact
+  configuration whenever it changes. See docs/CODE_SIGNING.md.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <msi-file path="blink-*-x86_64.msi">
+      <pe-file path="**/blink.exe">
+        <authenticode-sign/>
+      </pe-file>
+      <authenticode-sign/>
+    </msi-file>
+  </zip-file>
+</artifact-configuration>

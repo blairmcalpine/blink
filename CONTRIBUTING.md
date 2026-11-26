@@ -186,8 +186,27 @@ workspace version, and the release covers them all.
    PR if the generated wording needs work.
 2. Merging the release PR tags the merge commit `v{version}` and creates a
    draft GitHub release whose notes are the new changelog entry.
-3. The same workflow builds the MSI from the tag on `windows-latest`, attaches
-   it and its `.sha256` file to the release, and publishes the release.
+3. The same workflow builds the MSI from the tag on `windows-latest`, signs
+   it, attaches it and its `.sha256` file to the release, and publishes the
+   release. Signing waits up to an hour for a maintainer to approve the
+   signing request in SignPath.
+
+### Code signing
+
+Releases are signed through the SignPath Foundation
+([policy](docs/CODE_SIGNING.md)). The publish job signs only when the
+`SIGNPATH_PROJECT_SLUG` repository variable is set; without it, releases ship
+unsigned. Setup, once SignPath approves the project:
+
+1. In SignPath, link the project to the GitHub.com trusted build system and
+   paste `packaging/windows/signpath-artifact-configuration.xml` into its
+   default artifact configuration. Keep the two in sync.
+2. Create an API token for a user with submitter rights on the release signing
+   policy, and store it as the `SIGNPATH_API_TOKEN` repository secret.
+3. Set the `SIGNPATH_ORGANIZATION_ID`, `SIGNPATH_PROJECT_SLUG`, and
+   `SIGNPATH_SIGNING_POLICY_SLUG` repository variables.
+
+Signing changes the MSI's bytes, so the `.sha256` file is written after it.
 
 If packaging fails, the release stays a draft. If the cause was transient,
 use **Re-run failed jobs**; re-running all jobs does nothing, because the tag

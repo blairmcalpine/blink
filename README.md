@@ -70,7 +70,8 @@ A quiet install never launches blink.
 
 The installer is not code-signed yet, so Microsoft Defender SmartScreen may
 warn that it is from an unknown publisher. Select **More info**, then
-**Run anyway**.
+**Run anyway**. Signing through the SignPath Foundation is pending; see the
+[code signing policy](docs/CODE_SIGNING.md).
 
 Installing a newer release upgrades blink in place and keeps your choices: the
 Start menu shortcut if you had it, and starting at sign-in as blink's
@@ -117,6 +118,8 @@ and the toolchain bump procedure.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): design decisions, crate layout,
   unsafe policy, and the performance rules every change must respect.
 - [docs/BENCHMARKING.md](docs/BENCHMARKING.md): how to measure in-game impact.
+- [docs/CODE_SIGNING.md](docs/CODE_SIGNING.md): code signing policy, team
+  roles, and privacy policy.
 
 ## Third-party
 
