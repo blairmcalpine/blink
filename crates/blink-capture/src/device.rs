@@ -98,17 +98,17 @@ pub fn create_device() -> Result<CaptureDevice, CaptureError> {
     let (adapter, primary_output) = find_primary_output()?;
     let adapter_info = describe(&adapter)?;
     let (device, context) = if cfg!(debug_assertions) {
-        match create_on(&adapter, FLAGS | D3D11_CREATE_DEVICE_DEBUG) {
+        match create_with(&adapter, FLAGS | D3D11_CREATE_DEVICE_DEBUG) {
             Err(CaptureError::Windows { source, .. })
                 if source.code() == DXGI_ERROR_SDK_COMPONENT_MISSING =>
             {
                 tracing::debug!("D3D11 debug layer not installed; creating a plain device");
-                create_on(&adapter, FLAGS)?
+                create_with(&adapter, FLAGS)?
             }
             result => result?,
         }
     } else {
-        create_on(&adapter, FLAGS)?
+        create_with(&adapter, FLAGS)?
     };
     let multithread: ID3D11Multithread = context
         .cast()
@@ -135,6 +135,32 @@ pub fn create_device() -> Result<CaptureDevice, CaptureError> {
         primary_output,
         adapter: adapter_info,
     })
+}
+
+/// [`create_on`], retrying without video support where the driver rejects
+/// it; capture then copies frames as BGRA instead of converting to NV12.
+fn create_with(
+    adapter: &IDXGIAdapter1,
+    flags: D3D11_CREATE_DEVICE_FLAG,
+) -> Result<(ID3D11Device, ID3D11DeviceContext), CaptureError> {
+    match create_on(adapter, flags) {
+        Err(CaptureError::Windows { source, .. })
+            if source.code() != DXGI_ERROR_SDK_COMPONENT_MISSING =>
+        {
+            let plain = create_on(
+                adapter,
+                D3D11_CREATE_DEVICE_FLAG(flags.0 & !D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0),
+            );
+            if plain.is_ok() {
+                tracing::warn!(
+                    error = %source,
+                    "D3D11 video support unavailable; frames will be copied as BGRA"
+                );
+            }
+            plain
+        }
+        result => result,
+    }
 }
 
 fn create_on(

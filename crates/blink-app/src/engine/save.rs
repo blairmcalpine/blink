@@ -1,6 +1,6 @@
 //! Saving clips: cut out of the ring, then written as MP4s.
 //!
-//! Two threads ([`crate::pipeline`]): the cutter copies each clip at below
+//! Two threads ([`crate::pipeline`]): the cutter cuts each clip at below
 //! normal priority as soon as its settle delay has passed, so a game's
 //! threads preempt it but it is not starved while it holds the ring lock (see
 //! [`crate::cut`]). The writer, the only thread that touches the disk, runs

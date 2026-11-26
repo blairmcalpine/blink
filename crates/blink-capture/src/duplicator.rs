@@ -53,11 +53,12 @@ const LONG_OUTAGE: Duration = Duration::from_secs(3);
 /// How often the frame counters are logged.
 const STATS_PERIOD: Duration = Duration::from_secs(60);
 
-/// A desktop image copied into one of the duplicator's pooled textures.
+/// A desktop image written into the duplicator's capture texture.
 ///
 /// Cloning is cheap: it adds a COM reference to the same texture. Holding a
-/// clone keeps the texture alive across pool recreation, but does not stop the
-/// duplicator from overwriting it; see [`TEXTURE_POOL_SIZE`] for the reuse rule.
+/// clone keeps the texture alive after a resize replaces it, but does not
+/// stop the duplicator from overwriting it; see [`TEXTURE_POOL_SIZE`] for the
+/// reuse rule.
 #[derive(Debug, Clone)]
 pub struct CapturedFrame {
     texture: ID3D11Texture2D,
@@ -105,9 +106,9 @@ impl CapturedFrame {
 
     /// Frame counter, starting at 0 and increasing by one per emitted frame
     /// of this duplicator. A consumer can debug-assert the
-    /// [`TEXTURE_POOL_SIZE`] reuse rule with it: every frame still in use when
-    /// `next_frame` is called must have
-    /// `sequence + TEXTURE_POOL_SIZE > newest`.
+    /// [`TEXTURE_POOL_SIZE`] reuse rule with it: when `next_frame` is about
+    /// to produce frame `next`, every frame still in use must have
+    /// `sequence + TEXTURE_POOL_SIZE > next`.
     #[must_use]
     pub const fn sequence(&self) -> u64 {
         self.sequence
@@ -483,8 +484,8 @@ impl DesktopDuplicator {
         }
     }
 
-    /// Copies the desktop image into the next pool texture, stamped with
-    /// `timestamp`.
+    /// Writes the desktop image into the capture texture, converting it to
+    /// NV12 where possible, stamped with `timestamp`.
     fn copy_frame(
         &mut self,
         resource: &IDXGIResource,
@@ -720,15 +721,21 @@ impl DesktopDuplicator {
         let resized = current.is_none();
         let fresh = match current {
             Some(current) => current,
-            None => TexturePool::new(
-                &self.device,
-                &self.context,
-                width,
-                height,
-                self.write_as == WriteAs::Nv12,
-            )?,
+            None => self.new_pool(width, height)?,
         };
         Ok((self.pool.insert(fresh), resized))
+    }
+
+    /// A pool for `width` x `height`, NV12 unless conversion has failed or
+    /// the size is odd.
+    fn new_pool(&mut self, width: u32, height: u32) -> Result<TexturePool, CaptureError> {
+        let nv12 = self.write_as == WriteAs::Nv12 && is_even(width, height);
+        let pool = TexturePool::new(&self.device, &self.context, width, height, nv12)?;
+        if nv12 && pool.converter.is_none() {
+            // Setting up conversion failed; it would fail again.
+            self.write_as = WriteAs::Bgra;
+        }
+        Ok(pool)
     }
 }
 
@@ -767,12 +774,18 @@ fn log_session(output: &IDXGIOutput1, desc: &DXGI_OUTDUPL_DESC) {
     }
 }
 
+/// Whether NV12 can represent a `width` x `height` image (its chroma is
+/// subsampled in both directions).
+const fn is_even(width: u32, height: u32) -> bool {
+    width.is_multiple_of(2) && height.is_multiple_of(2)
+}
+
 /// How frames are written into the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteAs {
     /// Converted to NV12 where the size and the video processor allow.
     Nv12,
-    /// Copied as BGRA, after a conversion failed.
+    /// Copied as BGRA, after conversion failed to set up or to run.
     Bgra,
 }
 
@@ -836,8 +849,8 @@ struct TexturePool {
 }
 
 impl TexturePool {
-    /// An NV12 pool if `nv12` allows, the size is even, and the video
-    /// processor can convert; a BGRA pool otherwise.
+    /// An NV12 pool if `nv12` asks for one (the size must be even) and the
+    /// video processor can convert; a BGRA pool otherwise.
     fn new(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -845,7 +858,7 @@ impl TexturePool {
         height: u32,
         nv12: bool,
     ) -> Result<Self, CaptureError> {
-        let nv12_pool = if nv12 && width.is_multiple_of(2) && height.is_multiple_of(2) {
+        let nv12_pool = if nv12 {
             let attempt =
                 create_texture(device, width, height, DXGI_FORMAT_NV12).and_then(|texture| {
                     Nv12Converter::new(device, context, &texture, width, height)

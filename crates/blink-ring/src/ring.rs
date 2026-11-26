@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::warn;
 
-use self::blocks::Blocks;
+use self::blocks::{Blocks, StoreError};
 pub use self::clip::ClipBuf;
 use crate::media::{AudioFormat, PacketMeta, StreamKind, Timestamp, VideoFormat};
 
@@ -43,6 +43,13 @@ pub enum PushError {
         len: usize,
         /// Byte capacity of the ring.
         capacity: usize,
+    },
+    /// No memory could be allocated for the payload even after evicting
+    /// everything else.
+    #[error("out of memory storing a packet of {len} bytes")]
+    OutOfMemory {
+        /// Payload length in bytes.
+        len: usize,
     },
     /// A video packet arrived before [`ClipRing::set_video_format`].
     #[error("video packet pushed before a video format was set")]
@@ -93,11 +100,13 @@ struct Keyframe {
 
 /// Ring buffer of the last N seconds of encoded audio and video.
 ///
-/// Payloads live in 1 MiB blocks that are allocated as media arrives and
-/// freed as it is evicted, so the ring's memory follows what it holds (a few
-/// megabytes on a static desktop) rather than its byte capacity, which is
-/// only a limit. One freed block is kept for reuse, so a steady stream stops
-/// allocating once the window is full. Packet metadata lives in
+/// Payloads live in blocks (4 MiB for rings of 64 MiB and up) that are
+/// allocated as media arrives and freed as it is evicted, so the ring's
+/// memory follows what it holds (a few megabytes on a static desktop) rather
+/// than its byte capacity, which is only a limit. About a second of freed
+/// blocks is kept for reuse, so a steady stream stops allocating once the
+/// window is full. If an allocation fails, older media is evicted to make
+/// room instead. Packet metadata lives in
 /// fixed-capacity deques allocated in the constructor. When the time window,
 /// the byte capacity, or the packet capacity is exceeded, the ring evicts
 /// whole video GOPs from the front, together with the audio stored before
@@ -212,7 +221,7 @@ impl ClipRing {
             .min(max_allocation(size_of::<Entry>()))
             .max(1);
         Self {
-            store: Blocks::new(byte_capacity),
+            store: Blocks::new(byte_capacity, byte_capacity / kept_secs(window).max(1)),
             entries: VecDeque::with_capacity(packet_capacity),
             keyframes: VecDeque::with_capacity(packet_capacity),
             packet_capacity,
@@ -275,13 +284,15 @@ impl ClipRing {
 
     /// Stores one encoded packet, evicting old GOPs as needed. Allocates
     /// only to open a block when no freed one is spare, which a steady
-    /// stream stops doing once the window is full.
+    /// stream stops doing once the window is full. When an allocation fails,
+    /// GOPs are evicted until one succeeds.
     ///
     /// # Errors
     ///
     /// Returns [`PushError`] if the payload is empty or larger than the whole
-    /// ring, or if no format has been set for the packet's stream. The ring is
-    /// unchanged in that case.
+    /// ring, or if no format has been set for the packet's stream; the ring
+    /// is unchanged then. [`PushError::OutOfMemory`] if no block could be
+    /// allocated even with the ring emptied.
     pub fn push(&mut self, meta: PacketMeta, payload: &[u8]) -> Result<PushOutcome, PushError> {
         self.check_push(meta.kind, payload)?;
         if self.is_orphan(meta) {
@@ -291,13 +302,30 @@ impl ClipRing {
         if self.is_orphan(meta) {
             return Ok(PushOutcome::DroppedAwaitingKeyframe);
         }
-        let (block, offset) =
-            self.store
-                .push(payload)
-                .ok_or_else(|| PushError::PayloadTooLarge {
-                    len: payload.len(),
-                    capacity: self.store.limit(),
-                })?;
+        let (block, offset) = loop {
+            match self.store.push(payload) {
+                Ok(at) => break at,
+                Err(StoreError::Full) => {
+                    return Err(PushError::PayloadTooLarge {
+                        len: payload.len(),
+                        capacity: self.store.limit(),
+                    });
+                }
+                Err(StoreError::OutOfMemory) => {
+                    warn!(
+                        len = payload.len(),
+                        bytes = self.store.used(),
+                        "out of memory for a clip ring block; evicting to make room"
+                    );
+                    if !self.evict_step() {
+                        return Err(PushError::OutOfMemory { len: payload.len() });
+                    }
+                    if self.is_orphan(meta) {
+                        return Ok(PushOutcome::DroppedAwaitingKeyframe);
+                    }
+                }
+            }
+        };
         self.record(meta, block, offset, payload.len());
         self.enforce_window();
         Ok(PushOutcome::Stored)
@@ -316,9 +344,9 @@ impl ClipRing {
     ///
     /// No payload is copied: `clip` shares the blocks the packets live in,
     /// so this only builds the packet list, in time linear in the packets
-    /// stored. The newest block, once shared, is not written again; the next
-    /// push opens a fresh one. Drop `clip` once it is written, so the
-    /// blocks it shares can be freed or reused.
+    /// stored. While the clip holds the newest block it is not written
+    /// again; the next push opens a fresh one. Drop `clip` once it is
+    /// written, so the blocks it shares can be freed or reused.
     ///
     /// # Errors
     ///
@@ -363,26 +391,29 @@ impl ClipRing {
                 .skip(skip)
                 .filter(|entry| selection.includes(entry))
         };
-        let (video, audio) =
-            included().fold((0, 0), |(video, audio), entry| match entry.meta.kind {
-                StreamKind::Video => (video + 1, audio),
-                StreamKind::Audio => (video, audio + 1),
-            });
-        clip.reserve(video, audio);
+        let mut counts = Counts::default();
+        for entry in included() {
+            counts.add(entry);
+        }
+        clip.reserve(counts.video, counts.audio, counts.blocks());
         let mut shared = None;
         for entry in included() {
-            if shared != Some(entry.block) {
-                let Some(block) = self.store.block(entry.block) else {
+            if shared.map(|(id, _)| id) != Some(entry.block) {
+                let block = self.store.block(entry.block);
+                debug_assert!(block.is_some(), "a stored packet's block is live");
+                let Some(block) = block else {
                     continue;
                 };
-                clip.share(Arc::clone(block));
-                shared = Some(entry.block);
+                shared = Some((entry.block, clip.share(Arc::clone(block))));
             }
-            clip.push_shared(
-                entry.meta.kind,
-                entry.meta,
-                entry.offset..entry.offset.saturating_add(entry.len),
-            );
+            if let Some((_, index)) = shared {
+                clip.push_shared(
+                    entry.meta.kind,
+                    entry.meta,
+                    index,
+                    entry.offset..entry.offset.saturating_add(entry.len),
+                );
+            }
         }
         Ok(())
     }
@@ -406,10 +437,18 @@ impl ClipRing {
     }
 
     /// Bytes of payload blocks the ring holds now, used or not: its
-    /// payload memory, apart from at most three spare blocks.
+    /// payload memory, apart from [`bytes_spare`](Self::bytes_spare).
     #[must_use]
     pub const fn bytes_reserved(&self) -> usize {
         self.store.reserved()
+    }
+
+    /// Bytes of freed blocks kept for reuse, at most about a second of media
+    /// at the rate the byte capacity was sized for. Not counted against the
+    /// byte capacity.
+    #[must_use]
+    pub fn bytes_spare(&self) -> usize {
+        self.store.spare()
     }
 
     /// Most bytes of payload blocks the ring may hold.
@@ -616,6 +655,33 @@ impl ClipRing {
         self.store.clear();
         self.video_synced = false;
         self.long_gop_warned = false;
+    }
+}
+
+/// How many packets, and across how many blocks, a clip is about to take.
+#[derive(Default)]
+struct Counts {
+    video: usize,
+    audio: usize,
+    first_block: Option<u64>,
+    last_block: u64,
+}
+
+impl Counts {
+    fn add(&mut self, entry: &Entry) {
+        match entry.meta.kind {
+            StreamKind::Video => self.video += 1,
+            StreamKind::Audio => self.audio += 1,
+        }
+        self.first_block.get_or_insert(entry.block);
+        self.last_block = entry.block;
+    }
+
+    fn blocks(&self) -> usize {
+        self.first_block.map_or(0, |first| {
+            let span = self.last_block.saturating_sub(first).saturating_add(1);
+            usize::try_from(span).unwrap_or(0)
+        })
     }
 }
 

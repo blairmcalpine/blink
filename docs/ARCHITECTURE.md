@@ -296,12 +296,12 @@ code elegance, and convenience. Every one of them is a review criterion.
    before the next frame is written. Going asynchronous needs a texture per
    frame in flight.
 
-   Converting before NVENC rather than letting NVENC take BGRA saves the
-   intermediate copy and NVENC's own RGB conversion, which runs on CUDA cores
-   (rule 2). At 2560x1440 and 60 fps the old path moved about 14.7 MB x 2
-   (copy) + 14.7 + 5.5 (NVENC's conversion) = 50 MB per frame, 3 GB/s; the
-   video processor reads 14.7 MB and writes 5.5 MB, 1.2 GB/s. The texture
-   NVENC holds is 5.5 MB instead of three 14.7 MB pool textures.
+   Converting before NVENC, rather than handing it BGRA, avoids a separate
+   copy and NVENC's own RGB conversion, which runs on CUDA cores (rule 2). At
+   2560x1440 the video processor reads 14.7 MB and writes 5.5 MB per frame,
+   1.2 GB/s at 60 fps, and the texture NVENC holds is 5.5 MB. On NVIDIA the
+   conversion most likely runs on the 3D engine, sharing it with the game,
+   so the bandwidth matters less than leaving the CUDA cores alone.
 
    Where the video processor cannot convert (an unsupported driver, a failed
    conversion, or an odd size, which NV12 cannot represent), capture falls
@@ -312,7 +312,9 @@ code elegance, and convenience. Every one of them is a review criterion.
    with SMPTE bars.
 2. **No CUDA-core NVENC features.** Use a fast preset (P1 to P3), no lookahead,
    single pass, and no adaptive-quality modes that run on the CUDA cores. Use CBR
-   or VBR at a sensible bitrate.
+   or VBR at a sensible bitrate. The BGRA fallback of rule 1 is the one
+   exception: there NVENC's RGB conversion runs on CUDA cores, because nothing
+   else can convert.
 3. **Capture at the clip FPS, not the refresh rate.** Acquisition is paced to
    the clip frame rate: the capture thread sleeps until the next slot and
    acquires once, and DXGI folds the updates in between into that one frame.
@@ -481,16 +483,25 @@ revisiting.
 
 ## Ring memory
 
-The ring stores payloads in 1 MiB blocks (smaller for a small ring) that are
-allocated as media arrives and freed as the oldest GOPs are evicted, so its
-memory follows the media it holds: a few megabytes for a static desktop (one
-keyframe a second), the full window's worth only during sustained motion. The
-configured byte capacity is a limit, not an allocation. Blocks are 1 MiB
-because the Windows heap hands allocations above 1016 KiB straight to
-`VirtualAlloc`, so a freed block goes back to the OS instead of staying in
-the process's heap. Up to three evicted blocks are kept for reuse, which is
-enough for a steady stream to stop allocating. The packet index is sized from
-the frame rate: (fps + 64) entries per second kept.
+The ring stores payloads in 4 MiB blocks (a sixteenth of the byte capacity
+for rings under 64 MiB) that are allocated as media arrives and freed as the
+oldest GOPs are evicted, so its memory follows the media it holds: a few
+blocks for a static desktop, the full window's worth only during sustained
+motion. The configured byte capacity is a limit, not an allocation. Blocks
+are well above the 1016 KiB at which the Windows heap hands allocations
+straight to `VirtualAlloc`, so a freed block goes back to the OS instead of
+staying in the process's heap.
+
+About a second of evicted blocks (the byte capacity divided by the seconds
+kept, plus one block) is kept for reuse, so a steady stream stops allocating
+once the window is full; that much stays allocated after motion stops. A
+payload is never split across blocks, so one that does not fit the rest of
+the newest block leaves that rest unused: about `size² / 8 MiB` per payload,
+around 1% of a 20 Mbit/s stream with 600 KB keyframes and 8% with 1.5 MB
+ones, plus the partly used oldest and newest blocks. The 25% headroom in the
+recommended byte capacity absorbs it. If a block cannot be allocated, the
+ring evicts its oldest media and retries rather than aborting. The packet
+index is sized from the frame rate: (fps + 64) entries per second kept.
 
 ## Saving a clip
 
@@ -502,8 +513,9 @@ lock it records which packets the clip holds and takes a reference to the
 blocks they live in. Capture never writes into a block a clip shares (the next
 push opens a fresh block), and an evicted block a clip still references stays
 alive until the clip is written and dropped. A save therefore costs the media
-evicted while it is written, about a second's worth, not a second copy of the
-clip. Saving runs on two threads, so cutting never waits on the disk. The
+evicted while the clip waits and is written, not a second copy of the clip;
+since those blocks are not counted against the byte capacity, the worst case
+is the capacity plus the two clips a save can have outstanding. Saving runs on two threads, so cutting never waits on the disk. The
 writer writes the MP4 in Windows background mode (lowest CPU and I/O
 priority), never holding the lock, to a hidden `.partial` file that is renamed
 when complete; leftovers from a crash are deleted at startup. A second press

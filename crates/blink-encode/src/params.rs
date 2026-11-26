@@ -244,7 +244,7 @@ mod tests {
         fill_initialize(&mut init, &settings()).unwrap();
         assert_eq!(init.version, NV_ENC_INITIALIZE_PARAMS_VER);
         assert_eq!(init.encodeGUID, NV_ENC_CODEC_H264_GUID);
-        assert_eq!(init.presetGUID, NV_ENC_PRESET_P1_GUID);
+        assert_eq!(init.presetGUID, NV_ENC_PRESET_P2_GUID);
         assert_eq!(init.enableEncodeAsync, 0);
         assert_eq!(init.enablePTD, 1);
         assert_eq!(init.tuningInfo, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY);

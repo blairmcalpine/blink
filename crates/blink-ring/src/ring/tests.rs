@@ -504,7 +504,10 @@ fn model_range(
     &list[from..to]
 }
 
-fn owned(clip_packets: impl Iterator<Item = (PacketMeta, Vec<u8>)>) -> Vec<(PacketMeta, Vec<u8>)> {
+/// Packets with their payloads copied out.
+type Owned = Vec<(PacketMeta, Vec<u8>)>;
+
+fn owned(clip_packets: impl Iterator<Item = (PacketMeta, Vec<u8>)>) -> Owned {
     clip_packets.collect()
 }
 
@@ -512,7 +515,9 @@ fn owned(clip_packets: impl Iterator<Item = (PacketMeta, Vec<u8>)>) -> Vec<(Pack
 ///
 /// Audio runs `skew_ms` ahead of video in push order. With `roomy` limits only
 /// the time window evicts, so clips must hold exactly the model's packets and
-/// the window invariant must hold; under pressure clip audio may lose a prefix.
+/// the window invariant must hold; under pressure clip audio may lose a prefix,
+/// and each clip is held across the next steps (sealing the blocks it shares)
+/// and must not change.
 fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy: bool) {
     let iterations = if cfg!(miri) { 250 } else { 12_000 };
     // Copying each clip out for comparison dominates under Miri, so it checks
@@ -533,6 +538,7 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
         video: Vec::new(),
         audio: Vec::new(),
     };
+    let mut held: Option<(ClipBuf, Owned)> = None;
     for step in 0..iterations {
         let roll = next();
         let len = usize::try_from(roll % 40 + 1).expect("small");
@@ -577,6 +583,13 @@ fn randomized(byte_capacity: usize, packet_capacity: usize, skew_ms: i64, roomy:
                 .is_some_and(|(meta, _)| meta.keyframe && meta.pts == start)
         );
         assert_eq!(video, model_range(&model.video, start, end));
+        if !roomy {
+            if let Some((clip, video)) = &held {
+                let now = owned(clip.video().map(|(meta, data)| (meta, data.to_vec())));
+                assert_eq!(&now, video, "a held clip never changes");
+            }
+            held = Some((clip.clone(), video));
+        }
 
         let mut audio = owned(clip.audio().map(|(meta, data)| (meta, data.to_vec())));
         if audio.first().is_some_and(|(meta, _)| meta.pts < start) {
@@ -678,23 +691,99 @@ fn recommends_packet_capacity_from_fps() {
 
 #[test]
 fn memory_follows_the_media_held() {
-    // A 1 MiB-block ring with room for far more than this test stores.
+    // A 4 MiB-block ring with room for far more than this test stores.
     let mut ring = ring(1000, 64 << 20);
     assert_eq!(ring.bytes_reserved(), 0, "nothing is allocated up front");
-    // A burst: 2 s of 100 KB frames.
-    push_gops(&mut ring, 0, 4, 5, 100_000);
+    // A burst: 2 s of 1 MB frames.
+    push_gops(&mut ring, 0, 4, 5, 1_000_000);
     let busy = ring.bytes_reserved();
-    assert!(busy >= ring.bytes_used());
+    assert!(busy >= 8 << 20);
     // Then a quiet screen: one tiny IDR a second.
     for second in 2..10 {
         push(&mut ring, video(second * 1000, true), &[1; 100]);
     }
     assert!(ring.bytes_used() < 1000);
     assert!(
-        ring.bytes_reserved() <= 1 << 20,
-        "the burst's blocks were freed: {} of {busy}",
+        ring.bytes_reserved() <= 4 << 20,
+        "the burst's blocks were released: {} of {busy}",
         ring.bytes_reserved()
     );
+    // Spares: a second's share of the 5 s kept (64 MiB / 5), plus a block.
+    assert!(ring.bytes_spare() <= (64 << 20) / 5 + (4 << 20));
+}
+
+/// Pushes `secs` seconds of 60 fps video at `video_bps`, with a
+/// `keyframe_bytes` IDR each second, and 48 kHz AAC at 160 kbit/s,
+/// starting at `from_secs`.
+fn push_realistic(
+    ring: &mut ClipRing,
+    from_secs: i64,
+    secs: i64,
+    video_bps: usize,
+    keyframe_bytes: usize,
+) {
+    let per_second = video_bps / 8;
+    let delta = (per_second.saturating_sub(keyframe_bytes) / 59).max(1);
+    let keyframe = vec![0x65; keyframe_bytes];
+    let frame = vec![0x41; delta];
+    let aac = [0x21; 417];
+    for second in from_secs..from_secs + secs {
+        for slot in 0..60 {
+            let pts = second * 1000 + slot * 1000 / 60;
+            let payload = if slot == 0 { &keyframe } else { &frame };
+            push(ring, video(pts, slot == 0), payload);
+        }
+        for packet in 0..47 {
+            push(ring, audio(second * 1000 + packet * 1000 / 47), &aac);
+        }
+    }
+}
+
+/// The recommended ring for a 30 s clip (33 s window) at `video_bps`.
+fn realistic_ring(video_bps: u64) -> ClipRing {
+    let window = Timestamp::from_secs(33);
+    let mut ring = ClipRing::with_limits(
+        window,
+        ClipRing::recommended_byte_capacity(window, video_bps + 160_000),
+        ClipRing::recommended_packet_capacity(window, 60),
+    );
+    ring.set_video_format(video_format(64));
+    ring.set_audio_format(audio_format(48_000));
+    ring
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "pushes gigabytes; too slow under Miri")]
+fn realistic_streams_hold_the_window_and_stop_allocating() {
+    // About `keyframe² / 2` per keyframe is lost at the end of a 4 MiB block
+    // (payloads are never split), as a share of a second's media.
+    for (video_bps, keyframe_bytes, lost_percent) in [
+        (20_000_000, 600_000, 3),
+        (20_000_000, 1_500_000, 10),
+        (50_000_000, 1_500_000, 6),
+    ] {
+        let mut ring = realistic_ring(u64::try_from(video_bps).expect("small"));
+        push_realistic(&mut ring, 0, 60, video_bps, keyframe_bytes);
+        let warm = ring.store.allocations;
+        push_realistic(&mut ring, 60, 20, video_bps, keyframe_bytes);
+        assert_eq!(
+            ring.store.allocations, warm,
+            "{video_bps} bit/s with {keyframe_bytes} B keyframes allocated when warm"
+        );
+        let oldest = ring.keyframes.front().map(|keyframe| keyframe.pts);
+        assert!(
+            oldest.is_some_and(|pts| pts <= Timestamp::from_secs(80 - 33)),
+            "{video_bps} bit/s kept less than the window: from {oldest:?}"
+        );
+        // The partly released oldest block and the partly filled newest one,
+        // plus what was lost at block ends.
+        let waste = ring.bytes_reserved() - ring.bytes_used();
+        assert!(
+            waste < (8 << 20) + ring.bytes_used() * lost_percent / 100,
+            "{video_bps} bit/s wastes {waste} of {} bytes",
+            ring.bytes_reserved()
+        );
+    }
 }
 
 #[test]

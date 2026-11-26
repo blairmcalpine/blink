@@ -63,10 +63,12 @@ impl ClipBuf {
         self.data_len = 0;
     }
 
-    /// Makes room for `video` and `audio` more packets.
-    pub(super) fn reserve(&mut self, video: usize, audio: usize) {
+    /// Makes room for `video` and `audio` more packets in `blocks` more
+    /// blocks.
+    pub(super) fn reserve(&mut self, video: usize, audio: usize, blocks: usize) {
         self.video.reserve(video);
         self.audio.reserve(audio);
+        self.blocks.reserve(blocks);
     }
 
     /// Appends a video access unit (Annex B, as pushed into the ring),
@@ -81,24 +83,33 @@ impl ClipBuf {
     }
 
     fn push_owned(&mut self, kind: StreamKind, meta: PacketMeta, payload: &[u8]) {
-        self.share(Arc::new(payload.to_vec()));
-        self.push_shared(kind, meta, 0..payload.len());
+        let block = self.share(Arc::new(payload.to_vec()));
+        self.push_shared(kind, meta, block, 0..payload.len());
     }
 
-    /// Adds a block that the following [`push_shared`](Self::push_shared)
-    /// packets live in.
-    pub(super) fn share(&mut self, block: Block) {
+    /// Adds a block packets can live in and returns its index for
+    /// [`push_shared`](Self::push_shared).
+    pub(super) fn share(&mut self, block: Block) -> usize {
         self.blocks.push(block);
+        self.blocks.len() - 1
     }
 
-    /// Appends a packet whose payload is `range` of the last shared block.
-    pub(super) fn push_shared(&mut self, kind: StreamKind, meta: PacketMeta, range: Range<usize>) {
+    /// Appends a packet whose payload is `range` of shared block `block`.
+    pub(super) fn push_shared(
+        &mut self,
+        kind: StreamKind,
+        meta: PacketMeta,
+        block: usize,
+        range: Range<usize>,
+    ) {
+        debug_assert!(
+            self.blocks
+                .get(block)
+                .is_some_and(|shared| shared.get(range.clone()).is_some()),
+            "a packet lies inside its block"
+        );
         self.data_len = self.data_len.saturating_add(range.len());
-        let packet = Packet {
-            meta,
-            block: self.blocks.len().saturating_sub(1),
-            range,
-        };
+        let packet = Packet { meta, block, range };
         match kind {
             StreamKind::Video => self.video.push(packet),
             StreamKind::Audio => self.audio.push(packet),

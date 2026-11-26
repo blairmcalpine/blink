@@ -36,10 +36,15 @@ pub(crate) struct Nv12Converter {
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
     output: ID3D11VideoProcessorOutputView,
-    /// The view of the last desktop surface. DXGI hands back the same
-    /// surface for every frame of a session, so the view is made once per
-    /// session; the surface is held so its address cannot be reused.
-    input: Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
+    /// Views of the last desktop surfaces, newest first. DXGI hands back the
+    /// same surface for every frame of a session in practice (not by
+    /// contract, so two are cached in case a driver alternates), so views
+    /// are made about once per session. Each surface is held so its address
+    /// cannot be reused; holding it across `ReleaseFrame` only keeps the
+    /// object alive and never touches its contents outside an acquired
+    /// frame. The references must be gone before the next `DuplicateOutput`,
+    /// see [`forget_input`](Self::forget_input).
+    inputs: [Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>; 2],
 }
 
 impl Nv12Converter {
@@ -139,7 +144,7 @@ impl Nv12Converter {
             enumerator,
             processor,
             output,
-            input: None,
+            inputs: [None, None],
         })
     }
 
@@ -170,53 +175,63 @@ impl Nv12Converter {
     /// duplication session is created, which needs every reference to the
     /// old session's surfaces gone.
     pub(crate) fn forget_input(&mut self) {
-        self.input = None;
+        self.inputs = [None, None];
     }
 
     fn input_view(
         &mut self,
         source: &ID3D11Texture2D,
     ) -> Result<&ID3D11VideoProcessorInputView, CaptureError> {
-        let cached = self
-            .input
-            .as_ref()
-            .is_some_and(|(surface, _)| surface.as_raw() == source.as_raw());
-        if !cached {
-            self.input = None;
-            let desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
-                FourCC: 0,
-                ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
-                Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
-                    Texture2D: D3D11_TEX2D_VPIV {
-                        MipSlice: 0,
-                        ArraySlice: 0,
-                    },
-                },
-            };
-            let mut view = None;
-            // SAFETY: `source` is a live BGRA texture on this device,
-            // `enumerator` is live, and `desc` and `view` are valid for the
-            // call.
-            unsafe {
-                self.video_device.CreateVideoProcessorInputView(
-                    source,
-                    &self.enumerator,
-                    &raw const desc,
-                    Some(&raw mut view),
-                )
+        let is_source = |slot: &Option<(ID3D11Texture2D, _)>| {
+            slot.as_ref()
+                .is_some_and(|(surface, _)| surface.as_raw() == source.as_raw())
+        };
+        if !is_source(&self.inputs[0]) {
+            if is_source(&self.inputs[1]) {
+                self.inputs.swap(0, 1);
+            } else {
+                let view = self.create_input_view(source)?;
+                self.inputs.swap(0, 1);
+                self.inputs[0] = Some((source.clone(), view));
             }
-            .context("create the desktop input view")?;
-            let view = view.ok_or(CaptureError::NullOutput {
-                call: "CreateVideoProcessorInputView",
-                what: "view",
-            })?;
-            tracing::debug!("created a video processor view of the desktop surface");
-            self.input = Some((source.clone(), view));
         }
-        self.input
+        self.inputs[0]
             .as_ref()
             .map(|(_, view)| view)
             .ok_or(CaptureError::Invariant("the desktop input view is missing"))
+    }
+
+    fn create_input_view(
+        &self,
+        source: &ID3D11Texture2D,
+    ) -> Result<ID3D11VideoProcessorInputView, CaptureError> {
+        let desc = D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+            FourCC: 0,
+            ViewDimension: D3D11_VPIV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+                Texture2D: D3D11_TEX2D_VPIV {
+                    MipSlice: 0,
+                    ArraySlice: 0,
+                },
+            },
+        };
+        let mut view = None;
+        // SAFETY: `source` is a live BGRA texture on this device,
+        // `enumerator` is live, and `desc` and `view` are valid for the call.
+        unsafe {
+            self.video_device.CreateVideoProcessorInputView(
+                source,
+                &self.enumerator,
+                &raw const desc,
+                Some(&raw mut view),
+            )
+        }
+        .context("create the desktop input view")?;
+        tracing::debug!("created a video processor view of the desktop surface");
+        view.ok_or(CaptureError::NullOutput {
+            call: "CreateVideoProcessorInputView",
+            what: "view",
+        })
     }
 }
 

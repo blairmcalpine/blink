@@ -1,16 +1,17 @@
-//! The save pipeline: a cutter thread that copies each clip out of the ring
-//! as soon as its settle delay has passed, and a writer thread that writes
-//! the finished buffers.
+//! The save pipeline: a cutter thread that cuts each clip from the ring as
+//! soon as its settle delay has passed, and a writer thread that writes the
+//! cut clips.
 //!
 //! Splitting the stages keeps cutting from ever waiting on the disk. The ring
 //! keeps only a few seconds beyond the clip length, so a save queued behind a
 //! slow write would otherwise lose the start of its clip to eviction.
 //!
 //! Memory: a [`ClipBuf`] copies no payload; it shares the ring's blocks, and
-//! is dropped as soon as it is written. A save therefore costs only the
-//! blocks the ring evicts while the clip is being written (about a second
-//! of media), not a second copy of the clip, and nothing is kept between
-//! saves.
+//! is dropped as soon as it is written. A save therefore costs the blocks
+//! the ring evicts while the clip waits and is written, not a second copy of
+//! the clip, and nothing is kept between saves. Those blocks are not counted
+//! against the ring's byte capacity, so the bound is the capacity plus the
+//! clips outstanding (at most two, see `MAX_OUTSTANDING`).
 
 use std::io;
 use std::sync::Arc;

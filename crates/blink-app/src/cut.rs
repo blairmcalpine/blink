@@ -111,10 +111,10 @@ pub(crate) mod tests {
     /// `now - CLIP_SECS`.
     pub(crate) const NOW_MS: i64 = 20_900;
 
-    /// Fills `ring` up to a save at [`NOW_MS`], plus the 300 ms of packets
-    /// that arrive while the save waits for the encoder to drain, then cuts.
-    fn save_after_settle(ring: &SharedRing) -> Result<ClipBuf, CutError> {
-        let mut source = Source::new();
+    /// Fills `ring` from `source` up to a save at [`NOW_MS`], plus the
+    /// 300 ms of packets that arrive while the save waits for the encoder to
+    /// drain, then cuts.
+    fn save_after_settle(ring: &SharedRing, source: &mut Source) -> Result<ClipBuf, CutError> {
         source.run_until(ring, NOW_MS + 300);
         cut(
             ring,
@@ -126,7 +126,7 @@ pub(crate) mod tests {
     #[test]
     fn saving_after_the_settle_gets_the_full_clip() {
         let ring = SharedRing::new(RingSize::for_config(&config()));
-        let clip = save_after_settle(&ring).unwrap();
+        let clip = save_after_settle(&ring, &mut Source::new()).unwrap();
         assert!(
             clip.duration() >= Timestamp::from_secs(CLIP_SECS.into()),
             "clip is {:?} long",
@@ -144,7 +144,7 @@ pub(crate) mod tests {
             window: Timestamp::from_secs(CLIP_SECS.into()),
             ..size
         });
-        let clip = save_after_settle(&ring).unwrap();
+        let clip = save_after_settle(&ring, &mut Source::new()).unwrap();
         assert!(
             clip.duration() < Timestamp::from_secs(CLIP_SECS.into()),
             "without slack the keyframe before the clip start is already evicted: {:?}",
@@ -156,10 +156,20 @@ pub(crate) mod tests {
     fn a_clip_survives_the_ring_moving_on_and_replacement() {
         let ring = SharedRing::new(RingSize::for_config(&config()));
         let mut source = Source::new();
-        let clip = save_after_settle(&ring).unwrap();
+        let clip = save_after_settle(&ring, &mut source).unwrap();
         let before: Vec<Vec<u8>> = clip.video().map(|(_, data)| data.to_vec()).collect();
         // Long enough to evict the whole clip, then a settings change.
         source.run_until(&ring, NOW_MS + 30_000);
+        let mut held = ClipBuf::new();
+        ring.read_fair(|slot| {
+            slot.ring.snapshot(
+                Timestamp::from_ticks((NOW_MS + 30_000) * MS),
+                Timestamp::from_secs(3600),
+                &mut held,
+            )
+        })
+        .unwrap();
+        assert!(held.start() > clip.end(), "the ring evicted the whole clip");
         ring.replace(RingSize::for_config(&config()));
         let after: Vec<Vec<u8>> = clip.video().map(|(_, data)| data.to_vec()).collect();
         assert_eq!(before, after);

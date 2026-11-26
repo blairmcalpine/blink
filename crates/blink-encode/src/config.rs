@@ -10,12 +10,11 @@ use blink_ring::media::Timestamp;
 /// waits for each frame.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Preset {
-    /// The default: the fastest preset, so each frame holds the NVENC block
-    /// (and the waiting capture thread) for the least time. The quality
-    /// lost to P2 is small at blink's bitrates.
-    #[default]
+    /// Fastest, lowest quality.
     P1,
-    /// A little better quality than P1 at more encoder time.
+    /// The default: leaves headroom for 1440p at high frame rates and 4K60 on
+    /// older NVENC generations while staying close to P3 in quality.
+    #[default]
     P2,
     /// Slightly better quality than P2 at a little more encoder time.
     P3,
@@ -114,7 +113,7 @@ impl EncoderConfig {
             fps,
             bitrate_kbps,
             stretch_to: None,
-            preset: Preset::P1,
+            preset: Preset::P2,
         }
     }
 
@@ -264,7 +263,7 @@ mod tests {
     fn new_uses_the_initial_size_as_maximum() {
         let config = EncoderConfig::new(1280, 720, 30, 8000);
         assert_eq!((config.max_width, config.max_height), (1280, 720));
-        assert_eq!(config.preset, Preset::P1);
+        assert_eq!(config.preset, Preset::P2);
         assert_eq!(config.stretch_to, None);
         assert_eq!(config.validate(), Ok(()));
     }

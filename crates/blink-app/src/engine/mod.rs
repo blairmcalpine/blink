@@ -9,14 +9,14 @@
 //!   NVENC into the ring. Never waits on I/O or on a save.
 //! - **Audio thread** (below normal, owned by `blink-audio`): WASAPI loopback,
 //!   mixed with the microphone when enabled, into AAC into the ring.
-//! - **Save threads** ([`save`]): a cutter copies each clip out of the ring
-//!   in chunks at below-normal priority as soon as it can, and a writer
-//!   writes the MP4s in background mode.
+//! - **Save threads** ([`save`]): a cutter cuts each clip from the ring (no
+//!   copy) at below-normal priority as soon as it can, and a writer writes
+//!   the MP4s in background mode.
 //! - A short-lived thread per settings window waits for the child process,
 //!   and one per warning dialog, so the tray thread keeps pumping messages.
 //!
 //! The ring is the only state the threads share, behind one mutex held for
-//! one packet or one chunk at a time. Workers report back to the tray thread
+//! one packet or one clip's packet list at a time. Workers report back to the tray thread
 //! over a channel, and it shows their state in the tray tooltip.
 
 mod audio;
