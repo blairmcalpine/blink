@@ -209,7 +209,8 @@ the .NET SDK, and WiX Toolset 5 (the commands are in
 ```
 
 The MSI lands in `dist/`. `.github/workflows/package-windows.yml` runs the same
-scripts for pull requests that touch packaging inputs, and on demand from the
+scripts for pull requests that touch packaging inputs (`blink-app`, manifests,
+the lockfile, `packaging/`), on every push to main, and on demand from the
 Actions tab, and uploads the MSI as an artifact. Only that workflow builds and
 ICE-validates `blink.wxs`, so check its run after any installer change.
 

@@ -18,8 +18,58 @@ env:
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
   CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
+  # Decides which jobs a pull request needs. Pushes to main and manual runs
+  # take every job, which also keeps main's caches warm for pull requests.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
+      miri: ${{ github.event_name != 'pull_request' || steps.filter.outputs.miri == 'true' }}
+      deps: ${{ github.event_name != 'pull_request' || steps.filter.outputs.deps == 'true' }}
+      notices: ${{ github.event_name != 'pull_request' || steps.filter.outputs.notices == 'true' }}
+    steps:
+      - name: Filter changed paths
+        if: github.event_name == 'pull_request'
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            rust:
+              - ".cargo/**"
+              - ".github/workflows/ci.yml"
+              - "Cargo.lock"
+              - "Cargo.toml"
+              - "clippy.toml"
+              - "crates/**"
+              - "rust-toolchain.toml"
+            miri:
+              - ".github/workflows/ci.yml"
+              - "Cargo.lock"
+              - "Cargo.toml"
+              - "crates/blink-ring/**"
+            deps:
+              - ".github/workflows/ci.yml"
+              - "**/Cargo.toml"
+              - "Cargo.lock"
+              - "deny.toml"
+            notices:
+              - ".github/workflows/ci.yml"
+              - "**/Cargo.toml"
+              - "Cargo.lock"
+              - "THIRD-PARTY-NOTICES.txt"
+              - "about.hbs"
+              - "about.toml"
+              - "justfile"
+              - "rust-toolchain.toml"
+
   format:
     name: format
     runs-on: ubuntu-latest
@@ -49,6 +99,8 @@ jobs:
 
   clippy:
     name: clippy
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -64,12 +116,15 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features --locked
 
   test:
     name: test
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -90,6 +145,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo nextest
         run: cargo nextest run --workspace --all-features --locked --no-tests=pass
@@ -99,6 +155,8 @@ jobs:
 
   doc:
     name: doc
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -114,12 +172,15 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: doc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo doc
         run: cargo doc --workspace --no-deps --all-features --locked
 
   miri:
     name: miri
+    needs: changes
+    if: needs.changes.outputs.miri == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -131,16 +192,22 @@ jobs:
       - name: Install nightly with miri
         run: rustup toolchain install nightly --component miri,rust-src
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2.90.7
         with:
-          key: miri
+          tool: cargo-nextest
 
-      - name: cargo miri test
-        run: cargo +nightly miri test -p blink-ring
+      # Interpreting the tests dominates; nextest runs them in parallel.
+      - name: cargo miri nextest
+        run: cargo +nightly miri nextest run -p blink-ring
+
+      - name: cargo miri test --doc
+        run: cargo +nightly miri test --doc -p blink-ring
 
   msrv:
     name: msrv
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -171,6 +238,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: msrv-${{ steps.msrv.outputs.msrv }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check on MSRV
         shell: bash
@@ -178,6 +246,8 @@ jobs:
 
   deny:
     name: deny
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -194,6 +264,8 @@ jobs:
 
   machete:
     name: machete
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -212,6 +284,8 @@ jobs:
 
   notices:
     name: notices
+    needs: changes
+    if: needs.changes.outputs.notices == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -236,6 +310,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     needs:
+      - changes
       - format
       - clippy
       - test
@@ -245,9 +320,10 @@ jobs:
       - deny
       - machete
       - notices
+    # A job skipped by the `changes` filter counts as passing.
     steps:
       - name: Fail if any required job did not succeed
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
         run: |
           echo "One or more required jobs did not succeed."
           echo '${{ toJSON(needs) }}'

@@ -2,17 +2,8 @@ name: Package (Windows)
 
 on:
   pull_request:
-    paths:
-      - ".cargo/**"
-      - ".github/workflows/package-windows.yml"
-      - ".github/workflows/release.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "LICENSE-*"
-      - "THIRD-PARTY-NOTICES.txt"
-      - "crates/**"
-      - "packaging/**"
-      - "rust-toolchain.toml"
+  push:
+    branches: [main]
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -34,8 +25,42 @@ env:
   WIX_VERSION: "5.0.2"
 
 jobs:
+  # `msi` is a required check, so pull requests skip the job rather than the
+  # workflow: a skipped job passes, a workflow that never starts stays pending.
+  # Code outside blink-app reaches the release build only through CI's Windows
+  # jobs until it merges; main and every release PR build the MSI.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      package: ${{ github.event_name != 'pull_request' || steps.filter.outputs.package == 'true' }}
+    steps:
+      - name: Filter changed paths
+        if: github.event_name == 'pull_request'
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            package:
+              - ".cargo/**"
+              - ".github/workflows/package-windows.yml"
+              - ".github/workflows/release.yml"
+              - "**/Cargo.toml"
+              - "Cargo.lock"
+              - "LICENSE-*"
+              - "THIRD-PARTY-NOTICES.txt"
+              - "crates/blink-app/**"
+              - "packaging/**"
+              - "rust-toolchain.toml"
+
   msi:
     name: msi
+    needs: changes
+    if: needs.changes.outputs.package == 'true'
     runs-on: windows-latest
     timeout-minutes: 40
     defaults:
@@ -51,12 +76,13 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
 
-      # Release builds start from a clean target directory.
+      # Release builds (called with a ref) start from a clean target directory.
       - name: Cache cargo
-        if: github.event_name == 'pull_request'
+        if: inputs.ref == ''
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: package-windows
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install WiX Toolset
         run: |
