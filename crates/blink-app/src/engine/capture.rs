@@ -257,8 +257,8 @@ struct State<'a> {
     /// The display mode is too large to encode; frames are skipped.
     paused: bool,
     /// The newest captured frame, re-encoded as an IDR on a static screen.
-    /// The duplicator overwrites its texture only after three newer frames,
-    /// and this is replaced by each new frame, so it is always intact.
+    /// The duplicator overwrites its texture only with a newer frame, which
+    /// replaces this, so it is always intact.
     last_frame: Option<CapturedFrame>,
     /// Timestamp of the last encoded frame; encode timestamps must increase.
     last_pts: Option<Timestamp>,

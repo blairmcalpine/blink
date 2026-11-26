@@ -76,11 +76,11 @@ pub(crate) fn apply_config(
     h264.chromaFormatIDC = 1;
     h264.useBFramesAsRef = NV_ENC_BFRAME_REF_MODE_DISABLED;
 
-    // Desktop content converted by NVENC to limited-range YUV 4:2:0, labelled
-    // BT.709 so players do not guess BT.601. Needs hardware verification that
-    // NVENC's ARGB conversion really uses BT.709 coefficients (encode SMPTE
-    // colour bars, decode, compare). If it uses BT.601, label the matrix
-    // BT470BG (5) instead: a correct label matters more than the standard.
+    // Desktop content as limited-range BT.709 YUV 4:2:0, labelled so players
+    // do not guess BT.601. Capture's NV12 conversion produces exactly that.
+    // The BGRA fallback relies on NVENC's ARGB conversion, which needs
+    // hardware verification that it uses BT.709 coefficients too (encode
+    // SMPTE colour bars, decode, compare).
     let vui = &mut h264.h264VUIParameters;
     vui.videoSignalTypePresentFlag = 1;
     vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;

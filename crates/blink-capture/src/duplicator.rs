@@ -11,8 +11,8 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_MODE_ROTATION_IDENTITY,
+    DXGI_MODE_ROTATION_UNSPECIFIED, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_DESC, DXGI_OUTDUPL_FRAME_INFO,
@@ -20,24 +20,23 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
+use crate::convert::Nv12Converter;
 use crate::decision::{
     Acquire, Acquired, EMPTY_SESSION_WAIT, Outcome, Pacing, Staleness, next_empty_wait,
 };
 use crate::error::{CaptureError, Context, is_session_lost};
-use crate::rotation::RoundRobin;
 
-/// Number of textures the duplicator copies frames into, round robin.
+/// Number of textures the duplicator writes frames into.
 ///
-/// The texture of a [`CapturedFrame`] is overwritten by the copy that produces
-/// the `TEXTURE_POOL_SIZE`-th [`CaptureEvent::Frame`] after it (the frame
-/// whose [`sequence`](CapturedFrame::sequence) is `TEXTURE_POOL_SIZE` higher).
-/// So when calling [`DesktopDuplicator::next_frame`], at most
-/// `TEXTURE_POOL_SIZE - 1` earlier frames may still be in use (for example
-/// mapped as NVENC input); every older frame must be finished, which for NVENC
-/// means its encode has completed and the input resource is unmapped. Cloning
-/// a `CapturedFrame` keeps the texture alive but does not protect its
-/// contents.
-pub const TEXTURE_POOL_SIZE: usize = 3;
+/// One: every frame is written into the same texture, so the texture of a
+/// [`CapturedFrame`] is overwritten by the next [`CaptureEvent::Frame`]. When
+/// calling [`DesktopDuplicator::next_frame`], no earlier frame may still be
+/// in use; for NVENC that means its encode has completed and the input
+/// resource is unmapped, which a synchronous encoder guarantees. Cloning a
+/// `CapturedFrame` keeps the texture alive but does not protect its contents.
+/// Until the next frame the texture holds the latest desktop image, so it can
+/// be encoded again (as a static screen's keyframe, say).
+pub const TEXTURE_POOL_SIZE: usize = 1;
 
 /// Delay before the first retry after a failed recreation.
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -69,12 +68,15 @@ pub struct CapturedFrame {
 }
 
 impl CapturedFrame {
-    /// The `DXGI_FORMAT_B8G8R8A8_UNORM` texture holding the frame, on the
-    /// duplicator's device, created with `D3D11_USAGE_DEFAULT` and
-    /// `D3D11_BIND_RENDER_TARGET`.
+    /// The texture holding the frame, on the duplicator's device, created
+    /// with `D3D11_USAGE_DEFAULT` and `D3D11_BIND_RENDER_TARGET`. It is
+    /// `DXGI_FORMAT_NV12` (BT.709, studio range, left-sited chroma) when the
+    /// GPU's video processor can convert the desktop, and a
+    /// `DXGI_FORMAT_B8G8R8A8_UNORM` copy otherwise (or for odd sizes, which
+    /// NV12 cannot represent).
     ///
-    /// The copy into it is queued on the device's immediate context. Work that
-    /// reads it through that context is ordered after the copy.
+    /// The conversion or copy into it is queued on the device's immediate
+    /// context. Work that reads it through that context is ordered after it.
     #[must_use]
     pub const fn texture(&self) -> &ID3D11Texture2D {
         &self.texture
@@ -105,7 +107,7 @@ impl CapturedFrame {
     /// of this duplicator. A consumer can debug-assert the
     /// [`TEXTURE_POOL_SIZE`] reuse rule with it: every frame still in use when
     /// `next_frame` is called must have
-    /// `sequence > newest - TEXTURE_POOL_SIZE + 1`.
+    /// `sequence + TEXTURE_POOL_SIZE > newest`.
     #[must_use]
     pub const fn sequence(&self) -> u64 {
         self.sequence
@@ -158,15 +160,19 @@ pub enum CaptureEvent {
 /// bursting. After a timeout or a new session the current slot is not
 /// stamped, since the encoder may have refreshed a keyframe in it.
 ///
-/// Each emitted frame is copied with one GPU `CopyResource` into a small pool
-/// of textures this duplicator owns, and the duplication frame is released
-/// straight after. The copy is what lets the encoder work asynchronously: the
-/// duplicated surface is a single OS-owned texture that DXGI reuses for every
-/// frame, so it cannot stay mapped as encoder input across an asynchronous
-/// encode or the next acquire. Its bind flags are not guaranteed, and it
-/// changes identity with every session, which would churn NVENC
-/// registrations. Pool textures have known flags and a stable identity until
-/// the size changes. The steady state performs no heap allocation.
+/// Each emitted frame is converted to NV12 by the GPU's video processor, in
+/// one pass from the duplicated surface into a texture this duplicator owns,
+/// and the duplication frame is released straight after. That one pass is
+/// all the GPU does per frame before encoding: NVENC reads NV12 natively, so
+/// it skips its own RGB conversion, and reads 1.5 bytes per pixel instead of
+/// 4. Encoding from the duplicated surface itself is not an option: it is an
+/// OS-owned texture that DXGI reuses for every frame, its bind flags are not
+/// guaranteed, and it changes identity with every session, which would churn
+/// NVENC registrations. The owned texture has known flags and a stable
+/// identity until the size changes. Where the video processor cannot convert
+/// (or the size is odd), the frame is copied as BGRA with one
+/// `CopyResource` instead and NVENC converts it. The steady state performs no
+/// heap allocation.
 ///
 /// Only frames with new desktop content are copied; a pointer-only update's
 /// surface is not guaranteed to hold the desktop (on a new session it is
@@ -203,6 +209,8 @@ pub struct DesktopDuplicator {
     output_index: u32,
     duplication: Option<IDXGIOutputDuplication>,
     pool: Option<TexturePool>,
+    /// How frames are written; NV12 until a conversion fails.
+    write_as: WriteAs,
     clock: QpcClock,
     pacing: Pacing,
     backoff: Backoff,
@@ -261,6 +269,7 @@ impl DesktopDuplicator {
             output_index,
             duplication: None,
             pool: None,
+            write_as: WriteAs::Nv12,
             clock,
             pacing: Pacing::new(target_fps, clock.frequency()),
             backoff: Backoff::new(INITIAL_RETRY_DELAY, MAX_RETRY_DELAY),
@@ -488,19 +497,26 @@ impl DesktopDuplicator {
         if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
             return Err(CaptureError::UnsupportedFormat(desc.Format));
         }
-        let (pool, resized) = pool_for(&mut self.pool, &self.device, desc.Width, desc.Height)?;
-        pool.filled = true;
-        let Some(texture) = pool.textures.next().cloned() else {
-            return Err(CaptureError::Invariant("the capture texture pool is empty"));
+        let (_, mut resized) = self.pool_for(desc.Width, desc.Height)?;
+        if let Err(error) = self.write(&source) {
+            if matches!(error, CaptureError::DeviceLost { .. }) {
+                return Err(error);
+            }
+            tracing::warn!(
+                error = %ErrorChain(&error),
+                "NV12 conversion failed; copying frames as BGRA from now on"
+            );
+            self.write_as = WriteAs::Bgra;
+            self.pool = None;
+            resized = true;
+            self.pool_for(desc.Width, desc.Height)?;
+            self.write(&source)?;
+        }
+        let Some(pool) = self.pool.as_mut() else {
+            return Err(CaptureError::Invariant("the capture texture is missing"));
         };
-        // SAFETY: both textures belong to `self.device` and share size and
-        // format (checked above) and sample count; the duplicator never maps
-        // either. Whether the destination is still mapped as encoder input
-        // depends on the caller honoring the `TEXTURE_POOL_SIZE` reuse rule.
-        // Mip and array counts are not checked; a mismatch would make the copy
-        // a no-op, not undefined behavior. The source stays alive until the
-        // frame is released, after this call is queued.
-        unsafe { self.context.CopyResource(&texture, &source) };
+        pool.filled = true;
+        let texture = pool.texture.clone();
         let sequence = self.next_sequence;
         self.next_sequence = sequence.saturating_add(1);
         self.empty_wait = EMPTY_SESSION_WAIT;
@@ -640,9 +656,12 @@ impl DesktopDuplicator {
     /// Creates a fresh duplication session, resizing the pool if the output
     /// size changed. Returns [`CaptureEvent::ModeChanged`] in that case.
     fn recreate(&mut self) -> Result<Option<CaptureEvent>, CaptureError> {
-        // Release the old session first: an output allows one duplication per
-        // process.
+        // Release the old session first, along with the converter's view of
+        // its surface: an output allows one duplication per process.
         self.duplication = None;
+        if let Some(converter) = self.pool.as_mut().and_then(|pool| pool.converter.as_mut()) {
+            converter.forget_input();
+        }
         let dxgi_device: IDXGIDevice = self.device.cast().context("query IDXGIDevice")?;
         // SAFETY: `dxgi_device` is live; the call returns a new reference to
         // the adapter the device was created on.
@@ -672,11 +691,44 @@ impl DesktopDuplicator {
         self.pacing.new_session(qpc_counter()?);
         self.retry_at = None;
         self.session_started = Instant::now();
-        let (_, resized) = pool_for(&mut self.pool, &self.device, width, height)?;
+        let (_, resized) = self.pool_for(width, height)?;
         if first || resized {
             log_session(&output, &desc);
         }
         Ok(resized.then_some(CaptureEvent::ModeChanged { width, height }))
+    }
+
+    /// Queues writing the desktop image `source` into the pool texture.
+    fn write(&mut self, source: &ID3D11Texture2D) -> Result<(), CaptureError> {
+        match self.pool.as_mut() {
+            Some(pool) => pool.write(&self.context, source),
+            None => Err(CaptureError::Invariant("the capture texture is missing")),
+        }
+    }
+
+    /// Returns the pool for `width` x `height`, recreating it if the size
+    /// differs, and whether it was recreated.
+    fn pool_for(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<(&mut TexturePool, bool), CaptureError> {
+        let current = self
+            .pool
+            .take()
+            .filter(|pool| pool.width == width && pool.height == height);
+        let resized = current.is_none();
+        let fresh = match current {
+            Some(current) => current,
+            None => TexturePool::new(
+                &self.device,
+                &self.context,
+                width,
+                height,
+                self.write_as == WriteAs::Nv12,
+            )?,
+        };
+        Ok((self.pool.insert(fresh), resized))
     }
 }
 
@@ -713,6 +765,15 @@ fn log_session(output: &IDXGIOutput1, desc: &DXGI_OUTDUPL_DESC) {
             "rotated output is captured unrotated"
         );
     }
+}
+
+/// How frames are written into the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAs {
+    /// Converted to NV12 where the size and the video processor allow.
+    Nv12,
+    /// Copied as BGRA, after a conversion failed.
+    Bgra,
 }
 
 /// Why a session is being recreated, for diagnostics.
@@ -762,74 +823,118 @@ impl Drop for ReleaseGuard<'_> {
     }
 }
 
+/// The texture frames are written into, and how.
 #[derive(Debug)]
 struct TexturePool {
-    textures: RoundRobin<ID3D11Texture2D, TEXTURE_POOL_SIZE>,
+    texture: ID3D11Texture2D,
+    /// Converts into `texture` (NV12); `None` copies into it (BGRA).
+    converter: Option<Nv12Converter>,
     width: u32,
     height: u32,
-    /// A frame has been copied into the pool.
+    /// A frame has been written into the pool.
     filled: bool,
 }
 
 impl TexturePool {
-    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self, CaptureError> {
-        let desc = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0.cast_unsigned(),
-            CPUAccessFlags: 0,
-            MiscFlags: 0,
+    /// An NV12 pool if `nv12` allows, the size is even, and the video
+    /// processor can convert; a BGRA pool otherwise.
+    fn new(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        width: u32,
+        height: u32,
+        nv12: bool,
+    ) -> Result<Self, CaptureError> {
+        let nv12_pool = if nv12 && width.is_multiple_of(2) && height.is_multiple_of(2) {
+            let attempt =
+                create_texture(device, width, height, DXGI_FORMAT_NV12).and_then(|texture| {
+                    Nv12Converter::new(device, context, &texture, width, height)
+                        .map(|converter| (texture, converter))
+                });
+            match attempt {
+                Ok(pool) => Some(pool),
+                Err(error @ CaptureError::DeviceLost { .. }) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %ErrorChain(&error),
+                        "NV12 conversion unavailable; copying frames as BGRA"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
-        let textures = RoundRobin::new([
-            create_texture(device, &desc)?,
-            create_texture(device, &desc)?,
-            create_texture(device, &desc)?,
-        ]);
-        tracing::debug!(width, height, "created capture texture pool");
+        let (texture, converter) = match nv12_pool {
+            Some((texture, converter)) => (texture, Some(converter)),
+            None => (
+                create_texture(device, width, height, DXGI_FORMAT_B8G8R8A8_UNORM)?,
+                None,
+            ),
+        };
+        tracing::debug!(
+            width,
+            height,
+            nv12 = converter.is_some(),
+            "created the capture texture"
+        );
         Ok(Self {
-            textures,
+            texture,
+            converter,
             width,
             height,
             filled: false,
         })
     }
+
+    /// Queues writing `source`, a BGRA texture of the pool's size, into the
+    /// pool texture.
+    fn write(
+        &mut self,
+        context: &ID3D11DeviceContext,
+        source: &ID3D11Texture2D,
+    ) -> Result<(), CaptureError> {
+        if let Some(converter) = &mut self.converter {
+            return converter.convert(source);
+        }
+        // SAFETY: both textures belong to the same device and share size and
+        // format (BGRA pools only) and sample count; the duplicator never
+        // maps either. Whether the destination is still mapped as encoder
+        // input depends on the caller honoring the `TEXTURE_POOL_SIZE` reuse
+        // rule. Mip and array counts are not checked; a mismatch would make
+        // the copy a no-op, not undefined behavior. The source stays alive
+        // until the frame is released, after this call is queued.
+        unsafe { context.CopyResource(&self.texture, source) };
+        Ok(())
+    }
 }
 
-/// Returns the pool for `width` x `height`, recreating it if the size differs,
-/// and whether it was recreated.
-fn pool_for<'a>(
-    pool: &'a mut Option<TexturePool>,
+/// A single-mip render-target texture frames can be written into.
+fn create_texture(
     device: &ID3D11Device,
     width: u32,
     height: u32,
-) -> Result<(&'a mut TexturePool, bool), CaptureError> {
-    let current = pool
-        .take()
-        .filter(|pool| pool.width == width && pool.height == height);
-    let resized = current.is_none();
-    let fresh = match current {
-        Some(current) => current,
-        None => TexturePool::new(device, width, height)?,
-    };
-    Ok((pool.insert(fresh), resized))
-}
-
-fn create_texture(
-    device: &ID3D11Device,
-    desc: &D3D11_TEXTURE2D_DESC,
+    format: DXGI_FORMAT,
 ) -> Result<ID3D11Texture2D, CaptureError> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: format,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_RENDER_TARGET.0.cast_unsigned(),
+        CPUAccessFlags: 0,
+        MiscFlags: 0,
+    };
     let mut texture = None;
     // SAFETY: `desc` describes a valid single-mip, non-multisampled 2D texture,
     // no initial data is supplied, and `texture` is a valid out-pointer.
-    unsafe { device.CreateTexture2D(desc, None, Some(&raw mut texture)) }
+    unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut texture)) }
         .context("create a capture texture")?;
     texture.ok_or(CaptureError::NullOutput {
         call: "CreateTexture2D",

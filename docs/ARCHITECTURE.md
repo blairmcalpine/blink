@@ -32,8 +32,8 @@ flowchart LR
 
 Two properties define the design:
 
-1. Frames never leave the GPU. The duplicated D3D11 texture is handed to NVENC
-   directly, and NVENC returns encoded packets.
+1. Frames never leave the GPU. The duplicated D3D11 texture is converted to
+   NV12 on the GPU and handed to NVENC, and NVENC returns encoded packets.
 2. Only encoded packets are buffered. The ring holds compressed H.264 and AAC,
    not raw frames, so a multi-minute buffer costs megabytes rather than
    gigabytes.
@@ -279,41 +279,52 @@ need work.
 The primary goal is minimal in-game FPS loss. These rules outrank feature work,
 code elegance, and convenience. Every one of them is a review criterion.
 
-1. **GPU-only, one copy.** Each admitted frame costs exactly one GPU
-   `CopyResource` from the duplicated surface into a small pool of textures
-   that blink owns (`blink-capture`, `TEXTURE_POOL_SIZE` = 3). NVENC registers
-   those pool textures (`NvEncRegisterResource`) and is fed BGRA, so NVENC
-   performs the color conversion. No CPU readback, no scaling, and no
-   color-conversion shader of our own.
+1. **GPU-only, one pass.** Each admitted frame costs exactly one GPU pass
+   before encoding: the D3D11 video processor (`VideoProcessorBlt`) converts
+   the duplicated BGRA surface into a single NV12 texture that blink owns
+   (`blink-capture`, `TEXTURE_POOL_SIZE` = 1), as BT.709 studio range with
+   driver auto-processing off. NVENC registers that texture
+   (`NvEncRegisterResource`) as NV12 and encodes it as is. No CPU readback, no
+   scaling, and no shader of our own.
 
-   The copy is deliberate. The duplicated surface is a single OS-owned texture
-   that DXGI reuses for every frame, so it cannot stay mapped as encoder input
-   across an asynchronous encode or the next `AcquireNextFrame`. Its bind flags
+   The owned texture is deliberate. The duplicated surface is a single
+   OS-owned texture that DXGI reuses for every frame, so it cannot stay
+   mapped as encoder input past the next `AcquireNextFrame`. Its bind flags
    are not guaranteed, and it changes identity with every duplication session,
-   which would churn NVENC registrations on each mode change. Holding the
-   frame is not the problem: Microsoft recommends releasing it just before the
-   next acquire.
+   which would churn NVENC registrations on each mode change. One texture is
+   enough because encoding is synchronous: the encode of a frame has finished
+   before the next frame is written. Going asynchronous needs a texture per
+   frame in flight.
 
-   Cost: a copy reads and writes the frame once, so at 2560x1440 BGRA and
-   60 fps that is about 14.7 MB x 2 x 60 = 1.8 GB/s of video memory
-   bandwidth, a fraction of a percent of a current discrete GPU's. **Needs
-   hardware verification**: measure the copy's GPU time (timestamp queries or
-   the GPU 3D-engine delta in a capture-on versus capture-off benchmark run)
-   at 1440p and 4K, and record it with the other benchmark results.
+   Converting before NVENC rather than letting NVENC take BGRA saves the
+   intermediate copy and NVENC's own RGB conversion, which runs on CUDA cores
+   (rule 2). At 2560x1440 and 60 fps the old path moved about 14.7 MB x 2
+   (copy) + 14.7 + 5.5 (NVENC's conversion) = 50 MB per frame, 3 GB/s; the
+   video processor reads 14.7 MB and writes 5.5 MB, 1.2 GB/s. The texture
+   NVENC holds is 5.5 MB instead of three 14.7 MB pool textures.
+
+   Where the video processor cannot convert (an unsupported driver, a failed
+   conversion, or an odd size, which NV12 cannot represent), capture falls
+   back to one `CopyResource` into a BGRA texture and NVENC converts.
+   **Needs hardware verification**: measure the conversion's GPU time (the
+   3D and video-processing engine deltas in a capture-on versus capture-off
+   benchmark run) at 1440p and 4K, and confirm the colors match the BGRA path
+   with SMPTE bars.
 2. **No CUDA-core NVENC features.** Use a fast preset (P1 to P3), no lookahead,
    single pass, and no adaptive-quality modes that run on the CUDA cores. Use CBR
    or VBR at a sensible bitrate.
 3. **Capture at the clip FPS, not the refresh rate.** Acquisition is paced to
    the clip frame rate: the capture thread sleeps until the next slot and
    acquires once, and DXGI folds the updates in between into that one frame.
-   On a 240 Hz monitor recording at 60 fps, that is one acquire, copy, and
+   On a 240 Hz monitor recording at 60 fps, that is one acquire, conversion, and
    encode per four refreshes, and the other three are never acquired.
 4. **Skip unchanged frames.** When duplication reports no new content (a
-   timeout, or an update that only moved the pointer), nothing is copied or
-   encoded; the previous frame stands until the next change. On a static
+   timeout, or an update that only moved the pointer), nothing is converted
+   or encoded; the previous frame stands until the next change. On a static
    screen the only encoder work is the once-a-second IDR refresh.
 5. **CPU discipline.** A fixed set of threads, no per-frame allocation
-   (preallocated buffers and a preallocated ring), below-normal priority on
+   (preallocated buffers, and a ring that recycles its storage blocks),
+   below-normal priority on
    blink's threads, and saving and muxing on a low-priority thread that the
    capture and encode threads never wait on.
 6. **Native resolution by default.** No scaling pass. Downscaling is opt-in.
@@ -468,20 +479,35 @@ different GPU scaling settings (full panel, aspect ratio, no scaling). If the
 compositor pre-scales, `stretch_to` has nothing to stretch and the design needs
 revisiting.
 
+## Ring memory
+
+The ring stores payloads in 1 MiB blocks (smaller for a small ring) that are
+allocated as media arrives and freed as the oldest GOPs are evicted, so its
+memory follows the media it holds: a few megabytes for a static desktop (one
+keyframe a second), the full window's worth only during sustained motion. The
+configured byte capacity is a limit, not an allocation. Blocks are 1 MiB
+because the Windows heap hands allocations above 1016 KiB straight to
+`VirtualAlloc`, so a freed block goes back to the OS instead of staying in
+the process's heap. Up to three evicted blocks are kept for reuse, which is
+enough for a steady stream to stop allocating. The packet index is sized from
+the frame rate: (fps + 64) entries per second kept.
+
 ## Saving a clip
 
 The ring keeps the clip length plus 3 seconds. A save waits 200 ms after the
-hotkey press so the encoder and audio packets of that moment land, then copies
+hotkey press so the encoder and audio packets of that moment land, then cuts
 while capture keeps pushing; without the slack, those newer packets would evict
-the keyframe the clip starts at. Saving runs on two threads, so copying never
-waits on the disk. The cutter sizes and page-touches a reusable clip buffer
-before taking the ring lock, copies in 1 MB chunks at below-normal priority,
-and hands the lock back with a fair unlock between chunks, so a push waits at
-most one chunk. The writer writes the MP4 in Windows background mode (lowest
-CPU and I/O priority), never holding the lock, to a hidden `.partial` file
-that is renamed when complete; leftovers from a crash are deleted at startup.
-A second press while a clip is being written is cut right away into a second
-buffer, which is freed once both are back; more presses are ignored.
+the keyframe the clip starts at. A cut copies no media: under one short ring
+lock it records which packets the clip holds and takes a reference to the
+blocks they live in. Capture never writes into a block a clip shares (the next
+push opens a fresh block), and an evicted block a clip still references stays
+alive until the clip is written and dropped. A save therefore costs the media
+evicted while it is written, about a second's worth, not a second copy of the
+clip. Saving runs on two threads, so cutting never waits on the disk. The
+writer writes the MP4 in Windows background mode (lowest CPU and I/O
+priority), never holding the lock, to a hidden `.partial` file that is renamed
+when complete; leftovers from a crash are deleted at startup. A second press
+while a clip is being written is cut right away; more presses are ignored.
 
 ### Save sound
 
