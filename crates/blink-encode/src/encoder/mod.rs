@@ -85,8 +85,8 @@ struct Registration {
 /// the wait stalls the capture thread, so a frame must finish inside the frame
 /// budget (16.7 ms at 60 fps, 4.2 ms at 240 fps). Expected ceiling, to be
 /// confirmed by benchmark: comfortable at 1080p and 1440p up to 144 fps and 4K
-/// at 60 fps with P2; 240 fps at 1440p and 4K above 60 fps may not keep up
-/// (fall back to P1, or go asynchronous). Benchmarks should record blink's CPU
+/// at 60 fps with P1; 240 fps at 1440p and 4K above 60 fps may not keep up
+/// (go asynchronous). Benchmarks should record blink's CPU
 /// usage too, since the driver may spin while it waits.
 ///
 /// The asynchronous upgrade: `enableEncodeAsync = 1`, two or three bitstream
