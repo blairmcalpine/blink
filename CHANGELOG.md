@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/blairmcalpine/blink/compare/v0.0.3...v0.0.4) - 2026-11-26
+
+### Added
+
+- *(app)* open settings when launched from the installer, Start menu, or again ([#19](https://github.com/blairmcalpine/blink/pull/19))
+
+### Other
+
+- cut idle RAM and GPU work (block ring, zero-copy saves, NV12 conversion) ([#20](https://github.com/blairmcalpine/blink/pull/20))
+- skip unaffected jobs and stop PR runs from evicting caches ([#17](https://github.com/blairmcalpine/blink/pull/17))
+
 ## [0.0.3](https://github.com/blairmcalpine/blink/compare/v0.0.2...v0.0.3) - 2026-11-22
 
 ### Added
